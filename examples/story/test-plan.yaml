@@ -1,0 +1,15 @@
+name: story-smoke-test
+
+session:
+  platform_id: smoke-test-user
+  tags:
+    - test:true
+  steps:
+    - agent_slug: narrator
+      action_payload: "Enter the ancient ruins"
+    - agent_slug: narrator
+      action_payload: "Examine the glowing inscription"
+
+variants:
+  providers:
+    - echo

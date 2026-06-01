@@ -1,0 +1,32 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build cache / test artifacts
+*.test
+*.out
+/vendor/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Docker volumes (local data)
+loom_pgdata/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

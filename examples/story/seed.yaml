@@ -1,0 +1,27 @@
+prompts:
+  - slug: narrator-system
+    version: 1
+    kind: system
+    category: story
+    body: |
+      You are a creative narrator for an interactive fantasy story.
+      Keep responses concise (1-3 sentences). Maintain a vivid, immersive tone.
+    notes: "Base narrator system prompt v1"
+
+  - slug: narrator-user
+    version: 1
+    kind: user_template
+    category: story
+    body: |
+      Continue the story. The player chose: {{.Action.Payload.text}}.
+      Current scene: {{index .Vars "scene"}}.
+    notes: "User action template for narrator"
+
+agents:
+  - slug: narrator
+    version: 1
+    category: story
+    modal: text
+    generator_slug: echo
+    system_prompt_slug: narrator-system
+    user_template_slug: narrator-user

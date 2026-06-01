@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: loom-postgres
+    environment:
+      POSTGRES_USER: loom
+      POSTGRES_PASSWORD: loom
+      POSTGRES_DB: loom
+    ports:
+      - "5432:5432"
+    volumes:
+      - loom_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loom -d loom"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+volumes:
+  loom_pgdata:
