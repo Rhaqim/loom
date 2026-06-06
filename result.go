@@ -155,6 +155,26 @@ func NewVideoResult(url, previewImage string, durationSec float64, width, height
 	}
 }
 
+// NewAudioResult creates a ready AudioResult.
+// url is the remote URL or data URI of the audio file.
+// format is the MIME type or extension (e.g. "audio/mpeg", "mp3").
+// durationSec is the audio length in seconds.
+func NewAudioResult(url, format string, durationSec float64) *AudioResult {
+	return &AudioResult{
+		baseResult: baseResult{
+			ID:        uuid.New(),
+			modal:     ModalityAudio,
+			status:    ResultStatusReady,
+			meta:      map[string]any{},
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		},
+		URL:         url,
+		Format:      format,
+		DurationSec: durationSec,
+	}
+}
+
 // NewPendingResult creates a pending Result for async generators.
 func NewPendingResult(modality Modality, handle *TaskHandle) Result {
 	return &baseResult{

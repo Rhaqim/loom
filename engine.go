@@ -43,6 +43,11 @@ type Config struct {
 	Logger Logger
 	// MaxRetries is the default retry cap for post-hooks (default: 3).
 	MaxRetries int
+	// Cache is an optional read-through cache for immutable engine objects
+	// (agents, prompts). Use NewInProcessCache() for a zero-dependency in-process
+	// cache, or supply any implementation of the Cache interface (Redis, etc.).
+	// A nil Cache disables caching — every RunStep hits the database directly.
+	Cache Cache
 }
 
 // Logger is the minimal logging interface the engine uses.
@@ -65,6 +70,7 @@ type Engine struct {
 	generators map[string]Generator
 	hooks      *hookBus
 	log        Logger
+	cache      Cache
 
 	agents   *agentService
 	prompts  *promptService
@@ -108,6 +114,7 @@ func New(cfg Config) (*Engine, error) {
 		db:         cfg.DB,
 		prefix:     prefix,
 		generators: gens,
+		cache:      cfg.Cache,
 		hooks:      newHookBus(),
 		log:        log,
 	}
@@ -181,7 +188,17 @@ func (s *agentService) Get(ctx context.Context, slug string, version int) (*Agen
 	if version == 0 {
 		return s.Latest(ctx, slug)
 	}
-	return queryAgent(ctx, s.e.db, s.e.prefix, slug, version)
+	// Cache check — agents are immutable after creation.
+	key := cacheKey("agent", s.e.prefix, slug, version)
+	if a, ok := cacheGet[Agent](ctx, s.e.cache, key); ok {
+		return a, nil
+	}
+	a, err := queryAgent(ctx, s.e.db, s.e.prefix, slug, version)
+	if err != nil {
+		return nil, err
+	}
+	cacheSet(ctx, s.e.cache, key, a)
+	return a, nil
 }
 
 func (s *agentService) Latest(ctx context.Context, slug string) (*Agent, error) {
@@ -209,7 +226,17 @@ func (s *promptService) Get(ctx context.Context, slug string, version int) (*Pro
 	if version == 0 {
 		return s.Latest(ctx, slug)
 	}
-	return queryPrompt(ctx, s.e.db, s.e.prefix, slug, version)
+	// Cache check — prompts are immutable after creation.
+	key := cacheKey("prompt", s.e.prefix, slug, version)
+	if p, ok := cacheGet[Prompt](ctx, s.e.cache, key); ok {
+		return p, nil
+	}
+	p, err := queryPrompt(ctx, s.e.db, s.e.prefix, slug, version)
+	if err != nil {
+		return nil, err
+	}
+	cacheSet(ctx, s.e.cache, key, p)
+	return p, nil
 }
 
 func (s *promptService) Latest(ctx context.Context, slug string) (*Prompt, error) {
@@ -432,23 +459,40 @@ func (s *stepService) buildGenerateRequest(
 	action *Action,
 	annotations []RetryAnnotation,
 ) (GenerateRequest, error) {
-	// Load system prompt.
+	// Load system prompt — cached by UUID.
 	systemPrompt := ""
 	if agent.SystemPromptID != uuid.Nil {
-		sp, err := queryPromptByID(ctx, s.e.db, s.e.prefix, agent.SystemPromptID)
-		if err != nil {
-			return GenerateRequest{}, fmt.Errorf("load system prompt: %w", err)
+		spKey := cacheKey("prompt-id", s.e.prefix, agent.SystemPromptID.String(), 0)
+		var sp *Prompt
+		if cached, ok := cacheGet[Prompt](ctx, s.e.cache, spKey); ok {
+			sp = cached
+		} else {
+			var err error
+			sp, err = queryPromptByID(ctx, s.e.db, s.e.prefix, agent.SystemPromptID)
+			if err != nil {
+				return GenerateRequest{}, fmt.Errorf("load system prompt: %w", err)
+			}
+			cacheSet(ctx, s.e.cache, spKey, sp)
 		}
 		systemPrompt = sp.Body
 	}
 
-	// Load and render user template.
+	// Load and render user template — cached by UUID.
 	userPrompt := ""
 	if agent.UserTemplateID != uuid.Nil {
-		ut, err := queryPromptByID(ctx, s.e.db, s.e.prefix, agent.UserTemplateID)
-		if err != nil {
-			return GenerateRequest{}, fmt.Errorf("load user template: %w", err)
+		utKey := cacheKey("prompt-id", s.e.prefix, agent.UserTemplateID.String(), 0)
+		var ut *Prompt
+		if cached, ok := cacheGet[Prompt](ctx, s.e.cache, utKey); ok {
+			ut = cached
+		} else {
+			var err error
+			ut, err = queryPromptByID(ctx, s.e.db, s.e.prefix, agent.UserTemplateID)
+			if err != nil {
+				return GenerateRequest{}, fmt.Errorf("load user template: %w", err)
+			}
+			cacheSet(ctx, s.e.cache, utKey, ut)
 		}
+		var err error
 		userPrompt, err = renderTemplate(ut.Body, session, action)
 		if err != nil {
 			return GenerateRequest{}, fmt.Errorf("render user template: %w", err)
