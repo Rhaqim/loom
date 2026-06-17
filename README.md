@@ -175,6 +175,52 @@ step, err := e.RunStep(ctx, sess, loom.StepRequest{
 })
 ```
 
+### Turns & multi-agent flows
+
+`RunStep` runs one agent. Many platforms need a *turn* that composes several
+agents — e.g. a streaming "author" produces prose, then a "logician", "sensory
+director", and "titler" analyse that prose in parallel. A `Flow` declares that
+turn as data; `RunTurn` executes it, running the lead first (optionally
+streaming), injecting its output into the followers, then running the followers
+concurrently. Every resulting step is persisted and tagged with one `turn_id`.
+
+```go
+flow := loom.Flow{
+    Slug: "story-turn",
+    Lead: loom.FlowAgent{AgentSlug: "author", Stream: true, OutputKey: "Prose"},
+    Followers: []loom.FlowAgent{
+        {AgentSlug: "logician"}, // sees the lead's prose via {{.Inputs.Prose}}
+        {AgentSlug: "sensory"},
+    },
+}
+
+turn, err := e.RunTurn(ctx, sess, loom.TurnRequest{
+    Flow:    flow,
+    Action:  &loom.Action{Kind: loom.ActionFreeText, Payload: map[string]any{"text": "I open the door."}},
+    OnChunk: func(c loom.Chunk) { fmt.Print(c.Content) }, // streams the lead
+})
+prose := loom.ResultText(turn.Lead.Result)
+logician := turn.Followers["logician"].Result // a *StructuredResult
+```
+
+Because every agent in a flow is an ordinary versioned agent, the only thing that
+changes between products — or between text, image, video, and spatial/AR
+modalities — is the set of agents/prompts the flow references plus the registered
+generators. See [examples/conexus-loom](examples/conexus-loom) for a full
+multi-agent, multimodal playthrough that runs with no API keys.
+
+#### Per-step inputs, session-aware hooks, provider overrides
+
+- `StepRequest.Inputs` / `TurnRequest.Inputs` are exposed to user templates as
+  `{{.Inputs.x}}` and forwarded to the generator. `RunTurn` uses this to pass the
+  lead's output to followers.
+- Pre-hooks run **before** the template is rendered and receive the session via
+  `StepRequest.Session`, so a memory-recall hook can inject context that the
+  prompt then uses.
+- `StepRequest.GeneratorOverride` / `ParamOverride` / `Overrides` allow
+  per-request provider, parameter, and key/model routing (e.g. per-user API keys).
+- `Engine.RegisterGenerator(slug, gen)` adds a modality at runtime.
+
 ### Branching & Replay
 
 Fork a session at any step index to explore an alternative timeline. The parent session is untouched. Stale branches are cleaned up automatically by the GC worker.
@@ -419,6 +465,7 @@ loom/
 ├── prompt.go          # Prompt struct and PromptRegistry interface
 ├── session.go         # Session, Step, BranchNode, SessionRegistry
 ├── step.go            # StepRequest, StepRunner
+├── flow.go            # Flow, FlowAgent, TurnRequest, RunTurn (multi-agent turns)
 ├── result.go          # Result interface, TextResult, ImageResult, VideoResult
 ├── generator.go       # Generator, StreamingGenerator, GenerateRequest
 ├── hook.go            # HookBus, PreHook, PostHook
@@ -442,7 +489,8 @@ loom/
 ├── cmd/loom-cli/      # CLI: migrate, seed, test
 ├── examples/
 │   ├── story/         # Simple narrative example
-│   └── dnd/           # Full D&D solo experience (own go.mod)
+│   ├── dnd/           # Full D&D solo experience (own go.mod)
+│   └── conexus-loom/  # Multi-agent, multimodal playthrough via RunTurn (own go.mod, zero-setup)
 └── internal/
     ├── enginetest/    # Engine integration tests
     └── clitest/       # CLI integration tests

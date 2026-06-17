@@ -141,6 +141,23 @@ func New(cfg Config) (*Engine, error) {
 // Hooks returns the engine's hook bus for registering pre/post processors.
 func (e *Engine) Hooks() HookBus { return e.hooks }
 
+// RegisterGenerator adds or replaces a generator under a slug at runtime. This is
+// how a platform extends into a new modality — register a video or world (3-D/AR)
+// generator and reference it from an agent; no other engine change is needed.
+func (e *Engine) RegisterGenerator(slug string, g Generator) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.generators[slug] = g
+}
+
+// generator resolves a registered generator by slug under a read lock.
+func (e *Engine) generator(slug string) (Generator, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	g, ok := e.generators[slug]
+	return g, ok
+}
+
 // Agents returns the agent registry.
 func (e *Engine) Agents() AgentRegistry { return e.agents }
 
@@ -355,24 +372,35 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		}
 	}
 
-	// Look up generator.
-	gen, ok := s.e.generators[agent.GeneratorSlug]
+	// Look up generator. A per-request GeneratorOverride wins over the agent's
+	// configured generator, enabling per-call provider/model routing.
+	genSlug := agent.GeneratorSlug
+	if req.GeneratorOverride != "" {
+		genSlug = req.GeneratorOverride
+	}
+	gen, ok := s.e.generator(genSlug)
 	if !ok {
-		return nil, fmt.Errorf("loom: generator %q not registered", agent.GeneratorSlug)
+		return nil, fmt.Errorf("loom: generator %q not registered", genSlug)
 	}
 
-	// Build GenerateRequest (renders user template, loads system prompt).
-	genReq, err := s.buildGenerateRequest(ctx, session, agent, req.Action, req.annotations)
-	if err != nil {
-		return nil, err
-	}
+	// Expose the session to hooks before they run.
+	req.Session = session
 
-	// Run pre-hooks.
+	// Run pre-hooks first so they can mutate session state (e.g. inject recalled
+	// memories into State.Vars or set req.Inputs) *before* the user template is
+	// rendered from that state.
 	if err := s.e.hooks.RunPre(ctx, &req); err != nil {
 		if IsSkip(err) {
 			return nil, err // propagate skip to caller
 		}
 		return nil, fmt.Errorf("loom: pre-hook: %w", err)
+	}
+
+	// Build GenerateRequest (renders user template, loads system prompt) using
+	// the (possibly hook-mutated) session and request.
+	genReq, err := s.buildGenerateRequest(ctx, session, agent, &req)
+	if err != nil {
+		return nil, err
 	}
 
 	// Generation loop with retry support.
@@ -423,6 +451,19 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	if req.Action != nil && req.Action.ID == (uuid.UUID{}) {
 		req.Action.ID = uuid.New()
 	}
+	// Tag the step with turn linkage when it is part of a RunTurn flow so the
+	// steps of one turn can be grouped for branching, replay, and cost rollups.
+	if req.turnID != uuid.Nil {
+		diagnostics["turn_id"] = req.turnID.String()
+		diagnostics["turn_role"] = req.turnRole
+	}
+
+	// Serialise the session-mutating tail of the step. RunTurn runs follower
+	// agents concurrently against the same *Session; without this lock their
+	// index assignment and History appends would race.
+	s.e.mu.Lock()
+	defer s.e.mu.Unlock()
+
 	step := &Step{
 		ID:          uuid.New(),
 		SessionID:   session.ID,
@@ -456,9 +497,10 @@ func (s *stepService) buildGenerateRequest(
 	ctx context.Context,
 	session *Session,
 	agent *Agent,
-	action *Action,
-	annotations []RetryAnnotation,
+	req *StepRequest,
 ) (GenerateRequest, error) {
+	action := req.Action
+	annotations := req.annotations
 	// Load system prompt — cached by UUID.
 	systemPrompt := ""
 	if agent.SystemPromptID != uuid.Nil {
@@ -492,27 +534,45 @@ func (s *stepService) buildGenerateRequest(
 			}
 			cacheSet(ctx, s.e.cache, utKey, ut)
 		}
+		// Render under a read lock — a sibling follower's locked tail may be
+		// appending to session.History / writing session.State right now.
 		var err error
-		userPrompt, err = renderTemplate(ut.Body, session, action)
+		s.e.mu.RLock()
+		userPrompt, err = renderTemplate(ut.Body, session, action, req.Inputs)
+		s.e.mu.RUnlock()
 		if err != nil {
 			return GenerateRequest{}, fmt.Errorf("render user template: %w", err)
 		}
 	}
 
+	params := agent.Params
+	if req.ParamOverride != nil {
+		params = *req.ParamOverride
+	}
+
+	// Snapshot history under a read lock — RunTurn runs follower agents
+	// concurrently, and a sibling's locked tail may be appending right now.
+	s.e.mu.RLock()
+	histContext := collectResultContext(session.History)
+	s.e.mu.RUnlock()
+
 	return GenerateRequest{
 		SystemPrompt:   systemPrompt,
 		UserPrompt:     userPrompt,
-		Params:         agent.Params,
+		Params:         params,
 		ResponseFormat: agent.ResponseFormat,
-		Context:        collectResultContext(session.History),
+		Context:        histContext,
 		SessionID:      session.ID,
 		AgentID:        agent.ID,
 		Annotations:    annotations,
+		Inputs:         req.Inputs,
+		Overrides:      req.Overrides,
 	}, nil
 }
 
-// renderTemplate renders a Go text/template with the session and action as data.
-func renderTemplate(body string, session *Session, action *Action) (string, error) {
+// renderTemplate renders a Go text/template with the session, action, and
+// per-step inputs as data.
+func renderTemplate(body string, session *Session, action *Action, inputs map[string]any) (string, error) {
 	tmpl, err := template.New("user").Parse(body)
 	if err != nil {
 		return "", err
@@ -524,6 +584,7 @@ func renderTemplate(body string, session *Session, action *Action) (string, erro
 		"Vars":     session.State.Vars,
 		"Action":   action,
 		"History":  session.History,
+		"Inputs":   inputs,
 	}
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, data); err != nil {

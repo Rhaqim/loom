@@ -2,6 +2,7 @@
 package openai
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -79,30 +80,57 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 		defer respBody.Close()
 
 		var assembled strings.Builder
-		dec := json.NewDecoder(respBody)
+		finish := "stop"
+		var inTok, outTok int
 
-		for {
-			// SSE lines look like: data: {...}\n
-			// We decode the JSON payload directly.
-			var raw json.RawMessage
-			if err := dec.Decode(&raw); err != nil {
+		// OpenAI streams Server-Sent Events: each event is one or more
+		// "data: <json>" lines terminated by a blank line, ending with
+		// "data: [DONE]". A bufio.Scanner over lines parses this correctly;
+		// json.Decoder cannot, because the "data: " prefix is not JSON.
+		sc := bufio.NewScanner(respBody)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" || !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if payload == "[DONE]" {
 				break
 			}
 			var event struct {
 				Choices []struct {
-					Delta        struct{ Content string `json:"content"` } `json:"delta"`
-					FinishReason string                                      `json:"finish_reason"`
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+					FinishReason string `json:"finish_reason"`
 				} `json:"choices"`
+				Usage *struct {
+					PromptTokens     int `json:"prompt_tokens"`
+					CompletionTokens int `json:"completion_tokens"`
+				} `json:"usage"`
 			}
-			if json.Unmarshal(raw, &event) == nil && len(event.Choices) > 0 {
-				text := event.Choices[0].Delta.Content
-				if text != "" {
+			if json.Unmarshal([]byte(payload), &event) != nil {
+				continue
+			}
+			if event.Usage != nil {
+				inTok, outTok = event.Usage.PromptTokens, event.Usage.CompletionTokens
+			}
+			if len(event.Choices) > 0 {
+				if fr := event.Choices[0].FinishReason; fr != "" {
+					finish = fr
+				}
+				if text := event.Choices[0].Delta.Content; text != "" {
 					assembled.WriteString(text)
 					chunks <- loom.Chunk{Content: text}
 				}
 			}
 		}
-		results <- loom.NewTextResult(assembled.String(), "stop", 0, 0)
+		if err := sc.Err(); err != nil && assembled.Len() == 0 {
+			results <- newFailedResult(err)
+			return
+		}
+		results <- loom.NewTextResult(assembled.String(), finish, inTok, outTok)
 	}()
 
 	return chunks, results, nil
@@ -113,13 +141,18 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 // -----------------------------------------------------------------------
 
 type chatRequest struct {
-	Model          string          `json:"model"`
-	Messages       []chatMessage   `json:"messages"`
-	Temperature    float64         `json:"temperature,omitempty"`
-	MaxTokens      int             `json:"max_tokens,omitempty"`
-	TopP           float64         `json:"top_p,omitempty"`
-	Stream         bool            `json:"stream,omitempty"`
-	ResponseFormat *respFormat     `json:"response_format,omitempty"`
+	Model          string         `json:"model"`
+	Messages       []chatMessage  `json:"messages"`
+	Temperature    float64        `json:"temperature,omitempty"`
+	MaxTokens      int            `json:"max_tokens,omitempty"`
+	TopP           float64        `json:"top_p,omitempty"`
+	Stream         bool           `json:"stream,omitempty"`
+	StreamOptions  *streamOptions `json:"stream_options,omitempty"`
+	ResponseFormat *respFormat    `json:"response_format,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatMessage struct {
@@ -134,8 +167,10 @@ type respFormat struct {
 
 type chatResponse struct {
 	Choices []struct {
-		Message      struct{ Content string `json:"content"` } `json:"message"`
-		FinishReason string                                     `json:"finish_reason"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		PromptTokens     int `json:"prompt_tokens"`
@@ -159,10 +194,23 @@ func (g *ChatGenerator) buildBody(req loom.GenerateRequest, stream bool) ([]byte
 		TopP:        req.Params.TopP,
 		Stream:      stream,
 	}
+	if stream {
+		cr.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
 	if req.ResponseFormat != nil {
-		cr.ResponseFormat = &respFormat{
-			Type:       "json_schema",
-			JSONSchema: req.ResponseFormat.Schema,
+		// Empty schema → portable JSON mode (works across most OpenAI-compatible
+		// providers). A populated schema → strict structured outputs.
+		if len(req.ResponseFormat.Schema) == 0 {
+			cr.ResponseFormat = &respFormat{Type: "json_object"}
+		} else {
+			cr.ResponseFormat = &respFormat{
+				Type: "json_schema",
+				JSONSchema: map[string]any{
+					"name":   "output",
+					"schema": req.ResponseFormat.Schema,
+					"strict": req.ResponseFormat.StrictMode,
+				},
+			}
 		}
 	}
 	return json.Marshal(cr)

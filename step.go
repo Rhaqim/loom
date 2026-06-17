@@ -57,8 +57,39 @@ type StepRequest struct {
 	// MaxRetries caps the number of post-hook retry attempts (default 3).
 	MaxRetries int
 
+	// Session is the session this step runs against. The engine populates it
+	// before pre-hooks run so hooks can read and mutate session state — e.g. a
+	// memory-recall pre-hook can inject facts into State.Vars *before* the user
+	// template is rendered. It is set automatically by RunStep; callers may
+	// leave it nil.
+	Session *Session
+
+	// Inputs are arbitrary values made available to the user template as
+	// {{.Inputs.<key>}} and forwarded to the generator. RunTurn uses this to
+	// hand a lead agent's output to follower agents within the same turn.
+	Inputs map[string]any
+
+	// GeneratorOverride, when non-empty, replaces the agent's GeneratorSlug for
+	// this call only — a per-request provider override (e.g. a user-selected
+	// model routed to a different registered generator).
+	GeneratorOverride string
+
+	// ParamOverride, when non-nil, replaces the agent's generation params for
+	// this call only.
+	ParamOverride *GenerateParams
+
+	// Overrides is opaque per-request data passed through to the generator on
+	// GenerateRequest.Overrides — e.g. {"api_key": "...", "model": "..."} for
+	// per-user key routing in a custom generator.
+	Overrides map[string]any
+
 	// Annotations carried from previous retry attempts.
 	annotations []RetryAnnotation
+
+	// turn linkage — set by RunTurn so persisted steps can be grouped into a
+	// single logical turn for branching, replay, and cost rollups.
+	turnID   uuid.UUID
+	turnRole string
 }
 
 // StepRunner executes a step request against a session.

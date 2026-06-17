@@ -46,6 +46,8 @@ type GenerateRequest struct {
 	SessionID      uuid.UUID
 	AgentID        uuid.UUID
 	Annotations    []RetryAnnotation // retry hints from post-hooks
+	Inputs         map[string]any    // per-step inputs (e.g. a turn's lead-agent output)
+	Overrides      map[string]any    // per-request provider overrides (api key, model, …)
 }
 
 // Generator produces a Result from a GenerateRequest. One per modality+provider.
