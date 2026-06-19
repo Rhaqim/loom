@@ -212,6 +212,63 @@ func TestPerModelPricing(t *testing.T) {
 	}
 }
 
+// Two agents reference the SAME response-format record; both get the schema, and
+// the record is stored once (reused, not copied).
+func TestSharedResponseFormatReference(t *testing.T) {
+	ctx := context.Background()
+	db, _ := sql.Open("sqlite", "file:rfref?mode=memory&cache=shared")
+	db.SetMaxOpenConns(1)
+	if err := schema.NewLoader(schema.DialectSQLite).Apply(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	g := &recParamGen{}
+	e, err := loom.New(loom.Config{DB: db, Dialect: loom.DialectSQLite,
+		Generators: map[string]loom.Generator{"g": g}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One reusable response-format record.
+	rf := loom.MustResponseFormatJSON(`{"type":"object","properties":{"x":{"type":"string"}}}`, true)
+	rec := &loom.ResponseFormatRecord{Slug: "shared", Version: 1, Schema: rf.Schema, StrictMode: rf.StrictMode}
+	if err := e.ResponseFormats().Create(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	// Two agents (e.g. system-prompt v1 and v2) reference the SAME record.
+	for _, v := range []int{1, 2} {
+		id := rec.ID
+		if err := e.Agents().Create(ctx, &loom.Agent{Slug: "a", Version: v, Modal: loom.ModalityText, GeneratorSlug: "g", ResponseFormatID: &id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sess := &loom.Session{PlatformID: "p", State: loom.State{Modality: loom.ModalityText}}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	// Both agent versions resolve the referenced schema into the request.
+	for _, v := range []int{1, 2} {
+		g.lastRF = nil
+		if _, err := e.RunStep(ctx, sess, loom.StepRequest{AgentSlug: "a", AgentVersion: v}); err != nil {
+			t.Fatal(err)
+		}
+		if g.lastRF == nil || g.lastRF.Schema["type"] != "object" {
+			t.Fatalf("agent v%d did not resolve the referenced response format", v)
+		}
+	}
+	// Stored once.
+	got, err := e.ResponseFormats().Get(ctx, "shared", 1)
+	if err != nil || got.ID != rec.ID {
+		t.Fatalf("response format not retrievable as a single record: %v", err)
+	}
+}
+
+type recParamGen struct{ lastRF *loom.ResponseFormat }
+
+func (g *recParamGen) Modality() loom.Modality { return loom.ModalityText }
+func (g *recParamGen) Generate(_ context.Context, req loom.GenerateRequest) (loom.Result, error) {
+	g.lastRF = req.ResponseFormat
+	return loom.NewTextResult("ok", "stop", 1, 1), nil
+}
+
 func TestValidateJSONSchemaUnit(t *testing.T) {
 	sch := map[string]any{
 		"type":     "object",

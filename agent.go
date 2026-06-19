@@ -10,18 +10,23 @@ import (
 // Agent is a configuration bundling a Generator, system prompt, user template,
 // response format, and generation params. It is the unit the platform spawns.
 type Agent struct {
-	ID              uuid.UUID
-	Slug            string    // human-readable identifier
-	Version         int       // monotonically increasing
-	Category        string    // platform-defined grouping
-	Modal           Modality  // the modality this agent produces
-	GeneratorSlug   string    // references a registered Generator
-	SystemPromptID  uuid.UUID // FK → loom_prompts (system)
-	UserTemplateID  uuid.UUID // FK → loom_prompts (user_template)
-	ResponseFormat  *ResponseFormat
-	Params          GenerateParams
-	FallbackAgentID *uuid.UUID // used when budget action = downgrade
-	CreatedAt       time.Time
+	ID             uuid.UUID
+	Slug           string    // human-readable identifier
+	Version        int       // monotonically increasing
+	Category       string    // platform-defined grouping
+	Modal          Modality  // the modality this agent produces
+	GeneratorSlug  string    // references a registered Generator
+	SystemPromptID uuid.UUID // FK → loom_prompts (system)
+	UserTemplateID uuid.UUID // FK → loom_prompts (user_template)
+	// ResponseFormatID references a reusable response-format record
+	// (loom_response_formats). When set it is the agent's output contract and is
+	// shared across agents/versions. A nil ID falls back to the inline
+	// ResponseFormat below (ad-hoc, copied per agent).
+	ResponseFormatID *uuid.UUID
+	ResponseFormat   *ResponseFormat
+	Params           GenerateParams
+	FallbackAgentID  *uuid.UUID // used when budget action = downgrade
+	CreatedAt        time.Time
 }
 
 // AgentRegistry resolves and manages agents.

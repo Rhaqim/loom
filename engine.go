@@ -81,15 +81,16 @@ type Engine struct {
 	pricing      map[string]ModelPrice
 	defaultPrice *ModelPrice
 
-	agents   *agentService
-	prompts  *promptService
-	sessions *sessionService
-	steps    *stepService
-	costs    *costService
-	budgets  *budgetService
-	judges   JudgeRegistry
-	gc       *gcService
-	poller   *asyncPollerService
+	agents          *agentService
+	prompts         *promptService
+	responseFormats *responseFormatService
+	sessions        *sessionService
+	steps           *stepService
+	costs           *costService
+	budgets         *budgetService
+	judges          JudgeRegistry
+	gc              *gcService
+	poller          *asyncPollerService
 
 	mu sync.RWMutex
 }
@@ -132,6 +133,7 @@ func New(cfg Config) (*Engine, error) {
 
 	e.prompts = &promptService{e: e}
 	e.agents = &agentService{e: e}
+	e.responseFormats = &responseFormatService{e: e}
 	e.sessions = &sessionService{e: e}
 	e.steps = &stepService{e: e, maxRetries: maxRetries}
 	e.costs = &costService{e: e}
@@ -516,7 +518,6 @@ func (s *stepService) buildGenerateRequest(
 	annotations := req.annotations
 	// Load system prompt — cached by UUID.
 	systemPrompt := ""
-	var systemResponseFormat *ResponseFormat
 	if agent.SystemPromptID != uuid.Nil {
 		spKey := cacheKey("prompt-id", s.e.prefix, agent.SystemPromptID.String(), 0)
 		var sp *Prompt
@@ -531,7 +532,6 @@ func (s *stepService) buildGenerateRequest(
 			cacheSet(ctx, s.e.cache, spKey, sp)
 		}
 		systemPrompt = sp.Body
-		systemResponseFormat = sp.ResponseFormat
 	}
 
 	// Load and render user template — cached by UUID.
@@ -568,12 +568,16 @@ func (s *stepService) buildGenerateRequest(
 	// keep the whole map for the generator and template.
 	applyParamsMap(&params, req.Params)
 
-	// The agent's own ResponseFormat wins; otherwise fall back to the one stored
-	// on its system prompt, so a response format authored alongside a prompt is
-	// applied without also configuring the agent.
+	// Resolve the response format — an independent piece of the agent's
+	// composition (system prompt + user template + response format). A referenced
+	// record (shared, reusable) wins over an inline value.
 	responseFormat := agent.ResponseFormat
-	if responseFormat == nil {
-		responseFormat = systemResponseFormat
+	if agent.ResponseFormatID != nil && *agent.ResponseFormatID != uuid.Nil {
+		rec, err := s.e.responseFormats.GetByID(ctx, *agent.ResponseFormatID)
+		if err != nil {
+			return GenerateRequest{}, fmt.Errorf("load response format: %w", err)
+		}
+		responseFormat = rec.Format()
 	}
 
 	// Snapshot history under a read lock — RunTurn runs follower agents

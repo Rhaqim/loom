@@ -20,20 +20,17 @@ type Prompt struct {
 	Body      string   // raw template text
 	Variables []string // documented input variable names
 	Metadata  map[string]any
-	// ResponseFormat is the expected output schema for agents driven by this
-	// prompt. It is stored in the DB alongside the prompt so the prompt and its
-	// output contract travel together: when an agent's own ResponseFormat is nil,
-	// the engine uses the system prompt's ResponseFormat for generation. Most
-	// useful on system prompts (Kind == PromptKindSystem).
-	ResponseFormat *ResponseFormat
-	CreatedAt      time.Time
-	Notes          string // design rationale, change notes
+	CreatedAt time.Time
+	Notes     string // design rationale, change notes
 }
 
 // ResponseFormatJSON builds a ResponseFormat from a raw JSON Schema string — the
-// easy path for attaching an output schema to a prompt (paste the schema a client
-// authored straight into the DB). An empty/blank raw yields a non-nil
-// ResponseFormat with no schema, which generators treat as portable JSON mode.
+// easy path for attaching an output schema to an agent (paste a client-authored
+// schema straight in). An empty/blank raw yields a non-nil ResponseFormat with no
+// schema, which generators treat as portable JSON mode. Response formats are
+// independent of prompts: the same one can be reused across many agents, and an
+// agent's system prompt, user template, and response format are each versioned
+// and referenced independently.
 func ResponseFormatJSON(rawSchema string, strict bool) (*ResponseFormat, error) {
 	rf := &ResponseFormat{StrictMode: strict}
 	if s := strings.TrimSpace(rawSchema); s != "" {

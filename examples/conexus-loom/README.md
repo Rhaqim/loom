@@ -128,23 +128,46 @@ iteration; to change a *shipped* version cleanly, add a new `vN`.)
 and `sensory-sys.v2.txt` are the actual production system prompts; `-v 2` (the
 default) plays the story on them, `-v 1` on the compact demo prompts.
 
-### Response formats live with the prompt
+### System prompt, user template, and response format version independently
 
-A system prompt can carry its output JSON schema. Drop a file named
-`<agent>-schema.v<N>.json` next to the prompt and the seeder attaches it to that
-system prompt and **stores it in the DB alongside the prompt** (loom's new
-`Prompt.ResponseFormat`). When the agent runs, loom applies the prompt's schema as
-the provider `response_format` — the agent itself configures nothing. So adding a
-response format is just: write the system prompt, paste the JSON schema beside it.
+An agent is a **composition** of three independently-versioned parts, each a
+separate file:
+
+- `<agent>-sys.v<N>.txt`    — system prompt
+- `<agent>-user.v<N>.txt`   — user template
+- `<agent>-schema.v<N>.json` — response format (optional)
+
+The seeder composes agent version N from the **highest ≤ N** version of each part,
+so you change exactly one thing and the others are **reused by reference**:
+
+```bash
+cp narrative/prompts/author-sys.v2.txt narrative/prompts/author-sys.v3.txt
+$EDITOR narrative/prompts/author-sys.v3.txt   # tweak ONLY the system prompt
+go run ./cmd/play -v 3                          # author v3 = sys v3 + user v2 + schema(reused)
+```
+
+Likewise, dropping `logician-schema.v3.json` alone changes only the response
+format; `author-user.v3.txt` alone changes only the user template. Nothing
+duplicates the parts that didn't change.
+
+The response format is a **stored, reusable record** (`loom_response_formats`,
+one row per `<agent>-schema` version). An agent **references it by id**
+(`Agent.ResponseFormatID`), so it is stored once and shared: a new system-prompt
+version composes a new agent that points at the **same** response-format record —
+reused, not copied. Change a prompt without touching the schema; change the schema
+(new `…-schema.vN.json`) without touching the prompts. JSON agents with no schema
+file get an inline `json_object`; the Author (free prose) gets none.
 
 - `logician-schema.v2.json` — the real `LogicianAnalyzeSchema`
 - `sensory-schema.v2.json` — the real `SensoryDirectSchema`
-- JSON agents with no schema file get portable `json_object` mode; free-form
-  agents (the Author) get none.
 
 ```bash
-# inspect what's stored with each system prompt
-sqlite3 db.sqlite "select slug,version,length(response_format) from loom_prompts where kind='system';"
+# response formats are stored once…
+sqlite3 db.sqlite "select slug,version from loom_response_formats;"
+# …and reused: agent versions that share a schema share one response_format_id
+sqlite3 db.sqlite "select a.slug,a.version,sp.version sys_v,up.version user_v,a.response_format_id
+  from loom_agents a join loom_prompts sp on a.system_prompt_id=sp.id
+  join loom_prompts up on a.user_template_id=up.id order by a.slug,a.version;"
 ```
 
 Parsing tolerates both the compact v1 shape and the real nested v2 schema (e.g.

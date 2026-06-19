@@ -74,7 +74,6 @@ func postgresStatements(p string) []string {
 			body          TEXT NOT NULL,
 			variables     JSONB NOT NULL DEFAULT '[]',
 			metadata      JSONB NOT NULL DEFAULT '{}',
-			response_format JSONB,
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 			notes         TEXT NOT NULL DEFAULT '',
 			UNIQUE (slug, version, kind)
@@ -90,6 +89,17 @@ func postgresStatements(p string) []string {
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`, p),
 
+		// Response formats (reusable, versioned output contracts)
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sresponse_formats (
+			id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			slug          TEXT NOT NULL,
+			version       INT NOT NULL,
+			schema        JSONB NOT NULL DEFAULT '{}',
+			strict        BOOL NOT NULL DEFAULT false,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (slug, version)
+		)`, p),
+
 		// Agents
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sagents (
 			id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -100,12 +110,13 @@ func postgresStatements(p string) []string {
 			generator_slug      TEXT NOT NULL,
 			system_prompt_id    UUID REFERENCES %sprompts(id) ON DELETE RESTRICT,
 			user_template_id    UUID REFERENCES %sprompts(id) ON DELETE RESTRICT,
+			response_format_id  UUID REFERENCES %sresponse_formats(id) ON DELETE RESTRICT,
 			response_format     JSONB,
 			params              JSONB NOT NULL DEFAULT '{}',
 			fallback_agent_id   UUID,
 			created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE (slug, version)
-		)`, p, p, p),
+		)`, p, p, p, p),
 
 		// Sessions
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %ssessions (
@@ -273,7 +284,6 @@ func sqliteStatements(p string) []string {
 			body TEXT NOT NULL,
 			variables TEXT NOT NULL DEFAULT '[]',
 			metadata TEXT NOT NULL DEFAULT '{}',
-			response_format TEXT,
 			created_at DATETIME NOT NULL,
 			notes TEXT NOT NULL DEFAULT '',
 			UNIQUE (slug, version, kind)
@@ -288,6 +298,16 @@ func sqliteStatements(p string) []string {
 			created_at DATETIME NOT NULL
 		)`, p),
 
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sresponse_formats (
+			id TEXT PRIMARY KEY,
+			slug TEXT NOT NULL,
+			version INTEGER NOT NULL,
+			schema TEXT NOT NULL DEFAULT '{}',
+			strict INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			UNIQUE (slug, version)
+		)`, p),
+
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sagents (
 			id TEXT PRIMARY KEY,
 			slug TEXT NOT NULL,
@@ -297,6 +317,7 @@ func sqliteStatements(p string) []string {
 			generator_slug TEXT NOT NULL,
 			system_prompt_id TEXT,
 			user_template_id TEXT,
+			response_format_id TEXT,
 			response_format TEXT,
 			params TEXT NOT NULL DEFAULT '{}',
 			fallback_agent_id TEXT,

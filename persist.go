@@ -18,6 +18,10 @@ import (
 // Agent persistence
 // -----------------------------------------------------------------------
 
+const agentColumns = `id, slug, version, category, modality, generator_slug,
+	system_prompt_id, user_template_id, response_format_id, response_format, params,
+	fallback_agent_id, created_at`
+
 func sqlInsertAgent(ctx context.Context, db *sql.DB, prefix string, a *Agent) error {
 	rfJSON, _ := json.Marshal(a.ResponseFormat)
 	paramsJSON, _ := json.Marshal(a.Params)
@@ -26,44 +30,41 @@ func sqlInsertAgent(ctx context.Context, db *sql.DB, prefix string, a *Agent) er
 		s := a.FallbackAgentID.String()
 		fallbackID = &s
 	}
+	var rfID *string
+	if a.ResponseFormatID != nil && *a.ResponseFormatID != uuid.Nil {
+		s := a.ResponseFormatID.String()
+		rfID = &s
+	}
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %sagents
 			(id, slug, version, category, modality, generator_slug,
-			 system_prompt_id, user_template_id, response_format, params,
+			 system_prompt_id, user_template_id, response_format_id, response_format, params,
 			 fallback_agent_id, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		prefix),
 		a.ID, a.Slug, a.Version, a.Category, string(a.Modal),
 		a.GeneratorSlug, nullUUID(a.SystemPromptID), nullUUID(a.UserTemplateID),
-		rfJSON, paramsJSON, fallbackID, a.CreatedAt,
+		rfID, rfJSON, paramsJSON, fallbackID, a.CreatedAt,
 	)
 	return err
 }
 
 func sqlQueryAgent(ctx context.Context, db *sql.DB, prefix, slug string, version int) (*Agent, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT id, slug, version, category, modality, generator_slug,
-		       system_prompt_id, user_template_id, response_format, params,
-		       fallback_agent_id, created_at
-		FROM %sagents WHERE slug=$1 AND version=$2`, prefix), slug, version)
+		SELECT %s
+		FROM %sagents WHERE slug=$1 AND version=$2`, agentColumns, prefix), slug, version)
 	return scanAgent(row)
 }
 
 func sqlQueryAgentLatest(ctx context.Context, db *sql.DB, prefix, slug string) (*Agent, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT id, slug, version, category, modality, generator_slug,
-		       system_prompt_id, user_template_id, response_format, params,
-		       fallback_agent_id, created_at
-		FROM %sagents WHERE slug=$1 ORDER BY version DESC LIMIT 1`, prefix), slug)
+		SELECT %s
+		FROM %sagents WHERE slug=$1 ORDER BY version DESC LIMIT 1`, agentColumns, prefix), slug)
 	return scanAgent(row)
 }
 
 func sqlListAgents(ctx context.Context, db *sql.DB, prefix, category string) ([]*Agent, error) {
-	q := fmt.Sprintf(`
-		SELECT id, slug, version, category, modality, generator_slug,
-		       system_prompt_id, user_template_id, response_format, params,
-		       fallback_agent_id, created_at
-		FROM %sagents`, prefix)
+	q := fmt.Sprintf(`SELECT %s FROM %sagents`, agentColumns, prefix)
 	args := []any{}
 	if category != "" {
 		q += " WHERE category=$1"
@@ -92,14 +93,14 @@ type agentRow interface {
 
 func scanAgent(row agentRow) (*Agent, error) {
 	var (
-		a                                       Agent
-		rfJSON, paramsJSON                      []byte
-		sysPromptID, userTemplateID, fallbackID sql.NullString
-		modal                                   string
+		a                                             Agent
+		rfJSON, paramsJSON                            []byte
+		sysPromptID, userTemplateID, fallbackID, rfID sql.NullString
+		modal                                         string
 	)
 	err := row.Scan(
 		&a.ID, &a.Slug, &a.Version, &a.Category, &modal, &a.GeneratorSlug,
-		&sysPromptID, &userTemplateID, &rfJSON, &paramsJSON,
+		&sysPromptID, &userTemplateID, &rfID, &rfJSON, &paramsJSON,
 		&fallbackID, &a.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -121,30 +122,77 @@ func scanAgent(row agentRow) (*Agent, error) {
 		id, _ := uuid.Parse(fallbackID.String)
 		a.FallbackAgentID = &id
 	}
+	if rfID.Valid && rfID.String != "" {
+		id, _ := uuid.Parse(rfID.String)
+		a.ResponseFormatID = &id
+	}
 	_ = json.Unmarshal(rfJSON, &a.ResponseFormat)
 	_ = json.Unmarshal(paramsJSON, &a.Params)
 	return &a, nil
 }
 
 // -----------------------------------------------------------------------
+// Response-format persistence (reusable, versioned records)
+// -----------------------------------------------------------------------
+
+const responseFormatColumns = "id, slug, version, schema, strict, created_at"
+
+func sqlInsertResponseFormat(ctx context.Context, db *sql.DB, prefix string, rf *ResponseFormatRecord) error {
+	schemaJSON, _ := json.Marshal(rf.Schema)
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO %sresponse_formats (id, slug, version, schema, strict, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6)`, prefix),
+		rf.ID, rf.Slug, rf.Version, schemaJSON, rf.StrictMode, rf.CreatedAt,
+	)
+	return err
+}
+
+func sqlQueryResponseFormat(ctx context.Context, db *sql.DB, prefix, slug string, version int) (*ResponseFormatRecord, error) {
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT %s FROM %sresponse_formats WHERE slug=$1 AND version=$2`, responseFormatColumns, prefix), slug, version)
+	return scanResponseFormat(row)
+}
+
+func sqlQueryResponseFormatLatest(ctx context.Context, db *sql.DB, prefix, slug string) (*ResponseFormatRecord, error) {
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT %s FROM %sresponse_formats WHERE slug=$1 ORDER BY version DESC LIMIT 1`, responseFormatColumns, prefix), slug)
+	return scanResponseFormat(row)
+}
+
+func sqlQueryResponseFormatByID(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*ResponseFormatRecord, error) {
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT %s FROM %sresponse_formats WHERE id=$1`, responseFormatColumns, prefix), id)
+	return scanResponseFormat(row)
+}
+
+func scanResponseFormat(row promptRow) (*ResponseFormatRecord, error) {
+	var (
+		r          ResponseFormatRecord
+		schemaJSON []byte
+	)
+	err := row.Scan(&r.ID, &r.Slug, &r.Version, &schemaJSON, &r.StrictMode, &r.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal(schemaJSON, &r.Schema)
+	return &r, nil
+}
+
+// -----------------------------------------------------------------------
 // Prompt persistence
 // -----------------------------------------------------------------------
 
-const promptColumns = "id, slug, version, kind, category, body, variables, metadata, response_format, created_at, notes"
+const promptColumns = "id, slug, version, kind, category, body, variables, metadata, created_at, notes"
 
 func sqlInsertPrompt(ctx context.Context, db *sql.DB, prefix string, p *Prompt) error {
 	varsJSON, _ := json.Marshal(p.Variables)
 	metaJSON, _ := json.Marshal(p.Metadata)
-	var rfJSON []byte
-	if p.ResponseFormat != nil {
-		rfJSON, _ = json.Marshal(p.ResponseFormat)
-	}
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %sprompts
-			(id, slug, version, kind, category, body, variables, metadata, response_format, created_at, notes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, prefix),
+			(id, slug, version, kind, category, body, variables, metadata, created_at, notes)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, prefix),
 		p.ID, p.Slug, p.Version, string(p.Kind), p.Category,
-		p.Body, varsJSON, metaJSON, nullableJSON(rfJSON), p.CreatedAt, p.Notes,
+		p.Body, varsJSON, metaJSON, p.CreatedAt, p.Notes,
 	)
 	return err
 }
@@ -208,12 +256,12 @@ type promptRow interface {
 
 func scanPrompt(row promptRow) (*Prompt, error) {
 	var (
-		p                          Prompt
-		kind                       string
-		varsJSON, metaJSON, rfJSON []byte
+		p                  Prompt
+		kind               string
+		varsJSON, metaJSON []byte
 	)
 	err := row.Scan(&p.ID, &p.Slug, &p.Version, &kind, &p.Category,
-		&p.Body, &varsJSON, &metaJSON, &rfJSON, &p.CreatedAt, &p.Notes)
+		&p.Body, &varsJSON, &metaJSON, &p.CreatedAt, &p.Notes)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -223,19 +271,7 @@ func scanPrompt(row promptRow) (*Prompt, error) {
 	p.Kind = PromptKind(kind)
 	_ = json.Unmarshal(varsJSON, &p.Variables)
 	_ = json.Unmarshal(metaJSON, &p.Metadata)
-	if len(rfJSON) > 0 {
-		_ = json.Unmarshal(rfJSON, &p.ResponseFormat)
-	}
 	return &p, nil
-}
-
-// nullableJSON returns nil (SQL NULL) for empty JSON so a missing response_format
-// stays NULL rather than an empty string.
-func nullableJSON(b []byte) any {
-	if len(b) == 0 {
-		return nil
-	}
-	return b
 }
 
 // -----------------------------------------------------------------------
