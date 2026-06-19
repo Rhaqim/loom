@@ -48,6 +48,13 @@ type Config struct {
 	// cache, or supply any implementation of the Cache interface (Redis, etc.).
 	// A nil Cache disables caching — every RunStep hits the database directly.
 	Cache Cache
+	// Pricing maps model id → per-million-token price for accurate cost tracking.
+	// Generators report their model on Result metadata ("model"); a model not in
+	// the table falls back to DefaultPrice. Nil disables per-model pricing (the
+	// flat default applies).
+	Pricing map[string]ModelPrice
+	// DefaultPrice is used for models absent from Pricing (default: $1/$3 per 1M).
+	DefaultPrice *ModelPrice
 }
 
 // Logger is the minimal logging interface the engine uses.
@@ -64,13 +71,15 @@ func (noopLogger) Error(string, ...any) {}
 
 // Engine is the central object applications interact with.
 type Engine struct {
-	cfg        Config
-	db         *sql.DB
-	prefix     string
-	generators map[string]Generator
-	hooks      *hookBus
-	log        Logger
-	cache      Cache
+	cfg          Config
+	db           *sql.DB
+	prefix       string
+	generators   map[string]Generator
+	hooks        *hookBus
+	log          Logger
+	cache        Cache
+	pricing      map[string]ModelPrice
+	defaultPrice *ModelPrice
 
 	agents   *agentService
 	prompts  *promptService
@@ -110,13 +119,15 @@ func New(cfg Config) (*Engine, error) {
 	maps.Copy(gens, cfg.Generators)
 
 	e := &Engine{
-		cfg:        cfg,
-		db:         cfg.DB,
-		prefix:     prefix,
-		generators: gens,
-		cache:      cfg.Cache,
-		hooks:      newHookBus(),
-		log:        log,
+		cfg:          cfg,
+		db:           cfg.DB,
+		prefix:       prefix,
+		generators:   gens,
+		cache:        cfg.Cache,
+		hooks:        newHookBus(),
+		log:          log,
+		pricing:      cfg.Pricing,
+		defaultPrice: cfg.DefaultPrice,
 	}
 
 	e.prompts = &promptService{e: e}
@@ -402,6 +413,8 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	if err != nil {
 		return nil, err
 	}
+	// Surface the resolved output contract so post-hooks can validate against it.
+	req.ResponseFormat = genReq.ResponseFormat
 
 	// Generation loop with retry support.
 	var result Result
@@ -540,7 +553,7 @@ func (s *stepService) buildGenerateRequest(
 		// appending to session.History / writing session.State right now.
 		var err error
 		s.e.mu.RLock()
-		userPrompt, err = renderTemplate(ut.Body, session, action, req.Inputs)
+		userPrompt, err = renderTemplate(ut.Body, session, action, req.Inputs, req.Params)
 		s.e.mu.RUnlock()
 		if err != nil {
 			return GenerateRequest{}, fmt.Errorf("render user template: %w", err)
@@ -551,6 +564,9 @@ func (s *stepService) buildGenerateRequest(
 	if req.ParamOverride != nil {
 		params = *req.ParamOverride
 	}
+	// Fold the free-form params map onto the typed params (known model keys) and
+	// keep the whole map for the generator and template.
+	applyParamsMap(&params, req.Params)
 
 	// The agent's own ResponseFormat wins; otherwise fall back to the one stored
 	// on its system prompt, so a response format authored alongside a prompt is
@@ -577,12 +593,77 @@ func (s *stepService) buildGenerateRequest(
 		Annotations:    annotations,
 		Inputs:         req.Inputs,
 		Overrides:      req.Overrides,
+		ParamsMap:      req.Params,
+		Bus:            req.bus,
 	}, nil
+}
+
+// applyParamsMap folds known model keys from a free-form params map onto the
+// typed GenerateParams, and accumulates every key (including domain knobs like
+// "tension") into Params.Extra so generators can read them.
+func applyParamsMap(p *GenerateParams, m map[string]any) {
+	if len(m) == 0 {
+		return
+	}
+	for k, v := range m {
+		switch k {
+		case "temperature":
+			p.Temperature = toFloat(v)
+		case "top_p":
+			p.TopP = toFloat(v)
+		case "frequency_penalty":
+			p.FrequencyPenalty = toFloat(v)
+		case "presence_penalty":
+			p.PresencePenalty = toFloat(v)
+		case "duration_sec":
+			p.DurationSec = toFloat(v)
+		case "max_tokens":
+			p.MaxTokens = toInt(v)
+		case "seed":
+			p.Seed = toInt(v)
+		case "width":
+			p.Width = toInt(v)
+		case "height":
+			p.Height = toInt(v)
+		}
+	}
+	if p.Extra == nil {
+		p.Extra = map[string]any{}
+	}
+	maps.Copy(p.Extra, m)
+}
+
+func toFloat(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	}
+	return 0
+}
+
+func toInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case float32:
+		return int(n)
+	}
+	return 0
 }
 
 // renderTemplate renders a Go text/template with the session, action, and
 // per-step inputs as data.
-func renderTemplate(body string, session *Session, action *Action, inputs map[string]any) (string, error) {
+func renderTemplate(body string, session *Session, action *Action, inputs, params map[string]any) (string, error) {
 	tmpl, err := template.New("user").Parse(body)
 	if err != nil {
 		return "", err
@@ -595,6 +676,7 @@ func renderTemplate(body string, session *Session, action *Action, inputs map[st
 		"Action":   action,
 		"History":  session.History,
 		"Inputs":   inputs,
+		"Params":   params,
 	}
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, data); err != nil {
@@ -979,12 +1061,17 @@ func (c *costService) recordFromResult(ctx context.Context, step *Step, agent *A
 		inputTokens = r.InputTokens
 		outputTokens = r.OutputTokens
 	}
-	// Simple token-based pricing fallback ($1 per 1M input, $3 per 1M output).
-	usdCost = float64(inputTokens)*0.000001 + float64(outputTokens)*0.000003
+	// Per-model pricing: the generator reports its model on result metadata;
+	// fall back to the generator slug as the pricing key.
+	model := ResultModel(result)
+	if model == "" {
+		model = agent.GeneratorSlug
+	}
+	usdCost = c.e.priceFor(model).Cost(inputTokens, outputTokens)
 
 	rec := CostRecord{
 		Provider:     agent.GeneratorSlug,
-		Model:        agent.GeneratorSlug,
+		Model:        model,
 		Modal:        agent.Modal,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,

@@ -1,0 +1,69 @@
+{
+	"type": "object",
+	"properties": {
+		"turn_id": { "type": "string" },
+		"image": {
+			"type": "object",
+			"properties": {
+				"prompt": { "type": "string" },
+				"style_lock": { "type": "string" },
+				"characters_visible": {
+					"type": "array",
+					"items": {
+						"type": "object",
+						"properties": {
+							"name":       { "type": "string" },
+							"appearance": { "type": "string" },
+							"action":     { "type": "string" },
+							"expression": { "type": "string" }
+						},
+						"required": ["name", "appearance", "action", "expression"],
+						"additionalProperties": false
+					}
+				},
+				"negative_prompt": { "type": "string" }
+			},
+			"required": ["prompt", "style_lock", "characters_visible", "negative_prompt"],
+			"additionalProperties": false
+		},
+		"music": {
+			"type": "object",
+			"properties": {
+				"mood": { "type": "string", "enum": ["calm", "tense", "combat", "emotional", "romantic", "mysterious", "triumphant", "melancholy", "whimsical", "dread", "silence"] },
+				"intensity": { "type": "number" },
+				"transition": { "type": "string", "enum": ["crossfade", "hard_cut", "fade_out_in"] }
+			},
+			"required": ["mood", "intensity", "transition"],
+			"additionalProperties": false
+		},
+		"sfx_cue": { "type": "string" },
+		"sfx_trigger_phrase": { "type": "string" },
+		"sfx_trigger_word_index": { "type": "integer" },
+		"sfx_gain": { "type": "number" },
+		"voice": {
+			"type": "object",
+			"properties": {
+				"emotion": { "type": "string", "enum": ["neutral", "happy", "sad", "angry", "fearful", "surprised"] },
+				"speed_modifier": { "type": "number" },
+				"intensity": { "type": "number" },
+				"emphasis_words": { "type": "array", "items": { "type": "string" } }
+			},
+			"required": ["emotion", "speed_modifier", "intensity", "emphasis_words"],
+			"additionalProperties": false
+		},
+		"ambient": {
+			"type": "object",
+			"properties": {
+				"atmosphere":     { "type": ["string", "null"], "enum": [null, "dust_motes", "film_grain", "bokeh", "god_rays", "heat_haze", "rain_window", "rain_open", "snow", "fog", "embers", "ash", "spores", "static", "underwater", "void"] },
+				"cinematography": { "type": ["string", "null"], "enum": [null, "vignette_soft", "vignette_white", "tunnel_vision", "chromatic_aberration", "soft_focus", "frost_creep", "teary", "blood_mud", "cracked_glass"] },
+				"one_shot":       { "type": ["string", "null"], "enum": [null, "heartbeat", "flash_white", "cut_black", "glitch", "ringing"] },
+				"intensity":      { "type": "number" },
+				"color_tint":     { "type": ["string", "null"] }
+			},
+			"required": ["atmosphere", "cinematography", "one_shot", "intensity", "color_tint"],
+			"additionalProperties": false
+		}
+	},
+	"required": ["turn_id", "image", "music", "sfx_cue", "sfx_trigger_phrase", "sfx_trigger_word_index", "sfx_gain", "voice", "ambient"],
+	"additionalProperties": false
+}

@@ -39,6 +39,9 @@ type FlowAgent struct {
 	// GeneratorOverride routes this agent's call to a different registered
 	// generator for this turn only. Optional.
 	GeneratorOverride string
+	// Params are this agent's tuning knobs (model + domain), merged over the
+	// turn's Params. See StepRequest.Params.
+	Params map[string]any
 }
 
 // Flow declares a turn as a lead agent plus parallel followers.
@@ -62,6 +65,9 @@ type TurnRequest struct {
 	// Overrides is opaque per-turn data forwarded to every agent's generator
 	// unless an individual FlowAgent specifies its own Overrides.
 	Overrides map[string]any
+	// Params are turn-wide tuning knobs (model + domain, e.g. temperature,
+	// tension) merged under each FlowAgent's own Params.
+	Params map[string]any
 }
 
 // Turn is the result of RunTurn: the lead step plus follower steps, all sharing
@@ -71,6 +77,7 @@ type Turn struct {
 	Lead      *Step
 	Followers map[string]*Step // keyed by follower AgentSlug
 	Steps     []*Step          // lead first, then followers (completion order)
+	Messages  []Message        // everything published on the turn's Bus
 }
 
 // RunTurn executes a Flow against a session: it runs the lead agent (optionally
@@ -91,14 +98,27 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		}
 	}
 
+	// Per-turn cross-agent channel fabric, available to every agent's generator.
+	bus := newBus()
+	defer bus.close()
+
 	// ---- Lead ----
 	leadKey := req.Flow.Lead.OutputKey
 	if leadKey == "" {
 		leadKey = "Lead"
 	}
+	leadSlug := req.Flow.Lead.AgentSlug
+	// The lead's chunks are published on the "lead" topic as they stream, so a
+	// follower can consume the lead's output live (and, via replay, even though
+	// followers start after the lead).
 	var onChunk func(Chunk)
 	if req.Flow.Lead.Stream {
-		onChunk = req.OnChunk
+		onChunk = func(c Chunk) {
+			bus.Publish(leadSlug, "lead", c.Content)
+			if req.OnChunk != nil {
+				req.OnChunk(c)
+			}
+		}
 	}
 	leadStep, err := e.steps.run(ctx, session, StepRequest{
 		AgentSlug:         req.Flow.Lead.AgentSlug,
@@ -106,15 +126,18 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		Action:            req.Action,
 		OnChunk:           onChunk,
 		Inputs:            cloneInputs(inputs),
+		Params:            mergeParams(req.Params, req.Flow.Lead.Params),
 		Overrides:         pickOverrides(req.Flow.Lead.Overrides, req.Overrides),
 		GeneratorOverride: req.Flow.Lead.GeneratorOverride,
 		turnID:            turnID,
 		turnRole:          "lead",
+		bus:               bus,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("loom: turn %q lead %q: %w", req.Flow.Slug, req.Flow.Lead.AgentSlug, err)
 	}
 	inputs[leadKey] = ResultText(leadStep.Result)
+	bus.Publish(leadSlug, "lead.done", ResultText(leadStep.Result))
 
 	turn := &Turn{
 		ID:        turnID,
@@ -141,11 +164,17 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 				// carry no Action (sharing the lead's would duplicate its ID).
 				Action:            nil,
 				Inputs:            cloneInputs(inputs),
+				Params:            mergeParams(req.Params, f.Params),
 				Overrides:         pickOverrides(f.Overrides, req.Overrides),
 				GeneratorOverride: f.GeneratorOverride,
 				turnID:            turnID,
 				turnRole:          "follower:" + f.AgentSlug,
+				bus:               bus,
 			})
+			if ferr == nil {
+				// Publish the follower's output so concurrent siblings can react.
+				bus.Publish(f.AgentSlug, f.AgentSlug, ResultText(step.Result))
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if ferr != nil {
@@ -167,7 +196,19 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 	// The turn's dominant modality is the lead's output.
 	session.State.Modality = leadStep.Result.Modality()
 
+	turn.Messages = bus.Messages()
 	return turn, nil
+}
+
+// mergeParams overlays per-agent params on turn-wide defaults (agent wins).
+func mergeParams(turnParams, agentParams map[string]any) map[string]any {
+	if len(turnParams) == 0 && len(agentParams) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(turnParams)+len(agentParams))
+	maps.Copy(out, turnParams)
+	maps.Copy(out, agentParams)
+	return out
 }
 
 // ResultText extracts the primary text payload from a Result for prompt

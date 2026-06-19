@@ -130,7 +130,9 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 			results <- newFailedResult(err)
 			return
 		}
-		results <- loom.NewTextResult(assembled.String(), finish, inTok, outTok)
+		tr := loom.NewTextResult(assembled.String(), finish, inTok, outTok)
+		tr.Metadata()["model"] = g.model
+		results <- tr
 	}()
 
 	return chunks, results, nil
@@ -231,10 +233,14 @@ func (g *ChatGenerator) parseResponse(body []byte, req loom.GenerateRequest) (lo
 	if req.ResponseFormat != nil {
 		var data map[string]any
 		if err := json.Unmarshal([]byte(content), &data); err == nil {
-			return loom.NewStructuredResult(data, in, out), nil
+			sr := loom.NewStructuredResult(data, in, out)
+			sr.Metadata()["model"] = g.model
+			return sr, nil
 		}
 	}
-	return loom.NewTextResult(content, finish, in, out), nil
+	tr := loom.NewTextResult(content, finish, in, out)
+	tr.Metadata()["model"] = g.model
+	return tr, nil
 }
 
 func (g *ChatGenerator) post(ctx context.Context, path string, body []byte) ([]byte, error) {

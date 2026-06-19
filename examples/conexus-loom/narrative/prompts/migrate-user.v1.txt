@@ -1,0 +1,4 @@
+BLOCK PROMPT
+{{.Inputs.block}}
+
+Convert it to the JSON world+constitution.

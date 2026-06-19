@@ -48,6 +48,14 @@ type GenerateRequest struct {
 	Annotations    []RetryAnnotation // retry hints from post-hooks
 	Inputs         map[string]any    // per-step inputs (e.g. a turn's lead-agent output)
 	Overrides      map[string]any    // per-request provider overrides (api key, model, …)
+	// ParamsMap carries free-form tuning knobs as a map — both model params
+	// (temperature, max_tokens, top_p, seed, …, which the engine also folds into
+	// the typed Params above) and domain params (e.g. tension). Generators read
+	// whatever keys they understand.
+	ParamsMap map[string]any
+	// Bus is the per-turn cross-agent communication fabric (nil outside a turn).
+	// Generators may Publish/Subscribe to coordinate with sibling agents.
+	Bus Bus
 }
 
 // Generator produces a Result from a GenerateRequest. One per modality+provider.

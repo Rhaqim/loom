@@ -1,0 +1,17 @@
+STORY RULES
+Win scenarios: {{range .Vars.constitution.directives.win_scenarios}}{{.}}; {{end}}
+Lose scenarios: {{range .Vars.constitution.directives.lose_scenarios}}{{.}}; {{end}}
+Key events to dramatize: {{range .Vars.constitution.directives.key_events}}{{.}}; {{end}}
+Difficulty: {{.Vars.constitution.difficulty}}
+
+CURRENT STATE
+Step: {{.Vars.play.step}}   Location: {{.Inputs.location}}   Tension: {{.Vars.play.tension}}
+Known facts: {{range .Vars.play.facts}}{{.}}; {{end}}
+Previous options (do NOT repeat): {{range .Vars.play.previous_options}}{{.label}}; {{end}}
+
+THE SCENE
+{{.Inputs.Prose}}
+
+{{if .Inputs.action}}The player chose: {{.Inputs.action}}{{end}}
+
+Return the JSON analysis.

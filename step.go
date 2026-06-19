@@ -83,6 +83,18 @@ type StepRequest struct {
 	// per-user key routing in a custom generator.
 	Overrides map[string]any
 
+	// ResponseFormat is the output contract resolved for this step (from the
+	// agent or its system prompt). The engine sets it before hooks run so a
+	// post-hook can validate the result against the schema.
+	ResponseFormat *ResponseFormat
+
+	// Params is a free-form map of tuning knobs for this call: model params
+	// (temperature, max_tokens, top_p, seed, frequency_penalty, presence_penalty,
+	// width, height, duration_sec) are folded into the typed generation params,
+	// and the whole map is forwarded to the generator (GenerateRequest.ParamsMap)
+	// and template ({{.Params.x}}) so domain knobs like "tension" flow through.
+	Params map[string]any
+
 	// Annotations carried from previous retry attempts.
 	annotations []RetryAnnotation
 
@@ -90,7 +102,14 @@ type StepRequest struct {
 	// single logical turn for branching, replay, and cost rollups.
 	turnID   uuid.UUID
 	turnRole string
+	// bus is the per-turn cross-agent channel fabric, set by RunTurn.
+	bus Bus
 }
+
+// Bus returns the per-turn cross-agent communication fabric for this step, or nil
+// if the step is not part of a RunTurn. Hooks and plugins use it to publish or
+// subscribe alongside the turn's agents.
+func (r *StepRequest) Bus() Bus { return r.bus }
 
 // StepRunner executes a step request against a session.
 type StepRunner interface {

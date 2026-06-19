@@ -1,0 +1,112 @@
+{
+	"type": "object",
+	"properties": {
+		"turn_id": { "type": "string" },
+		"title": { "type": "string" },
+		"status": { "type": "string", "enum": ["ONGOING", "ENDED_VICTORY", "ENDED_DEFEAT", "ENDED_NEUTRAL"] },
+		"options": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"properties": {
+					"label": { "type": "string" },
+					"type": { "type": "string", "enum": ["cautious", "bold", "social", "investigate", "creative", "emotional"] },
+					"detail": { "type": "string" }
+				},
+				"required": ["label", "type", "detail"],
+				"additionalProperties": false
+			}
+		},
+		"state_patch": {
+			"type": "object",
+			"properties": {
+				"location": { "type": "string" },
+				"time": { "type": "string" },
+				"characters_joined": { "type": "array", "items": { "type": "string" } },
+				"characters_left": { "type": "array", "items": { "type": "string" } },
+				"facts_add": { "type": "array", "items": { "type": "string" } },
+				"facts_remove": { "type": "array", "items": { "type": "string" } },
+				"tension": { "type": ["number", "null"], "minimum": 0, "maximum": 1, "description": "Optional. 0.0-1.0. Emit null when unchanged from the previous turn (null preserves prior tension)." },
+				"scene_type": { "type": "string", "enum": ["dialogue", "action", "exploration", "puzzle", "social", "discovery", "world_event", "divine_intervention", "narrative_shift"] },
+				"tone": { "type": "string" },
+				"key_events_fired": { "type": "array", "items": { "type": "integer" }, "description": "Indices (K-numbers) of the encoded KEY EVENTS this scene's prose actually dramatized on the page. Empty array when none fired this scene. Report a beat ONLY when the scene realized it, never on a passing mention." }
+			},
+			"required": ["location", "time", "characters_joined", "characters_left", "facts_add", "facts_remove", "tension", "scene_type", "tone", "key_events_fired"],
+			"additionalProperties": false
+		},
+		"character_updates": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"properties": {
+					"character_id": { "type": "string" },
+					"health_delta": { "type": "integer" },
+					"mood": { "type": "string" },
+					"add_injuries": { "type": "array", "items": { "type": "string" } },
+					"remove_injuries": { "type": "array", "items": { "type": "string" } },
+					"traits_delta": { "type": "object", "additionalProperties": { "type": "number" } },
+					"relations_delta": { "type": "object", "additionalProperties": { "type": "number" } },
+					"add_goals": { "type": "array", "items": { "type": "string" } },
+					"image_description_patch": { "type": "string" }
+				},
+				"required": ["character_id", "health_delta", "mood", "add_injuries", "remove_injuries", "add_goals", "image_description_patch"],
+				"additionalProperties": false
+			}
+		},
+		"difficulty_eval": {
+			"type": "object",
+			"properties": {
+				"choice_quality": { "type": "string", "enum": ["good", "neutral", "poor"] },
+				"fail_triggered": { "type": "boolean" },
+				"fail_reason": { "type": "string" }
+			},
+			"required": ["choice_quality", "fail_triggered", "fail_reason"],
+			"additionalProperties": false
+		},
+		"pacing": {
+			"type": "object",
+			"properties": {
+				"arc_position": { "type": "string", "enum": ["setup", "rising_action", "climax", "falling_action", "resolution"] },
+				"next_turn_guidance": { "type": "string", "enum": ["accelerate", "breathe", "maintain", "end_victory", "end_defeat", "end_neutral"] },
+				"approaching_climax": { "type": "boolean" },
+				"avoid_repetition": { "type": "array", "items": { "type": "string" } }
+			},
+			"required": ["arc_position", "next_turn_guidance", "approaching_climax", "avoid_repetition"],
+			"additionalProperties": false
+		},
+		"end_card": {
+			"type": "object",
+			"description": "Legacy Card payload. When status is ONGOING, every string is empty. When status is ENDED_*, every field is populated per the prompt's LEGACY CARD RULES.",
+			"properties": {
+				"summary":  { "type": "string" },
+				"outcome":  { "type": "string" },
+				"visual_data": {
+					"type": "object",
+					"properties": {
+						"style_guide":      { "type": "string" },
+						"character_anchor": { "type": "string" },
+						"hero_shot_scene":  { "type": "string" }
+					},
+					"required": ["style_guide", "character_anchor", "hero_shot_scene"],
+					"additionalProperties": false
+				},
+				"player_profile": {
+					"type": "object",
+					"properties": {
+						"archetype":       { "type": "string" },
+						"superpower_name": { "type": "string" },
+						"superpower_desc": { "type": "string" },
+						"analysis":        { "type": "string" },
+						"key_moment":      { "type": "string" }
+					},
+					"required": ["archetype", "superpower_name", "superpower_desc", "analysis", "key_moment"],
+					"additionalProperties": false
+				}
+			},
+			"required": ["summary", "outcome", "visual_data", "player_profile"],
+			"additionalProperties": false
+		}
+	},
+	"required": ["turn_id", "title", "status", "options", "state_patch", "character_updates", "difficulty_eval", "pacing", "end_card"],
+	"additionalProperties": false
+}

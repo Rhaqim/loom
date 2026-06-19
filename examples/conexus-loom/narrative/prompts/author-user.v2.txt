@@ -1,0 +1,16 @@
+STORY BIBLE
+{{.Vars.bible}}
+
+CURRENT SCENE
+Location: {{.Inputs.location}}   Time: {{.Vars.play.time}}   Tension: {{.Vars.play.tension}}   Tone: {{.Vars.play.tone}}
+Characters present: {{range .Vars.play.characters_present}}{{.}}, {{end}}
+{{if .Inputs.recalled_memories}}
+RELEVANT PAST{{range .Inputs.recalled_memories}}
+- {{.}}{{end}}
+{{end}}{{if .Inputs.recent_prose}}
+PREVIOUSLY
+{{.Inputs.recent_prose}}
+{{end}}
+{{if .Inputs.action}}THE PLAYER CHOOSES: {{.Inputs.action}}
+
+Write the scene that follows from this choice.{{else}}Write the opening scene.{{end}}

@@ -1,0 +1,7 @@
+VISUAL STYLE: {{.Inputs.visual_style}}
+LOCATION: {{.Inputs.location}}
+
+THE SCENE
+{{.Inputs.Prose}}
+
+Return the JSON direction.
