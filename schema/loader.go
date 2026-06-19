@@ -74,6 +74,7 @@ func postgresStatements(p string) []string {
 			body          TEXT NOT NULL,
 			variables     JSONB NOT NULL DEFAULT '[]',
 			metadata      JSONB NOT NULL DEFAULT '{}',
+			response_format JSONB,
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 			notes         TEXT NOT NULL DEFAULT '',
 			UNIQUE (slug, version, kind)
@@ -272,6 +273,7 @@ func sqliteStatements(p string) []string {
 			body TEXT NOT NULL,
 			variables TEXT NOT NULL DEFAULT '[]',
 			metadata TEXT NOT NULL DEFAULT '{}',
+			response_format TEXT,
 			created_at DATETIME NOT NULL,
 			notes TEXT NOT NULL DEFAULT '',
 			UNIQUE (slug, version, kind)

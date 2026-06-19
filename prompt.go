@@ -2,6 +2,9 @@ package loom
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,8 +20,38 @@ type Prompt struct {
 	Body      string   // raw template text
 	Variables []string // documented input variable names
 	Metadata  map[string]any
-	CreatedAt time.Time
-	Notes     string // design rationale, change notes
+	// ResponseFormat is the expected output schema for agents driven by this
+	// prompt. It is stored in the DB alongside the prompt so the prompt and its
+	// output contract travel together: when an agent's own ResponseFormat is nil,
+	// the engine uses the system prompt's ResponseFormat for generation. Most
+	// useful on system prompts (Kind == PromptKindSystem).
+	ResponseFormat *ResponseFormat
+	CreatedAt      time.Time
+	Notes          string // design rationale, change notes
+}
+
+// ResponseFormatJSON builds a ResponseFormat from a raw JSON Schema string — the
+// easy path for attaching an output schema to a prompt (paste the schema a client
+// authored straight into the DB). An empty/blank raw yields a non-nil
+// ResponseFormat with no schema, which generators treat as portable JSON mode.
+func ResponseFormatJSON(rawSchema string, strict bool) (*ResponseFormat, error) {
+	rf := &ResponseFormat{StrictMode: strict}
+	if s := strings.TrimSpace(rawSchema); s != "" {
+		if err := json.Unmarshal([]byte(s), &rf.Schema); err != nil {
+			return nil, fmt.Errorf("loom: response format schema: %w", err)
+		}
+	}
+	return rf, nil
+}
+
+// MustResponseFormatJSON is ResponseFormatJSON that panics on invalid JSON —
+// convenient for static schemas defined in code.
+func MustResponseFormatJSON(rawSchema string, strict bool) *ResponseFormat {
+	rf, err := ResponseFormatJSON(rawSchema, strict)
+	if err != nil {
+		panic(err)
+	}
+	return rf
 }
 
 // PromptKind discriminates between system and user template prompts.

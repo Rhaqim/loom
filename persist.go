@@ -130,37 +130,43 @@ func scanAgent(row agentRow) (*Agent, error) {
 // Prompt persistence
 // -----------------------------------------------------------------------
 
+const promptColumns = "id, slug, version, kind, category, body, variables, metadata, response_format, created_at, notes"
+
 func sqlInsertPrompt(ctx context.Context, db *sql.DB, prefix string, p *Prompt) error {
 	varsJSON, _ := json.Marshal(p.Variables)
 	metaJSON, _ := json.Marshal(p.Metadata)
+	var rfJSON []byte
+	if p.ResponseFormat != nil {
+		rfJSON, _ = json.Marshal(p.ResponseFormat)
+	}
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %sprompts
-			(id, slug, version, kind, category, body, variables, metadata, created_at, notes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, prefix),
+			(id, slug, version, kind, category, body, variables, metadata, response_format, created_at, notes)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, prefix),
 		p.ID, p.Slug, p.Version, string(p.Kind), p.Category,
-		p.Body, varsJSON, metaJSON, p.CreatedAt, p.Notes,
+		p.Body, varsJSON, metaJSON, nullableJSON(rfJSON), p.CreatedAt, p.Notes,
 	)
 	return err
 }
 
 func sqlQueryPrompt(ctx context.Context, db *sql.DB, prefix, slug string, version int) (*Prompt, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT id, slug, version, kind, category, body, variables, metadata, created_at, notes
-		FROM %sprompts WHERE slug=$1 AND version=$2`, prefix), slug, version)
+		SELECT %s
+		FROM %sprompts WHERE slug=$1 AND version=$2`, promptColumns, prefix), slug, version)
 	return scanPrompt(row)
 }
 
 func sqlQueryPromptLatest(ctx context.Context, db *sql.DB, prefix, slug string) (*Prompt, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT id, slug, version, kind, category, body, variables, metadata, created_at, notes
-		FROM %sprompts WHERE slug=$1 ORDER BY version DESC LIMIT 1`, prefix), slug)
+		SELECT %s
+		FROM %sprompts WHERE slug=$1 ORDER BY version DESC LIMIT 1`, promptColumns, prefix), slug)
 	return scanPrompt(row)
 }
 
 func sqlQueryPromptByID(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Prompt, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT id, slug, version, kind, category, body, variables, metadata, created_at, notes
-		FROM %sprompts WHERE id=$1`, prefix), id)
+		SELECT %s
+		FROM %sprompts WHERE id=$1`, promptColumns, prefix), id)
 	return scanPrompt(row)
 }
 
@@ -175,7 +181,7 @@ func sqlListPrompts(ctx context.Context, db *sql.DB, prefix string, kind PromptK
 		args = append(args, category)
 		conds = append(conds, fmt.Sprintf("category=$%d", len(args)))
 	}
-	q := fmt.Sprintf("SELECT id, slug, version, kind, category, body, variables, metadata, created_at, notes FROM %sprompts", prefix)
+	q := fmt.Sprintf("SELECT %s FROM %sprompts", promptColumns, prefix)
 	if len(conds) > 0 {
 		q += " WHERE " + strings.Join(conds, " AND ")
 	}
@@ -202,12 +208,12 @@ type promptRow interface {
 
 func scanPrompt(row promptRow) (*Prompt, error) {
 	var (
-		p                  Prompt
-		kind               string
-		varsJSON, metaJSON []byte
+		p                          Prompt
+		kind                       string
+		varsJSON, metaJSON, rfJSON []byte
 	)
 	err := row.Scan(&p.ID, &p.Slug, &p.Version, &kind, &p.Category,
-		&p.Body, &varsJSON, &metaJSON, &p.CreatedAt, &p.Notes)
+		&p.Body, &varsJSON, &metaJSON, &rfJSON, &p.CreatedAt, &p.Notes)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -217,7 +223,19 @@ func scanPrompt(row promptRow) (*Prompt, error) {
 	p.Kind = PromptKind(kind)
 	_ = json.Unmarshal(varsJSON, &p.Variables)
 	_ = json.Unmarshal(metaJSON, &p.Metadata)
+	if len(rfJSON) > 0 {
+		_ = json.Unmarshal(rfJSON, &p.ResponseFormat)
+	}
 	return &p, nil
+}
+
+// nullableJSON returns nil (SQL NULL) for empty JSON so a missing response_format
+// stays NULL rather than an empty string.
+func nullableJSON(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 // -----------------------------------------------------------------------

@@ -503,6 +503,7 @@ func (s *stepService) buildGenerateRequest(
 	annotations := req.annotations
 	// Load system prompt — cached by UUID.
 	systemPrompt := ""
+	var systemResponseFormat *ResponseFormat
 	if agent.SystemPromptID != uuid.Nil {
 		spKey := cacheKey("prompt-id", s.e.prefix, agent.SystemPromptID.String(), 0)
 		var sp *Prompt
@@ -517,6 +518,7 @@ func (s *stepService) buildGenerateRequest(
 			cacheSet(ctx, s.e.cache, spKey, sp)
 		}
 		systemPrompt = sp.Body
+		systemResponseFormat = sp.ResponseFormat
 	}
 
 	// Load and render user template — cached by UUID.
@@ -550,6 +552,14 @@ func (s *stepService) buildGenerateRequest(
 		params = *req.ParamOverride
 	}
 
+	// The agent's own ResponseFormat wins; otherwise fall back to the one stored
+	// on its system prompt, so a response format authored alongside a prompt is
+	// applied without also configuring the agent.
+	responseFormat := agent.ResponseFormat
+	if responseFormat == nil {
+		responseFormat = systemResponseFormat
+	}
+
 	// Snapshot history under a read lock — RunTurn runs follower agents
 	// concurrently, and a sibling's locked tail may be appending right now.
 	s.e.mu.RLock()
@@ -560,7 +570,7 @@ func (s *stepService) buildGenerateRequest(
 		SystemPrompt:   systemPrompt,
 		UserPrompt:     userPrompt,
 		Params:         params,
-		ResponseFormat: agent.ResponseFormat,
+		ResponseFormat: responseFormat,
 		Context:        histContext,
 		SessionID:      session.ID,
 		AgentID:        agent.ID,
