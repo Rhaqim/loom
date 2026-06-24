@@ -146,6 +146,11 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		Steps:     []*Step{leadStep},
 	}
 
+	// Freeze the inputs (the lead's output is already injected) once. Every
+	// follower reads from this immutable snapshot, so concurrent followers never
+	// touch the shared inputs map.
+	followerInputs := cloneInputs(inputs)
+
 	// ---- Followers (concurrent) ----
 	var (
 		mu sync.Mutex
@@ -163,7 +168,7 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 				// analyse the lead's output and read the action via Inputs, so they
 				// carry no Action (sharing the lead's would duplicate its ID).
 				Action:            nil,
-				Inputs:            cloneInputs(inputs),
+				Inputs:            cloneInputs(followerInputs),
 				Params:            mergeParams(req.Params, f.Params),
 				Overrides:         pickOverrides(f.Overrides, req.Overrides),
 				GeneratorOverride: f.GeneratorOverride,
@@ -180,12 +185,6 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 			if ferr != nil {
 				e.log.Error("turn follower failed", "turn_id", turnID, "agent", f.AgentSlug, "err", ferr)
 				return
-			}
-			if f.OutputKey != "" {
-				// Make this follower's output visible on the returned inputs map
-				// for callers that inspect it; later followers do not see it
-				// (followers run in parallel by design).
-				inputs[f.OutputKey] = ResultText(step.Result)
 			}
 			turn.Followers[f.AgentSlug] = step
 			turn.Steps = append(turn.Steps, step)
