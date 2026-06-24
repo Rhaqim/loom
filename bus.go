@@ -72,6 +72,19 @@ func newBus() *busImpl {
 	return b
 }
 
+// deliver sends one message to a subscriber without ever blocking the sole
+// dispatcher: it honours turn-end (b.done) and drops the message to a subscriber
+// whose 256-slot buffer is already full. Dropping a straggler is preferable to
+// wedging the dispatcher, which would otherwise block every publisher for the
+// rest of the turn.
+func (b *busImpl) deliver(s subscription, msg Message) {
+	select {
+	case s.ch <- msg:
+	case <-b.done:
+	default:
+	}
+}
+
 // run is the sole owner of subscriber channels.
 func (b *busImpl) run() {
 	var subs []subscription
@@ -86,7 +99,7 @@ func (b *busImpl) run() {
 			b.mu.Unlock()
 			for _, s := range subs {
 				if s.topic == TopicAll || s.topic == msg.Topic {
-					s.ch <- msg
+					b.deliver(s, msg)
 				}
 			}
 		case s := <-b.sub:
@@ -95,7 +108,7 @@ func (b *busImpl) run() {
 			b.mu.Unlock()
 			for _, msg := range backlog {
 				if s.topic == TopicAll || s.topic == msg.Topic {
-					s.ch <- msg
+					b.deliver(s, msg)
 				}
 			}
 			subs = append(subs, s)
