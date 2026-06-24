@@ -438,23 +438,37 @@ func scanSession(row sessionRow) (*Session, error) {
 // Step persistence
 // -----------------------------------------------------------------------
 
+// execer is satisfied by both *sql.DB and *sql.Tx, letting the row-insert
+// helpers run either standalone or inside a transaction.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step) error {
 	reqJSON, _ := json.Marshal(step.Request)
-	resultJSON, _ := marshalResultForStorage(step.Result)
 	diagJSON, _ := json.Marshal(step.Diagnostics)
 	annJSON, _ := json.Marshal(step.Annotations)
+
+	// All three writes (action, result, step) commit atomically so a failure on
+	// the final steps INSERT cannot orphan the result/action rows.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	var actionID *string
 	if step.Action != nil {
 		s := step.Action.ID.String()
 		actionID = &s
-		if err := sqlInsertAction(ctx, db, prefix, step.SessionID, step.Index, step.Action); err != nil {
+		if err := sqlInsertAction(ctx, tx, prefix, step.SessionID, step.Index, step.Action); err != nil {
 			return fmt.Errorf("persist action: %w", err)
 		}
 	}
-	if err := sqlInsertResult(ctx, db, prefix, step); err != nil {
+	if err := sqlInsertResult(ctx, tx, prefix, step); err != nil {
 		return fmt.Errorf("persist result: %w", err)
 	}
-	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %ssteps
 			(id, session_id, step_index, agent_id, request, result_id,
 			 action_id, annotations, diagnostics, duration_ms, created_at)
@@ -462,12 +476,13 @@ func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step) e
 		step.ID, step.SessionID, step.Index, step.AgentID,
 		reqJSON, step.Result.ResultID(),
 		actionID, annJSON, diagJSON, step.DurationMs, step.CreatedAt,
-	)
-	_ = resultJSON
-	return err
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func sqlInsertResult(ctx context.Context, db *sql.DB, prefix string, step *Step) error {
+func sqlInsertResult(ctx context.Context, db execer, prefix string, step *Step) error {
 	payload, _ := marshalResultForStorage(step.Result)
 	var taskID *string
 	if th := step.Result.TaskHandle(); th != nil {
@@ -484,7 +499,7 @@ func sqlInsertResult(ctx context.Context, db *sql.DB, prefix string, step *Step)
 	return err
 }
 
-func sqlInsertAction(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID, stepIndex int, action *Action) error {
+func sqlInsertAction(ctx context.Context, db execer, prefix string, sessionID uuid.UUID, stepIndex int, action *Action) error {
 	payloadJSON, _ := json.Marshal(action.Payload)
 	metaJSON, _ := json.Marshal(action.Metadata)
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
