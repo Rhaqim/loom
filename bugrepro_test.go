@@ -10,6 +10,7 @@ package loom
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -60,8 +61,9 @@ func (failingStreamGen) GenerateStream(context.Context, GenerateRequest) (<-chan
 	results := make(chan Result, 1)
 	go func() {
 		close(chunks) // provider failed: no chunks produced
-		// Adapters encode a failure as a ResultStatusReady (NOT Failed) empty result.
-		results <- NewTextResult("", "error", 0, 0)
+		// A corrected adapter signals a stream failure with a ResultStatusFailed
+		// result; the engine must surface it rather than persist an empty turn.
+		results <- NewFailedResult(ModalityText, errors.New("provider failed"))
 		close(results)
 	}()
 	return chunks, results, nil

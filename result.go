@@ -188,6 +188,25 @@ func NewPendingResult(modality Modality, handle *TaskHandle) Result {
 	}
 }
 
+// NewFailedResult creates a failed Result carrying the error message in metadata
+// under "error". Streaming generators send this on the result channel to signal a
+// provider failure so the engine surfaces it instead of persisting an empty
+// successful turn.
+func NewFailedResult(modality Modality, err error) Result {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	return &baseResult{
+		ID:        uuid.New(),
+		modal:     modality,
+		status:    ResultStatusFailed,
+		meta:      map[string]any{"error": msg},
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+}
+
 // NewWorldResult creates a ready WorldResult.
 func NewWorldResult(deltas []WorldDelta) *WorldResult {
 	return &WorldResult{

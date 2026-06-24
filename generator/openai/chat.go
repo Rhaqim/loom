@@ -274,7 +274,5 @@ func (g *ChatGenerator) postStream(ctx context.Context, path string, body []byte
 
 // newFailedResult returns a minimal failed result for goroutine error propagation.
 func newFailedResult(err error) loom.Result {
-	r := loom.NewTextResult("", "error", 0, 0)
-	r.Metadata()["error"] = err.Error()
-	return r
+	return loom.NewFailedResult(loom.ModalityText, err)
 }
