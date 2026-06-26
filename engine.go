@@ -90,6 +90,7 @@ type Engine struct {
 	budgets         *budgetService
 	judges          JudgeRegistry
 	gc              *gcService
+	flows           *flowService
 	poller          *asyncPollerService
 
 	mu sync.RWMutex
@@ -140,6 +141,7 @@ func New(cfg Config) (*Engine, error) {
 	e.budgets = &budgetService{e: e}
 	e.judges = newJudgeRegistryImpl()
 	e.gc = &gcService{e: e}
+	e.flows = &flowService{e: e}
 
 	if cfg.AsyncPoller.Workers > 0 {
 		e.poller = newAsyncPollerService(e, cfg.AsyncPoller)
@@ -191,6 +193,9 @@ func (e *Engine) Judges() JudgeRegistry { return e.judges }
 
 // GC returns the branch garbage collection service.
 func (e *Engine) GC() GCService { return e.gc }
+
+// Flows returns the persisted-flow (agent map) registry.
+func (e *Engine) Flows() FlowRegistry { return e.flows }
 
 // StartPoller starts the background async-result poller. It is a no-op if
 // AsyncPoller.Workers == 0 in the config.

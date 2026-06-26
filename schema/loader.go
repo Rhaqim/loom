@@ -118,6 +118,32 @@ func postgresStatements(p string) []string {
 			UNIQUE (slug, version)
 		)`, p, p, p, p),
 
+		// Flows (persisted agent maps)
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sflows (
+			id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			owner       TEXT NOT NULL DEFAULT '',
+			slug        TEXT NOT NULL,
+			version     INT NOT NULL,
+			topic_id    TEXT,
+			category    TEXT NOT NULL DEFAULT '',
+			is_active   INT NOT NULL DEFAULT 1,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (owner, slug, version)
+		)`, p),
+
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sflow_agents (
+			id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			flow_id            UUID NOT NULL REFERENCES %sflows(id) ON DELETE CASCADE,
+			position           INT NOT NULL,
+			agent_slug         TEXT NOT NULL,
+			agent_version      INT NOT NULL DEFAULT 0,
+			output_key         TEXT NOT NULL DEFAULT '',
+			stream             INT NOT NULL DEFAULT 0,
+			generator_override TEXT NOT NULL DEFAULT '',
+			params             JSONB NOT NULL DEFAULT '{}',
+			UNIQUE (flow_id, position)
+		)`, p, p),
+
 		// Sessions
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %ssessions (
 			id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -323,6 +349,31 @@ func sqliteStatements(p string) []string {
 			fallback_agent_id TEXT,
 			created_at DATETIME NOT NULL,
 			UNIQUE (slug, version)
+		)`, p),
+
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sflows (
+			id          TEXT PRIMARY KEY,
+			owner       TEXT NOT NULL DEFAULT '',
+			slug        TEXT NOT NULL,
+			version     INTEGER NOT NULL,
+			topic_id    TEXT,
+			category    TEXT NOT NULL DEFAULT '',
+			is_active   INTEGER NOT NULL DEFAULT 1,
+			created_at  DATETIME NOT NULL,
+			UNIQUE (owner, slug, version)
+		)`, p),
+
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sflow_agents (
+			id                 TEXT PRIMARY KEY,
+			flow_id            TEXT NOT NULL,
+			position           INTEGER NOT NULL,
+			agent_slug         TEXT NOT NULL,
+			agent_version      INTEGER NOT NULL DEFAULT 0,
+			output_key         TEXT NOT NULL DEFAULT '',
+			stream             INTEGER NOT NULL DEFAULT 0,
+			generator_override TEXT NOT NULL DEFAULT '',
+			params             TEXT NOT NULL DEFAULT '{}',
+			UNIQUE (flow_id, position)
 		)`, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %ssessions (
