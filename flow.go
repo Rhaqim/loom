@@ -146,12 +146,11 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		Steps:     []*Step{leadStep},
 	}
 
-	// Freeze the inputs (the lead's output is already injected) once. Every
-	// follower reads from this immutable snapshot, so concurrent followers never
-	// touch the shared inputs map.
-	followerInputs := cloneInputs(inputs)
-
 	// ---- Followers (concurrent) ----
+	// The shared inputs map is only READ from here on: the lead's output was
+	// injected above, before any goroutine starts, and nothing writes back into
+	// it during the fan-out. So each follower's cloneInputs is its own private
+	// copy with no write to race against.
 	var (
 		mu sync.Mutex
 		wg sync.WaitGroup
@@ -168,7 +167,7 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 				// analyse the lead's output and read the action via Inputs, so they
 				// carry no Action (sharing the lead's would duplicate its ID).
 				Action:            nil,
-				Inputs:            cloneInputs(followerInputs),
+				Inputs:            cloneInputs(inputs),
 				Params:            mergeParams(req.Params, f.Params),
 				Overrides:         pickOverrides(f.Overrides, req.Overrides),
 				GeneratorOverride: f.GeneratorOverride,
