@@ -2,6 +2,7 @@ package loom
 
 import (
 	"context"
+	"maps"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +31,28 @@ type State struct {
 	Snapshot         []byte         // serialized application state (opaque to engine)
 	Vars             map[string]any // engine-tracked typed variables
 	AvailableActions []ActionTemplate
+}
+
+// forStep returns a shallow copy of the session with a cloned State.Vars map so
+// a step's pre-hooks and template render mutate and read private state instead of
+// racing concurrent sibling steps in the same turn. Hook-written Vars are merged
+// back onto the shared session via mergeVars under the engine lock.
+func (s *Session) forStep() *Session {
+	cp := *s
+	cp.State.Vars = maps.Clone(s.State.Vars)
+	return &cp
+}
+
+// mergeVars copies a step's (possibly hook-mutated) Vars onto dst, lazily
+// allocating dst.Vars. A no-op when vars is empty.
+func mergeVars(dst *State, vars map[string]any) {
+	if len(vars) == 0 {
+		return
+	}
+	if dst.Vars == nil {
+		dst.Vars = make(map[string]any, len(vars))
+	}
+	maps.Copy(dst.Vars, vars)
 }
 
 // BranchNode represents a node in the session branch tree.

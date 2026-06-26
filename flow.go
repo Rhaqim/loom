@@ -147,6 +147,10 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 	}
 
 	// ---- Followers (concurrent) ----
+	// The shared inputs map is only READ from here on: the lead's output was
+	// injected above, before any goroutine starts, and nothing writes back into
+	// it during the fan-out. So each follower's cloneInputs is its own private
+	// copy with no write to race against.
 	var (
 		mu sync.Mutex
 		wg sync.WaitGroup
@@ -180,12 +184,6 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 			if ferr != nil {
 				e.log.Error("turn follower failed", "turn_id", turnID, "agent", f.AgentSlug, "err", ferr)
 				return
-			}
-			if f.OutputKey != "" {
-				// Make this follower's output visible on the returned inputs map
-				// for callers that inspect it; later followers do not see it
-				// (followers run in parallel by design).
-				inputs[f.OutputKey] = ResultText(step.Result)
 			}
 			turn.Followers[f.AgentSlug] = step
 			turn.Steps = append(turn.Steps, step)

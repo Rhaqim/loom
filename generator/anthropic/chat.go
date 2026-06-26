@@ -69,7 +69,7 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 
 		respBody, err := g.postRaw(ctx, "/messages", body)
 		if err != nil {
-			results <- loom.NewTextResult("", "error", 0, 0)
+			results <- loom.NewFailedResult(loom.ModalityText, err)
 			return
 		}
 		defer respBody.Close()

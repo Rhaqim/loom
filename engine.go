@@ -396,8 +396,17 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		return nil, fmt.Errorf("loom: generator %q not registered", genSlug)
 	}
 
-	// Expose the session to hooks before they run.
-	req.Session = session
+	// Each step runs against a per-step copy of the session so concurrent
+	// followers in a turn mutate/read their own State.Vars instead of racing on
+	// the shared map; hook-written Vars are merged back under the lock below. The
+	// copy is taken under the read lock so it does not race a sibling follower's
+	// locked persist tail (which appends History and writes State).
+	s.e.mu.RLock()
+	stepSession := session.forStep()
+	s.e.mu.RUnlock()
+
+	// Expose the (per-step) session to hooks before they run.
+	req.Session = stepSession
 
 	// Run pre-hooks first so they can mutate session state (e.g. inject recalled
 	// memories into State.Vars or set req.Inputs) *before* the user template is
@@ -411,7 +420,7 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 
 	// Build GenerateRequest (renders user template, loads system prompt) using
 	// the (possibly hook-mutated) session and request.
-	genReq, err := s.buildGenerateRequest(ctx, session, agent, &req)
+	genReq, err := s.buildGenerateRequest(ctx, stepSession, agent, &req)
 	if err != nil {
 		return nil, err
 	}
@@ -434,10 +443,37 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 			if streamErr != nil {
 				return nil, fmt.Errorf("loom: generator stream: %w", streamErr)
 			}
-			for c := range chunks {
-				req.OnChunk(c)
+			// Forward chunks until the adapter closes the channel, honouring
+			// cancellation so a stuck stream cannot hang the step.
+		drainChunks:
+			for {
+				select {
+				case c, more := <-chunks:
+					if !more {
+						break drainChunks
+					}
+					req.OnChunk(c)
+				case <-ctx.Done():
+					return nil, fmt.Errorf("loom: generator stream: %w", ctx.Err())
+				}
 			}
-			result = <-resultCh
+			var more bool
+			select {
+			case result, more = <-resultCh:
+			case <-ctx.Done():
+				return nil, fmt.Errorf("loom: generator stream: %w", ctx.Err())
+			}
+			// Mirror the sync error path: a closed channel (no result) or a failed
+			// result is a generator error, not a successful empty turn.
+			if !more || result == nil {
+				return nil, fmt.Errorf("loom: generator stream: no result")
+			}
+			if result.Status() == ResultStatusFailed {
+				if msg, _ := result.Metadata()["error"].(string); msg != "" {
+					return nil, fmt.Errorf("loom: generator stream: %s", msg)
+				}
+				return nil, fmt.Errorf("loom: generator stream: failed")
+			}
 		} else {
 			result, err = gen.Generate(ctx, genReq)
 			if err != nil {
@@ -498,6 +534,9 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	// Update session history and state.
 	session.History = append(session.History, *step)
 	session.State.Modality = result.Modality()
+	// Reconcile any Vars the hooks wrote on the per-step copy back onto the
+	// shared session (last writer wins), under the lock.
+	mergeVars(&session.State, stepSession.State.Vars)
 	if err := s.e.sessions.Update(ctx, session); err != nil {
 		s.e.log.Error("update session after step", "session_id", session.ID, "err", err)
 	}
@@ -868,7 +907,7 @@ func (p *asyncPollerService) pollPending(ctx context.Context) {
 		return
 	}
 	for _, t := range tasks {
-		gen, ok := p.e.generators[t.Provider]
+		gen, ok := p.e.generator(t.Provider)
 		if !ok {
 			continue
 		}
