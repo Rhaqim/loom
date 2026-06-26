@@ -12,6 +12,7 @@ import (
 type Agent struct {
 	ID             uuid.UUID
 	Slug           string    // human-readable identifier
+	Owner          string    // opaque app-owned scope ("" = global); reserved for future per-tenant use
 	Version        int       // monotonically increasing
 	Category       string    // platform-defined grouping
 	Modal          Modality  // the modality this agent produces
@@ -39,4 +40,7 @@ type AgentRegistry interface {
 	Create(ctx context.Context, a *Agent) error
 	// List returns all agents matching optional category filter.
 	List(ctx context.Context, category string) ([]*Agent, error)
+	// Delete removes a specific agent version (>= 1). On Postgres it fails if the
+	// version is still referenced (e.g. by persisted steps, ON DELETE RESTRICT).
+	Delete(ctx context.Context, slug string, version int) error
 }

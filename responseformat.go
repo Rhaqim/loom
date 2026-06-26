@@ -2,6 +2,7 @@ package loom
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,7 @@ import (
 type ResponseFormatRecord struct {
 	ID         uuid.UUID
 	Slug       string // human-readable identifier, e.g. "logician-schema"
+	Owner      string // opaque app-owned scope ("" = global); reserved for future per-tenant use
 	Version    int    // monotonically increasing; editing creates a new version
 	Schema     map[string]any
 	StrictMode bool
@@ -42,6 +44,9 @@ type ResponseFormatRegistry interface {
 	Latest(ctx context.Context, slug string) (*ResponseFormatRecord, error)
 	// GetByID retrieves a response format by ID.
 	GetByID(ctx context.Context, id uuid.UUID) (*ResponseFormatRecord, error)
+	// Delete removes a specific response-format version (>= 1). On Postgres it
+	// fails if the version is still referenced by an agent (ON DELETE RESTRICT).
+	Delete(ctx context.Context, slug string, version int) error
 }
 
 // ResponseFormats returns the response-format registry.
@@ -90,4 +95,24 @@ func (s *responseFormatService) GetByID(ctx context.Context, id uuid.UUID) (*Res
 	}
 	cacheSet(ctx, s.e.cache, key, r)
 	return r, nil
+}
+
+func (s *responseFormatService) Delete(ctx context.Context, slug string, version int) error {
+	if version < 1 {
+		return fmt.Errorf("loom: delete response format %q: an explicit version >= 1 is required", slug)
+	}
+	// Resolve the row id first so we can also evict the by-id cache that GetByID
+	// and the agent-build path populate (cacheKey "rf-id").
+	var id uuid.UUID
+	if rf, err := sqlQueryResponseFormat(ctx, s.e.db, s.e.prefix, slug, version); err == nil {
+		id = rf.ID
+	}
+	if err := sqlDeleteResponseFormat(ctx, s.e.db, s.e.prefix, slug, version); err != nil {
+		return err
+	}
+	cacheDelete(ctx, s.e.cache, cacheKey("rf", s.e.prefix, slug, version))
+	if id != uuid.Nil {
+		cacheDelete(ctx, s.e.cache, cacheKey("rf-id", s.e.prefix, id.String(), 0))
+	}
+	return nil
 }

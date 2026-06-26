@@ -20,7 +20,7 @@ import (
 
 const agentColumns = `id, slug, version, category, modality, generator_slug,
 	system_prompt_id, user_template_id, response_format_id, response_format, params,
-	fallback_agent_id, created_at`
+	fallback_agent_id, created_at, owner`
 
 func sqlInsertAgent(ctx context.Context, db *sql.DB, prefix string, a *Agent) error {
 	rfJSON, _ := json.Marshal(a.ResponseFormat)
@@ -39,12 +39,12 @@ func sqlInsertAgent(ctx context.Context, db *sql.DB, prefix string, a *Agent) er
 		INSERT INTO %sagents
 			(id, slug, version, category, modality, generator_slug,
 			 system_prompt_id, user_template_id, response_format_id, response_format, params,
-			 fallback_agent_id, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			 fallback_agent_id, created_at, owner)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		prefix),
 		a.ID, a.Slug, a.Version, a.Category, string(a.Modal),
 		a.GeneratorSlug, nullUUID(a.SystemPromptID), nullUUID(a.UserTemplateID),
-		rfID, rfJSON, paramsJSON, fallbackID, a.CreatedAt,
+		rfID, rfJSON, paramsJSON, fallbackID, a.CreatedAt, a.Owner,
 	)
 	return err
 }
@@ -101,7 +101,7 @@ func scanAgent(row agentRow) (*Agent, error) {
 	err := row.Scan(
 		&a.ID, &a.Slug, &a.Version, &a.Category, &modal, &a.GeneratorSlug,
 		&sysPromptID, &userTemplateID, &rfID, &rfJSON, &paramsJSON,
-		&fallbackID, &a.CreatedAt,
+		&fallbackID, &a.CreatedAt, &a.Owner,
 	)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
@@ -135,14 +135,14 @@ func scanAgent(row agentRow) (*Agent, error) {
 // Response-format persistence (reusable, versioned records)
 // -----------------------------------------------------------------------
 
-const responseFormatColumns = "id, slug, version, schema, strict, created_at"
+const responseFormatColumns = "id, slug, version, schema, strict, created_at, owner"
 
 func sqlInsertResponseFormat(ctx context.Context, db *sql.DB, prefix string, rf *ResponseFormatRecord) error {
 	schemaJSON, _ := json.Marshal(rf.Schema)
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %sresponse_formats (id, slug, version, schema, strict, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6)`, prefix),
-		rf.ID, rf.Slug, rf.Version, schemaJSON, rf.StrictMode, rf.CreatedAt,
+		INSERT INTO %sresponse_formats (id, slug, version, schema, strict, created_at, owner)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`, prefix),
+		rf.ID, rf.Slug, rf.Version, schemaJSON, rf.StrictMode, rf.CreatedAt, rf.Owner,
 	)
 	return err
 }
@@ -167,7 +167,7 @@ func scanResponseFormat(row promptRow) (*ResponseFormatRecord, error) {
 		r          ResponseFormatRecord
 		schemaJSON []byte
 	)
-	err := row.Scan(&r.ID, &r.Slug, &r.Version, &schemaJSON, &r.StrictMode, &r.CreatedAt)
+	err := row.Scan(&r.ID, &r.Slug, &r.Version, &schemaJSON, &r.StrictMode, &r.CreatedAt, &r.Owner)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -182,17 +182,17 @@ func scanResponseFormat(row promptRow) (*ResponseFormatRecord, error) {
 // Prompt persistence
 // -----------------------------------------------------------------------
 
-const promptColumns = "id, slug, version, kind, category, body, variables, metadata, created_at, notes"
+const promptColumns = "id, slug, version, kind, category, body, variables, metadata, created_at, notes, owner"
 
 func sqlInsertPrompt(ctx context.Context, db *sql.DB, prefix string, p *Prompt) error {
 	varsJSON, _ := json.Marshal(p.Variables)
 	metaJSON, _ := json.Marshal(p.Metadata)
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %sprompts
-			(id, slug, version, kind, category, body, variables, metadata, created_at, notes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, prefix),
+			(id, slug, version, kind, category, body, variables, metadata, created_at, notes, owner)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, prefix),
 		p.ID, p.Slug, p.Version, string(p.Kind), p.Category,
-		p.Body, varsJSON, metaJSON, p.CreatedAt, p.Notes,
+		p.Body, varsJSON, metaJSON, p.CreatedAt, p.Notes, p.Owner,
 	)
 	return err
 }
@@ -261,7 +261,7 @@ func scanPrompt(row promptRow) (*Prompt, error) {
 		varsJSON, metaJSON []byte
 	)
 	err := row.Scan(&p.ID, &p.Slug, &p.Version, &kind, &p.Category,
-		&p.Body, &varsJSON, &metaJSON, &p.CreatedAt, &p.Notes)
+		&p.Body, &varsJSON, &metaJSON, &p.CreatedAt, &p.Notes, &p.Owner)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -272,6 +272,25 @@ func scanPrompt(row promptRow) (*Prompt, error) {
 	_ = json.Unmarshal(varsJSON, &p.Variables)
 	_ = json.Unmarshal(metaJSON, &p.Metadata)
 	return &p, nil
+}
+
+// -----------------------------------------------------------------------
+// Deletes (agents, prompts, response formats)
+// -----------------------------------------------------------------------
+
+func sqlDeleteAgent(ctx context.Context, db *sql.DB, prefix, slug string, version int) error {
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %sagents WHERE slug=$1 AND version=$2`, prefix), slug, version)
+	return err
+}
+
+func sqlDeletePrompt(ctx context.Context, db *sql.DB, prefix, slug string, version int) error {
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %sprompts WHERE slug=$1 AND version=$2`, prefix), slug, version)
+	return err
+}
+
+func sqlDeleteResponseFormat(ctx context.Context, db *sql.DB, prefix, slug string, version int) error {
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %sresponse_formats WHERE slug=$1 AND version=$2`, prefix), slug, version)
+	return err
 }
 
 // -----------------------------------------------------------------------
