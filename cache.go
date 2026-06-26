@@ -70,6 +70,14 @@ func cacheSet[T any](ctx context.Context, c Cache, key string, v *T) {
 	c.Set(ctx, key, raw, CacheTTL)
 }
 
+// cacheDelete evicts a key. No-op when the cache is nil.
+func cacheDelete(ctx context.Context, c Cache, key string) {
+	if c == nil {
+		return
+	}
+	c.Delete(ctx, key)
+}
+
 // -----------------------------------------------------------------------
 // Built-in in-process cache (sync.Map, no dependencies)
 // -----------------------------------------------------------------------
