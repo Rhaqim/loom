@@ -68,6 +68,7 @@ func postgresStatements(p string) []string {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sprompts (
 			id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			slug          TEXT NOT NULL,
+			owner         TEXT NOT NULL DEFAULT '',
 			version       INT NOT NULL,
 			kind          TEXT NOT NULL CHECK (kind IN ('system','user_template')),
 			category      TEXT NOT NULL DEFAULT '',
@@ -93,6 +94,7 @@ func postgresStatements(p string) []string {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sresponse_formats (
 			id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			slug          TEXT NOT NULL,
+			owner         TEXT NOT NULL DEFAULT '',
 			version       INT NOT NULL,
 			schema        JSONB NOT NULL DEFAULT '{}',
 			strict        BOOL NOT NULL DEFAULT false,
@@ -104,6 +106,7 @@ func postgresStatements(p string) []string {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sagents (
 			id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			slug                TEXT NOT NULL,
+			owner               TEXT NOT NULL DEFAULT '',
 			version             INT NOT NULL,
 			category            TEXT NOT NULL DEFAULT '',
 			modality            TEXT NOT NULL,
@@ -304,6 +307,7 @@ func sqliteStatements(p string) []string {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sprompts (
 			id TEXT PRIMARY KEY,
 			slug TEXT NOT NULL,
+			owner TEXT NOT NULL DEFAULT '',
 			version INTEGER NOT NULL,
 			kind TEXT NOT NULL,
 			category TEXT NOT NULL DEFAULT '',
@@ -327,6 +331,7 @@ func sqliteStatements(p string) []string {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sresponse_formats (
 			id TEXT PRIMARY KEY,
 			slug TEXT NOT NULL,
+			owner TEXT NOT NULL DEFAULT '',
 			version INTEGER NOT NULL,
 			schema TEXT NOT NULL DEFAULT '{}',
 			strict INTEGER NOT NULL DEFAULT 0,
@@ -337,6 +342,7 @@ func sqliteStatements(p string) []string {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sagents (
 			id TEXT PRIMARY KEY,
 			slug TEXT NOT NULL,
+			owner TEXT NOT NULL DEFAULT '',
 			version INTEGER NOT NULL,
 			category TEXT NOT NULL DEFAULT '',
 			modality TEXT NOT NULL,

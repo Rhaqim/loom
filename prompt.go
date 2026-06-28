@@ -14,6 +14,7 @@ import (
 type Prompt struct {
 	ID        uuid.UUID
 	Slug      string // human-readable identifier, e.g. "opening-author"
+	Owner     string // opaque app-owned scope ("" = global); reserved for future per-tenant use
 	Version   int    // monotonically increasing; editing creates a new version
 	Kind      PromptKind
 	Category  string   // platform-defined grouping
@@ -86,4 +87,7 @@ type PromptRegistry interface {
 	Create(ctx context.Context, p *Prompt) error
 	// List returns all prompts matching kind and optional category filter.
 	List(ctx context.Context, kind PromptKind, category string) ([]*Prompt, error)
+	// Delete removes a specific prompt version (>= 1). On Postgres it fails if the
+	// version is still referenced by an agent (ON DELETE RESTRICT).
+	Delete(ctx context.Context, slug string, version int) error
 }

@@ -254,6 +254,17 @@ func (s *agentService) List(ctx context.Context, category string) ([]*Agent, err
 	return listAgents(ctx, s.e.db, s.e.prefix, category)
 }
 
+func (s *agentService) Delete(ctx context.Context, slug string, version int) error {
+	if version < 1 {
+		return fmt.Errorf("loom: delete agent %q: an explicit version >= 1 is required", slug)
+	}
+	if err := sqlDeleteAgent(ctx, s.e.db, s.e.prefix, slug, version); err != nil {
+		return err
+	}
+	cacheDelete(ctx, s.e.cache, cacheKey("agent", s.e.prefix, slug, version))
+	return nil
+}
+
 // promptService implements PromptRegistry.
 type promptService struct{ e *Engine }
 
@@ -290,6 +301,26 @@ func (s *promptService) Create(ctx context.Context, p *Prompt) error {
 
 func (s *promptService) List(ctx context.Context, kind PromptKind, category string) ([]*Prompt, error) {
 	return listPrompts(ctx, s.e.db, s.e.prefix, kind, category)
+}
+
+func (s *promptService) Delete(ctx context.Context, slug string, version int) error {
+	if version < 1 {
+		return fmt.Errorf("loom: delete prompt %q: an explicit version >= 1 is required", slug)
+	}
+	// Resolve the row id first so we can also evict the by-id cache that the
+	// agent-build path populates (cacheKey "prompt-id").
+	var id uuid.UUID
+	if p, err := queryPrompt(ctx, s.e.db, s.e.prefix, slug, version); err == nil {
+		id = p.ID
+	}
+	if err := sqlDeletePrompt(ctx, s.e.db, s.e.prefix, slug, version); err != nil {
+		return err
+	}
+	cacheDelete(ctx, s.e.cache, cacheKey("prompt", s.e.prefix, slug, version))
+	if id != uuid.Nil {
+		cacheDelete(ctx, s.e.cache, cacheKey("prompt-id", s.e.prefix, id.String(), 0))
+	}
+	return nil
 }
 
 // sessionService implements SessionRegistry.
