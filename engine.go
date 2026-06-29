@@ -644,6 +644,11 @@ func (s *stepService) buildGenerateRequest(
 	if req.ParamOverride != nil {
 		params = *req.ParamOverride
 	}
+	// params is a shallow struct copy, so params.Extra still aliases the agent's
+	// (or override's) shared map. Clone it before applyParamsMap mutates it in
+	// place — otherwise concurrent steps sharing the agent race/corrupt that map
+	// and one turn's params leak into the next. Clone(nil) is nil (then allocated).
+	params.Extra = maps.Clone(params.Extra)
 	// Fold the free-form params map onto the typed params (known model keys) and
 	// keep the whole map for the generator and template.
 	applyParamsMap(&params, req.Params)
