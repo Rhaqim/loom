@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
 	"sync"
 	"text/template"
 	"time"
@@ -588,6 +589,26 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	return step, nil
 }
 
+// resolveSystemPrompt loads a system-prompt override from the registry
+// (Slug+Version) or a file (File). An empty ref yields "".
+func (s *stepService) resolveSystemPrompt(ctx context.Context, ref PromptRef) (string, error) {
+	if ref.File != "" {
+		b, err := os.ReadFile(ref.File)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	if ref.Slug != "" {
+		p, err := s.e.prompts.Get(ctx, ref.Slug, ref.Version)
+		if err != nil {
+			return "", err
+		}
+		return p.Body, nil
+	}
+	return "", nil
+}
+
 func (s *stepService) buildGenerateRequest(
 	ctx context.Context,
 	session *Session,
@@ -612,6 +633,17 @@ func (s *stepService) buildGenerateRequest(
 			cacheSet(ctx, s.e.cache, spKey, sp)
 		}
 		systemPrompt = sp.Body
+	}
+	// A per-call system-prompt override (e.g. a harness prompt variant) replaces
+	// the agent's system prompt for this step only.
+	if req.SystemPromptOverride != nil {
+		body, err := s.resolveSystemPrompt(ctx, *req.SystemPromptOverride)
+		if err != nil {
+			return GenerateRequest{}, fmt.Errorf("resolve system-prompt override: %w", err)
+		}
+		if body != "" {
+			systemPrompt = body
+		}
 	}
 
 	// Load and render user template — cached by UUID.
