@@ -153,9 +153,6 @@ func New(cfg Config) (*Engine, error) {
 		e.poller = newAsyncPollerService(e, cfg.AsyncPoller)
 	}
 
-	// Register built-in budget enforcer pre-hook.
-	e.hooks.RegisterPre("budget-enforcer", e.budgets.enforceHook)
-
 	return e, nil
 }
 
@@ -425,6 +422,15 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		if err != nil {
 			return nil, fmt.Errorf("loom: resolve agent %q: %w", req.AgentSlug, err)
 		}
+	}
+
+	// Enforce budgets before the generator is chosen: an exceeded budget may
+	// block this step (BudgetExceededError) or downgrade it to the agent's
+	// fallback, so it must run before generator resolution.
+	if downgraded, err := s.e.budgets.enforce(ctx, session, agent); err != nil {
+		return nil, err
+	} else {
+		agent = downgraded
 	}
 
 	// Look up generator. A per-request GeneratorOverride wins over the agent's
@@ -1278,12 +1284,106 @@ func (b *budgetService) Delete(ctx context.Context, id uuid.UUID) error {
 	return sqlDeleteBudget(ctx, b.e.db, b.e.prefix, id)
 }
 
-// enforceHook is registered as the built-in "budget-enforcer" pre-hook.
-func (b *budgetService) enforceHook(ctx context.Context, req *StepRequest) error {
-	// In a real implementation this would query loom_cost_records and compare
-	// against active budgets for the session's platform_id.
-	// For now it is a pass-through — the mechanism is wired; data makes it real.
-	return nil
+// enforce checks active budgets targeting the session's platform_id and applies
+// the configured action when a limit is exceeded: block (returns
+// *BudgetExceededError), downgrade (swaps to the agent's fallback), or notify
+// (logs and continues). It fails open on lookup/usage errors so a budgeting
+// glitch never silently breaks a run, and returns the agent to use.
+func (b *budgetService) enforce(ctx context.Context, session *Session, agent *Agent) (*Agent, error) {
+	if session == nil || session.PlatformID == "" {
+		return agent, nil
+	}
+	budgets, err := b.List(ctx, TargetPlatformID, session.PlatformID)
+	if err != nil {
+		b.e.log.Error("budget: list", "err", err)
+		return agent, nil
+	}
+	now := time.Now()
+	for _, bud := range budgets {
+		if !bud.Active {
+			continue
+		}
+		used, err := b.e.costs.Usage(ctx, UsageQuery{Target: bud.Target, From: budgetWindowStart(bud.Window, now), To: now})
+		if err != nil {
+			b.e.log.Error("budget: usage", "budget", bud.Name, "err", err)
+			continue
+		}
+		if !budgetExceeded(bud.Limit, used) {
+			continue
+		}
+		switch bud.OnExceed {
+		case BudgetDowngrade:
+			if agent.FallbackAgentID != nil {
+				if fb, ferr := sqlQueryAgentByID(ctx, b.e.db, b.e.prefix, *agent.FallbackAgentID); ferr == nil {
+					b.e.log.Info("budget: downgrading to fallback", "budget", bud.Name, "from", agent.Slug, "to", fb.Slug)
+					return fb, nil
+				}
+			}
+			// No usable fallback — block rather than silently overspend.
+			return agent, budgetExceededErr(bud, used, now)
+		case BudgetNotify:
+			b.e.log.Info("budget: exceeded (notify)", "budget", bud.Name, "used_usd", used.TotalUSD, "limit_usd", bud.Limit.USD)
+		default: // BudgetBlock
+			return agent, budgetExceededErr(bud, used, now)
+		}
+	}
+	return agent, nil
+}
+
+func budgetExceeded(limit BudgetLimit, used *UsageSummary) bool {
+	if limit.USD > 0 && used.TotalUSD >= limit.USD {
+		return true
+	}
+	if limit.Tokens > 0 && used.TotalTokens >= limit.Tokens {
+		return true
+	}
+	if limit.Steps > 0 && used.StepCount >= limit.Steps {
+		return true
+	}
+	return false
+}
+
+func budgetExceededErr(bud *Budget, used *UsageSummary, now time.Time) *BudgetExceededError {
+	return &BudgetExceededError{
+		BudgetName:  bud.Name,
+		Window:      string(bud.Window),
+		UsedUSD:     used.TotalUSD,
+		LimitUSD:    bud.Limit.USD,
+		UsedTokens:  used.TotalTokens,
+		LimitTokens: bud.Limit.Tokens,
+		ResetsAt:    budgetWindowEnd(bud.Window, now),
+	}
+}
+
+// budgetWindowStart returns the lower bound of a rolling budget window.
+func budgetWindowStart(w BudgetWindow, now time.Time) time.Time {
+	switch w {
+	case BudgetWindowHour:
+		return now.Add(-time.Hour)
+	case BudgetWindowDay:
+		return now.Add(-24 * time.Hour)
+	case BudgetWindowWeek:
+		return now.Add(-7 * 24 * time.Hour)
+	case BudgetWindowMonth:
+		return now.Add(-30 * 24 * time.Hour)
+	default: // lifetime (or unknown) — count everything
+		return time.Time{}
+	}
+}
+
+func budgetWindowEnd(w BudgetWindow, now time.Time) time.Time {
+	switch w {
+	case BudgetWindowHour:
+		return now.Add(time.Hour)
+	case BudgetWindowDay:
+		return now.Add(24 * time.Hour)
+	case BudgetWindowWeek:
+		return now.Add(7 * 24 * time.Hour)
+	case BudgetWindowMonth:
+		return now.Add(30 * 24 * time.Hour)
+	default:
+		return time.Time{}
+	}
 }
 
 // -----------------------------------------------------------------------

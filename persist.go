@@ -63,6 +63,13 @@ func sqlQueryAgentLatest(ctx context.Context, db *sql.DB, prefix, slug string) (
 	return scanAgent(row)
 }
 
+func sqlQueryAgentByID(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Agent, error) {
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM %sagents WHERE id=$1`, agentColumns, prefix), id)
+	return scanAgent(row)
+}
+
 func sqlListAgents(ctx context.Context, db *sql.DB, prefix, category string) ([]*Agent, error) {
 	q := fmt.Sprintf(`SELECT %s FROM %sagents`, agentColumns, prefix)
 	args := []any{}
