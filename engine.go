@@ -55,6 +55,11 @@ type Config struct {
 	Pricing map[string]ModelPrice
 	// DefaultPrice is used for models absent from Pricing (default: $1/$3 per 1M).
 	DefaultPrice *ModelPrice
+	// BranchGC configures the branch garbage collector used by Engine.GC().
+	// Nil uses safe defaults (DryRun=true, so nothing is deleted); set an explicit
+	// config with DryRun=false to actually sweep. The Dialect is filled in from
+	// Config.Dialect automatically.
+	BranchGC *BranchGCConfig
 }
 
 // Logger is the minimal logging interface the engine uses.
