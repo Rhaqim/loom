@@ -1,13 +1,14 @@
-// Package schema provides the idempotent schema loader for the Loom engine.
+// Package schema provides the versioned migration runner for the Loom engine.
 // Apply migrations with:
 //
 //	loader := schema.NewLoader(schema.DialectPostgres)
 //	err := loader.Apply(ctx, db)
+//
+// Migrations live in migrations.go as a dense, ordered list. Each runs exactly
+// once and is recorded in the <prefix>schema_migrations ledger.
 package schema
 
 import (
-	"context"
-	"database/sql"
 	"fmt"
 )
 
@@ -33,29 +34,6 @@ func NewLoader(dialect Dialect, prefix ...string) *Loader {
 		p = prefix[0]
 	}
 	return &Loader{dialect: dialect, prefix: p}
-}
-
-// Apply creates or updates the Loom schema in db. It is safe to call on every
-// application startup — all statements use CREATE TABLE IF NOT EXISTS.
-func (l *Loader) Apply(ctx context.Context, db *sql.DB) error {
-	stmts := l.statements()
-	for _, stmt := range stmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("loom schema: %w\nSQL: %s", err, stmt)
-		}
-	}
-	return nil
-}
-
-// statements returns the ordered DDL for the current dialect.
-func (l *Loader) statements() []string {
-	p := l.prefix
-	switch l.dialect {
-	case DialectSQLite:
-		return sqliteStatements(p)
-	default:
-		return postgresStatements(p)
-	}
 }
 
 // postgresStatements returns Postgres DDL for all Loom tables.
