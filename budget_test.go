@@ -95,3 +95,40 @@ func TestBudget_UnderLimitRunsNormally(t *testing.T) {
 		t.Errorf("under budget ran under %s, want %s", step.AgentID, mainID)
 	}
 }
+
+func TestBudget_StepLimitBlocks(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "budget_steps", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	if err := e.Agents().Create(ctx, &Agent{ID: uuid.New(), Slug: "main", Version: 1, Modal: ModalityText, GeneratorSlug: "g"}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // two prior steps -> StepCount 2
+		if err := e.Cost().Record(ctx, CostRecord{PlatformID: "u1", Timestamp: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.Budgets().Create(ctx, &Budget{Name: "steps", Target: BudgetTarget{Kind: TargetPlatformID, Key: "u1"}, Window: BudgetWindowDay, Limit: BudgetLimit{Steps: 2}, OnExceed: BudgetBlock, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	sess := &Session{PlatformID: "u1", State: State{Modality: ModalityText}}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "main", AgentVersion: 1})
+	var be *BudgetExceededError
+	if !errors.As(err, &be) {
+		t.Fatalf("step-limit budget should block, got %v", err)
+	}
+}
+
+func TestBudget_CreateRejectsUnenforcedTarget(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "budget_reject", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	err := e.Budgets().Create(ctx, &Budget{
+		Name: "sess", Target: BudgetTarget{Kind: "session", Key: "x"},
+		Window: BudgetWindowDay, Limit: BudgetLimit{USD: 1}, OnExceed: BudgetBlock, Active: true,
+	})
+	if err == nil {
+		t.Fatal("Create should reject a non-platform_id budget that would never be enforced")
+	}
+}

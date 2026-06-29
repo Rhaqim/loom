@@ -1135,9 +1135,10 @@ type Budget struct {
 	CreatedAt   time.Time
 }
 
-// BudgetTarget identifies the entity a budget applies to.
+// BudgetTarget identifies the entity a budget applies to. Only Kind ==
+// TargetPlatformID is currently enforced; Create rejects other kinds.
 type BudgetTarget struct {
-	Kind string // "session" | "platform_id" | "custom"
+	Kind string // currently only "platform_id" is enforced
 	Key  string
 }
 
@@ -1263,6 +1264,11 @@ func (c *costService) recordFromResult(ctx context.Context, step *Step, agent *A
 type budgetService struct{ e *Engine }
 
 func (b *budgetService) Create(ctx context.Context, budget *Budget) error {
+	// Only platform_id budgets are enforced today; reject other kinds rather than
+	// silently storing a budget that would never be applied.
+	if budget.Target.Kind != TargetPlatformID {
+		return fmt.Errorf("loom: budget target kind %q is not supported (only %q is enforced)", budget.Target.Kind, TargetPlatformID)
+	}
 	if budget.ID == uuid.Nil {
 		budget.ID = uuid.New()
 	}
@@ -1284,11 +1290,16 @@ func (b *budgetService) Delete(ctx context.Context, id uuid.UUID) error {
 	return sqlDeleteBudget(ctx, b.e.db, b.e.prefix, id)
 }
 
-// enforce checks active budgets targeting the session's platform_id and applies
-// the configured action when a limit is exceeded: block (returns
-// *BudgetExceededError), downgrade (swaps to the agent's fallback), or notify
-// (logs and continues). It fails open on lookup/usage errors so a budgeting
-// glitch never silently breaks a run, and returns the agent to use.
+// enforce checks active platform budgets and applies the configured action when
+// a limit is exceeded: block (returns *BudgetExceededError), downgrade (swaps to
+// the agent's fallback), or notify (logs and continues). It returns the agent to
+// use.
+//
+// The cap is BEST-EFFORT, not a hard ceiling: it reads only PRIOR recorded spend
+// (the current step's cost is recorded after the step, fire-and-forget), and a
+// turn's parallel followers each see the same prior spend — so spend can overshoot
+// by up to one step per concurrent call. It also fails OPEN on lookup/usage errors
+// so a transient DB glitch never silently breaks a run.
 func (b *budgetService) enforce(ctx context.Context, session *Session, agent *Agent) (*Agent, error) {
 	if session == nil || session.PlatformID == "" {
 		return agent, nil
