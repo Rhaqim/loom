@@ -958,15 +958,59 @@ func (p *asyncPollerService) pollPending(ctx context.Context) {
 			Provider: t.Provider,
 			Handle:   t.Handle,
 		})
-		if err != nil {
+		switch {
+		case err != nil:
 			p.e.log.Error("poll task", "task_id", t.ID, "err", err)
-			_ = sqlIncrementTaskAttempts(ctx, p.e.db, p.e.prefix, t.ID, err.Error())
-			continue
-		}
-		if result.Status() == ResultStatusReady {
-			_ = sqlMarkTaskReady(ctx, p.e.db, p.e.prefix, t.ID, result)
+			p.retryOrFail(ctx, t, err.Error())
+		case result == nil:
+			// Defensive: a generator returning (nil, nil) is a non-terminal miss,
+			// not a worker panic.
+			p.retryOrFail(ctx, t, "poll returned no result")
+		case result.Status() == ResultStatusReady:
+			if err := sqlMarkTaskReady(ctx, p.e.db, p.e.prefix, t.ID, result); err != nil {
+				p.e.log.Error("mark task ready", "task_id", t.ID, "err", err)
+			}
+		case result.Status() == ResultStatusFailed:
+			_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, resultErrorMessage(result))
+		default:
+			// Still pending at the provider: count the poll so a job that never
+			// resolves is eventually capped rather than polled forever.
+			p.retryOrFail(ctx, t, "still pending after maximum poll attempts")
 		}
 	}
+}
+
+// defaultMaxPollAttempts caps how many times a task is polled before it is
+// terminally failed when PollerConfig.MaxAttempts is unset.
+const defaultMaxPollAttempts = 60
+
+func (p *asyncPollerService) maxAttempts() int {
+	if p.cfg.MaxAttempts > 0 {
+		return p.cfg.MaxAttempts
+	}
+	return defaultMaxPollAttempts
+}
+
+// retryOrFail increments a task's attempt counter, or terminally fails it once it
+// reaches the attempt cap, so neither erroring nor perpetually-pending jobs are
+// polled forever.
+func (p *asyncPollerService) retryOrFail(ctx context.Context, t pendingTask, reason string) {
+	if t.Attempts+1 >= p.maxAttempts() {
+		_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, reason)
+	} else {
+		_ = sqlIncrementTaskAttempts(ctx, p.e.db, p.e.prefix, t.ID, reason)
+	}
+}
+
+// resultErrorMessage extracts a failed result's error string, falling back to a
+// generic message.
+func resultErrorMessage(r Result) string {
+	if r != nil {
+		if e, ok := r.Metadata()["error"].(string); ok && e != "" {
+			return e
+		}
+	}
+	return "provider reported failure"
 }
 
 // -----------------------------------------------------------------------
@@ -978,6 +1022,7 @@ type pendingTask struct {
 	ID       uuid.UUID
 	Provider string
 	Handle   string
+	Attempts int
 }
 
 // UsageSummary aggregates cost metrics.
