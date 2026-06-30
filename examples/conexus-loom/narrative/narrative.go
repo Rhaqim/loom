@@ -28,6 +28,8 @@ func Flow(versions map[string][]int, target int) loom.Flow {
 				Params: map[string]any{"temperature": 0.2}},
 			{AgentSlug: AgentSensory, AgentVersion: ResolveVersion(versions, AgentSensory, target),
 				Params: map[string]any{"temperature": 0.5}},
+			{AgentSlug: AgentTitle, AgentVersion: ResolveVersion(versions, AgentTitle, target),
+				Params: map[string]any{"temperature": 0.4}},
 		},
 	}
 }
@@ -86,6 +88,29 @@ func ParseSensory(text string) (domain.SensoryOutput, error) {
 		MusicMood:   nested.Music.Mood,
 		Intensity:   nested.Music.Intensity,
 	}, nil
+}
+
+// ParseTitle extracts a chapter title from the Title agent's plain-text output:
+// the first non-empty line, stripped of fences/quotes and capped to a sane
+// length in case the model ignores the one-line instruction.
+func ParseTitle(text string) string {
+	// The Title agent must emit a plain line. If it returned JSON anyway, treat it
+	// as empty so the engine falls back to the Logician's title rather than
+	// rendering a broken fragment.
+	if t := strings.TrimSpace(text); strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[") || strings.HasPrefix(t, "```json") {
+		return ""
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(strings.Trim(strings.TrimSpace(line), "`\"'"))
+		if line == "" {
+			continue
+		}
+		if words := strings.Fields(line); len(words) > 12 {
+			line = strings.Join(words[:12], " ")
+		}
+		return line
+	}
+	return ""
 }
 
 // MigrationResult is the parsed output of the migration agent.
