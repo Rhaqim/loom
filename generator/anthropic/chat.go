@@ -45,10 +45,32 @@ func (g *ChatGenerator) WithBaseURL(url string) *ChatGenerator {
 	return g
 }
 
+// withOverrides returns a per-request copy of the generator honoring
+// req.Overrides ("api_key", "model", "base_url"), so a single call can be routed
+// to a different model or tenant key. Returns the receiver unchanged when no
+// overrides apply. The shallow copy shares the (concurrency-safe) http.Client.
+func (g *ChatGenerator) withOverrides(req loom.GenerateRequest) *ChatGenerator {
+	if len(req.Overrides) == 0 {
+		return g
+	}
+	cp := *g
+	if v, ok := req.Overrides["api_key"].(string); ok && v != "" {
+		cp.apiKey = v
+	}
+	if v, ok := req.Overrides["model"].(string); ok && v != "" {
+		cp.model = v
+	}
+	if v, ok := req.Overrides["base_url"].(string); ok && v != "" {
+		cp.baseURL = v
+	}
+	return &cp
+}
+
 func (g *ChatGenerator) Modality() loom.Modality { return loom.ModalityText }
 
 // Generate calls the Anthropic Messages API synchronously.
 func (g *ChatGenerator) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error) {
+	g = g.withOverrides(req)
 	body, err := g.buildBody(req, false)
 	if err != nil {
 		return nil, err
@@ -62,6 +84,7 @@ func (g *ChatGenerator) Generate(ctx context.Context, req loom.GenerateRequest) 
 
 // GenerateStream calls the Anthropic streaming API.
 func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateRequest) (<-chan loom.Chunk, <-chan loom.Result, error) {
+	g = g.withOverrides(req)
 	body, err := g.buildBody(req, true)
 	if err != nil {
 		return nil, nil, err
