@@ -9,10 +9,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	_ "github.com/lib/pq"
+	"github.com/rhaqim/loom/schema"
 )
 
 func gcSession(t *testing.T, ctx context.Context, e *Engine) *Session {
@@ -245,6 +248,66 @@ func TestGC_T4_ScopesToBranchesAndHonorsPin(t *testing.T) {
 		if !gcExists(t, db, e.prefix, id) {
 			t.Errorf("%s was wrongly deleted by T4", name)
 		}
+	}
+}
+
+// TestGC_T4_Postgres exercises the T4 test-tag tier on the PRODUCTION dialect:
+// the SQLite tests hardcode Dialect:"sqlite", so the Postgres `tags::text LIKE`
+// predicate (which deletes real sessions) is otherwise never run. Uses real
+// RunStep so the steps satisfy Postgres foreign keys.
+func TestGC_T4_Postgres(t *testing.T) {
+	dsn := os.Getenv("LOOM_DSN")
+	if dsn == "" {
+		t.Skip("set LOOM_DSN to run the Postgres GC T4 test")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := schema.NewLoader(schema.DialectPostgres).Apply(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	e, err := New(Config{DB: db, Dialect: DialectPostgres, Generators: map[string]Generator{"g": okGen{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = e.Agents().Create(ctx, &Agent{Slug: "gca", Version: 1, Modal: ModalityText, GeneratorSlug: "g"})
+
+	parent := gcSession(t, ctx, e)
+
+	// Tagged branch with a real (FK-valid) step -> Postgres T4 must delete it.
+	tagged := gcSession(t, ctx, e)
+	if _, err := e.RunStep(ctx, tagged, StepRequest{AgentSlug: "gca", AgentVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	gcMakeBranch(t, db, e.prefix, tagged.ID, parent.ID)
+	gcAge(t, db, e.prefix, tagged.ID, 2*time.Hour)
+	gcTagTest(t, db, e.prefix, tagged.ID)
+
+	// Untagged branch with a step -> T4 (test-tag scoped) must NOT delete it.
+	untagged := gcSession(t, ctx, e)
+	if _, err := e.RunStep(ctx, untagged, StepRequest{AgentSlug: "gca", AgentVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	gcMakeBranch(t, db, e.prefix, untagged.ID, parent.ID)
+	gcAge(t, db, e.prefix, untagged.ID, 2*time.Hour)
+
+	cfg := gcTestConfig(false)
+	cfg.Dialect = "postgres"
+	report, err := NewBranchGCWorker(e, cfg).Sweep(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if report.TestBranchesDeleted < 1 {
+		t.Fatalf("Postgres T4 deleted %d test branches, want >=1 (tags::text LIKE)", report.TestBranchesDeleted)
+	}
+	if gcExists(t, db, e.prefix, tagged.ID) {
+		t.Error("Postgres T4 did not delete the test-tagged branch")
+	}
+	if !gcExists(t, db, e.prefix, untagged.ID) {
+		t.Error("Postgres T4 wrongly deleted the untagged branch")
 	}
 }
 

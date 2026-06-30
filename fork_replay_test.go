@@ -3,6 +3,8 @@ package loom
 import (
 	"context"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 // TestForkRewindsToCheckpoint verifies that Fork reconstructs session state as
@@ -60,6 +62,33 @@ func TestForkRewindsToCheckpoint(t *testing.T) {
 		if branch.State.Modality != ModalityText {
 			t.Fatalf("fork at %d: modality = %q, want text (full state not reconstructed)", at, branch.State.Modality)
 		}
+	}
+}
+
+// TestSnapshotUniquePerStep proves the state_snapshots UNIQUE(session_id,
+// step_index) invariant: a second checkpoint at the same step is rejected.
+func TestSnapshotUniquePerStep(t *testing.T) {
+	ctx := context.Background()
+	e, db := reproEngine(t, "snapuniq", map[string]Generator{"g": okGen{}}, PollerConfig{})
+
+	if err := e.Agents().Create(ctx, &Agent{Slug: "a", Version: 1, Modal: ModalityText, GeneratorSlug: "g"}); err != nil {
+		t.Fatal(err)
+	}
+	sess := &Session{PlatformID: "p", State: State{Modality: ModalityText}}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	// One step writes the checkpoint at step_index 0.
+	if _, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A duplicate checkpoint at (session, step_index=0) must violate the UNIQUE.
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO loom_state_snapshots (id, session_id, step_index, snapshot, vars, created_at)
+		 VALUES ($1,$2,0,'{}','{}',CURRENT_TIMESTAMP)`, uuid.NewString(), sess.ID)
+	if err == nil {
+		t.Fatal("expected a UNIQUE(session_id, step_index) violation on a duplicate snapshot")
 	}
 }
 

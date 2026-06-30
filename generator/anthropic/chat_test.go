@@ -149,3 +149,50 @@ func TestPerRequestOverrides(t *testing.T) {
 		t.Fatalf("override leaked into the generator: key=%q model=%q", gotKey, gotModel)
 	}
 }
+
+func TestGenerateStreamWithOverrides(t *testing.T) {
+	const sse = "event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}` + "\n\n" +
+		"event: message_stop\n" + `data: {"type":"message_stop"}` + "\n\n"
+	var gotKey, gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("x-api-key")
+		b, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		json.Unmarshal(b, &body)
+		gotModel, _ = body["model"].(string)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse)
+	}))
+	defer srv.Close()
+
+	// Streaming is the primary chat path: the per-request overrides must reach the
+	// wire there too (not just in the sync Generate).
+	g := NewChatGenerator("default-key", "default-model").WithBaseURL("http://invalid.invalid")
+	chunks, results, err := g.GenerateStream(context.Background(), loom.GenerateRequest{
+		UserPrompt: "hi",
+		Overrides:  map[string]any{"api_key": "override-key", "model": "override-model", "base_url": srv.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range chunks {
+	}
+	<-results
+	if gotKey != "override-key" || gotModel != "override-model" {
+		t.Fatalf("streaming overrides not applied: key=%q model=%q", gotKey, gotModel)
+	}
+
+	// The override copy must not mutate the generator: a no-override stream uses defaults.
+	g.WithBaseURL(srv.URL)
+	chunks2, results2, err := g.GenerateStream(context.Background(), loom.GenerateRequest{UserPrompt: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range chunks2 {
+	}
+	<-results2
+	if gotKey != "default-key" || gotModel != "default-model" {
+		t.Fatalf("override leaked into the streaming generator: key=%q model=%q", gotKey, gotModel)
+	}
+}

@@ -198,6 +198,55 @@ func TestForeignKeysEnforcedSQLite(t *testing.T) {
 	}
 }
 
+// TestAdoptSessionVersionSQLite is the prod-upgrade path for migration v3: a
+// database whose sessions table predates the optimistic-concurrency version
+// column. Apply must backfill it (default 0) so session CAS works after upgrade.
+func TestAdoptSessionVersionSQLite(t *testing.T) {
+	ctx := context.Background()
+	db := openMemSQLite(t)
+
+	if _, err := db.ExecContext(ctx, `CREATE TABLE loom_sessions (
+		id         TEXT PRIMARY KEY,
+		platform_id TEXT NOT NULL DEFAULT '',
+		state      TEXT NOT NULL DEFAULT '{}',
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if hasColumn(t, db, DialectSQLite, "loom_sessions", "version") {
+		t.Fatal("precondition: loom_sessions should not have version yet")
+	}
+
+	if err := NewLoader(DialectSQLite).Apply(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if !hasColumn(t, db, DialectSQLite, "loom_sessions", "version") {
+		t.Fatal("migration v3 did not backfill sessions.version")
+	}
+
+	id := uuid.NewString()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO loom_sessions (id, platform_id, state, created_at, updated_at) VALUES ($1,'p','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`, id); err != nil {
+		t.Fatal(err)
+	}
+	var v int
+	if err := db.QueryRowContext(ctx, `SELECT version FROM loom_sessions WHERE id=$1`, id).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != 0 {
+		t.Fatalf("backfilled version default = %d, want 0", v)
+	}
+	// The optimistic-concurrency guard must work on the backfilled column.
+	res, err := db.ExecContext(ctx, `UPDATE loom_sessions SET version=version+1 WHERE id=$1 AND version=0`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Fatalf("CAS update affected %d rows, want 1", n)
+	}
+}
+
 // TestApplyPostgres runs the runner against Postgres when LOOM_DSN is set,
 // covering the information_schema column-introspection path.
 func TestApplyPostgres(t *testing.T) {
