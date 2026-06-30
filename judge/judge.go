@@ -1,7 +1,8 @@
-// Package judge provides LLM-based scoring as a first-class abstraction.
-// Judges evaluate generator outputs along rubric dimensions, compare pairs,
-// or enforce binary constraints — reusable across the test harness, post-hooks,
-// and runtime agent selection.
+// Package judge provides LLM-based scoring as a reusable abstraction. Judges
+// evaluate generator outputs along rubric dimensions, compare pairs, or enforce
+// binary constraints. They are caller-driven: register a judge and invoke it
+// from a test, a post-hook, or agent-selection code. Nothing in the engine
+// registers or invokes judges automatically yet.
 package judge
 
 import (
@@ -115,9 +116,15 @@ func NewRegistry() *Registry {
 	return &Registry{judges: make(map[string]Judge)}
 }
 
-// Register adds a judge under its slug.
+// Register adds a judge under its intrinsic Slug().
 func (r *Registry) Register(j Judge) {
 	r.judges[j.Slug()] = j
+}
+
+// RegisterAs adds a judge under an explicit slug, which may differ from the
+// judge's intrinsic Slug(). Lookups use this key.
+func (r *Registry) RegisterAs(slug string, j Judge) {
+	r.judges[slug] = j
 }
 
 // Rubric returns the RubricJudge registered under slug, or a no-op judge.
@@ -189,9 +196,13 @@ type noopConstraintJudge struct{ slug string }
 func (j *noopConstraintJudge) Mode() Mode   { return ModeConstraint }
 func (j *noopConstraintJudge) Slug() string { return j.slug }
 func (j *noopConstraintJudge) Check(_ context.Context, req CheckRequest) (ConstraintVerdict, error) {
+	// A judge that never ran must not assert certainty: report zero confidence
+	// and flag that the check was skipped, so callers gating on confidence don't
+	// treat an unregistered constraint as a confident pass.
 	return ConstraintVerdict{
 		Passed:     true,
 		Constraint: req.Constraint,
-		Confidence: 1.0,
+		Violations: []string{fmt.Sprintf("judge %q not found; constraint not checked", j.slug)},
+		Confidence: 0,
 	}, nil
 }

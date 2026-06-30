@@ -4,6 +4,9 @@ package loom
 // interface so callers use a single coherent API surface.
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/rhaqim/loom/judge"
 )
 
@@ -30,7 +33,7 @@ func (j *judgeRegistryImpl) Constraint(slug string) ConstraintJudge {
 }
 
 func (j *judgeRegistryImpl) Register(slug string, jj Judge) {
-	j.reg.Register(jj)
+	j.reg.RegisterAs(slug, jj)
 }
 
 // Expose judge sub-package types as aliases so callers don't need a separate import.
@@ -64,3 +67,47 @@ type CheckRequest = judge.CheckRequest
 
 // ConstraintVerdict is the output of ConstraintJudge.Check.
 type ConstraintVerdict = judge.ConstraintVerdict
+
+// Completer is the narrow text-generation capability the LLM-backed judges need.
+type Completer = judge.Completer
+
+// NewLLMRubricJudge builds a rubric judge backed by a text generator.
+func NewLLMRubricJudge(slug string, g Generator) *judge.LLMRubricJudge {
+	return judge.NewLLMRubricJudge(slug, GeneratorCompleter(g))
+}
+
+// NewLLMConstraintJudge builds a constraint judge backed by a text generator.
+func NewLLMConstraintJudge(slug string, g Generator) *judge.LLMConstraintJudge {
+	return judge.NewLLMConstraintJudge(slug, GeneratorCompleter(g))
+}
+
+// NewLLMPairwiseJudge builds a pairwise judge backed by a text generator.
+func NewLLMPairwiseJudge(slug string, g Generator) *judge.LLMPairwiseJudge {
+	return judge.NewLLMPairwiseJudge(slug, GeneratorCompleter(g))
+}
+
+// GeneratorCompleter adapts a text Generator to judge.Completer so engine
+// generators can back real judges. The generator must return a TextResult.
+func GeneratorCompleter(g Generator) judge.Completer {
+	return generatorCompleter{g: g}
+}
+
+type generatorCompleter struct{ g Generator }
+
+func (a generatorCompleter) Complete(ctx context.Context, system, user string) (string, error) {
+	res, err := a.g.Generate(ctx, GenerateRequest{SystemPrompt: system, UserPrompt: user})
+	if err != nil {
+		return "", err
+	}
+	if res == nil {
+		return "", fmt.Errorf("judge completer: generator returned no result")
+	}
+	tr, ok := res.(*TextResult)
+	if !ok {
+		return "", fmt.Errorf("judge completer: generator produced %s, want text", res.Modality())
+	}
+	if tr == nil {
+		return "", fmt.Errorf("judge completer: nil text result")
+	}
+	return tr.Content, nil
+}
