@@ -217,7 +217,8 @@ func postgresStatements(p string) []string {
 			step_index  INT NOT NULL,
 			snapshot    BYTEA,
 			vars        JSONB NOT NULL DEFAULT '{}',
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (session_id, step_index)
 		)`, p, p),
 
 		// Cost records (partitioned by month in production)
@@ -448,7 +449,8 @@ func sqliteStatements(p string) []string {
 			step_index INTEGER NOT NULL,
 			snapshot BLOB,
 			vars TEXT NOT NULL DEFAULT '{}',
-			created_at DATETIME NOT NULL
+			created_at DATETIME NOT NULL,
+			UNIQUE (session_id, step_index)
 		)`, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %scost_records (

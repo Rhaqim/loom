@@ -463,13 +463,58 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step) error {
+// sqlInsertSnapshot records a per-step state checkpoint so a later Fork can
+// reconstruct full session state as of a given step instead of inheriting the
+// parent's latest. The whole State (modality, opaque snapshot, vars, available
+// actions) is serialized into the snapshot column; the vars column is also
+// populated for external introspection.
+func sqlInsertSnapshot(ctx context.Context, db execer, prefix string, id, sessionID uuid.UUID, stepIndex int, state State, createdAt time.Time) error {
+	stateJSON, _ := json.Marshal(state)
+	varsJSON, _ := json.Marshal(state.Vars)
+	if len(varsJSON) == 0 || string(varsJSON) == "null" {
+		varsJSON = []byte("{}")
+	}
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO %sstate_snapshots (id, session_id, step_index, snapshot, vars, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6)`, prefix),
+		id, sessionID, stepIndex, stateJSON, varsJSON, createdAt)
+	return err
+}
+
+// sqlQuerySnapshotAt returns the full checkpointed State at or before stepIndex
+// for a session. found is false when no checkpoint exists that early.
+func sqlQuerySnapshotAt(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID, stepIndex int) (state State, found bool, err error) {
+	var stateJSON []byte
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT snapshot FROM %sstate_snapshots
+		WHERE session_id = $1 AND step_index <= $2
+		ORDER BY step_index DESC, created_at DESC
+		LIMIT 1`, prefix), sessionID, stepIndex)
+	switch scanErr := row.Scan(&stateJSON); scanErr {
+	case nil:
+	case sql.ErrNoRows:
+		return State{}, false, nil
+	default:
+		return State{}, false, scanErr
+	}
+	if len(stateJSON) > 0 {
+		_ = json.Unmarshal(stateJSON, &state)
+	}
+	return state, true, nil
+}
+
+// sqlInsertStep persists the step (with its result and action) and, when
+// checkpoint is non-nil, the post-step state snapshot — all in one transaction
+// so a step never commits without its checkpoint (which would let a later Fork
+// silently rewind to the wrong state).
+func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, checkpoint *State) error {
 	reqJSON, _ := json.Marshal(step.Request)
 	diagJSON, _ := json.Marshal(step.Diagnostics)
 	annJSON, _ := json.Marshal(step.Annotations)
 
-	// All three writes (action, result, step) commit atomically so a failure on
-	// the final steps INSERT cannot orphan the result/action rows.
+	// All writes (action, result, step, snapshot) commit atomically so a failure
+	// on a later INSERT cannot orphan earlier rows or split a step from its
+	// checkpoint.
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -497,6 +542,11 @@ func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step) e
 		actionID, annJSON, diagJSON, step.DurationMs, step.CreatedAt,
 	); err != nil {
 		return err
+	}
+	if checkpoint != nil {
+		if err := sqlInsertSnapshot(ctx, tx, prefix, uuid.New(), step.SessionID, step.Index, *checkpoint, step.CreatedAt); err != nil {
+			return fmt.Errorf("persist snapshot: %w", err)
+		}
 	}
 	return tx.Commit()
 }

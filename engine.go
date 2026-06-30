@@ -372,6 +372,15 @@ func (s *sessionService) Fork(ctx context.Context, parentID uuid.UUID, stepIndex
 		CreatedAt:       time.Now(),
 		UpdatedAt:       time.Now(),
 	}
+	// Reconstruct full state as of the fork point from the per-step checkpoint so
+	// the branch inherits the state after stepIndex, not the parent's latest. When
+	// no checkpoint exists that early (e.g. a pre-checkpoint session), fall back to
+	// the parent's current state.
+	if st, found, err := querySnapshotAt(ctx, s.e.db, s.e.prefix, parentID, stepIndex); err != nil {
+		return nil, fmt.Errorf("loom: fork: load checkpoint: %w", err)
+	} else if found {
+		branch.State = st
+	}
 	if err := insertSession(ctx, s.e.db, s.e.prefix, branch); err != nil {
 		return nil, err
 	}
@@ -563,16 +572,17 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		DurationMs:  int(time.Since(start).Milliseconds()),
 		CreatedAt:   time.Now(),
 	}
-	if err := insertStep(ctx, s.e.db, s.e.prefix, step); err != nil {
+	// Finalize the post-step state before persisting so the step and its
+	// checkpoint commit in one transaction. Reconcile any Vars the hooks wrote on
+	// the per-step copy back onto the shared session (last writer wins).
+	session.State.Modality = result.Modality()
+	mergeVars(&session.State, stepSession.State.Vars)
+	if err := insertStep(ctx, s.e.db, s.e.prefix, step, &session.State); err != nil {
 		return nil, fmt.Errorf("loom: persist step: %w", err)
 	}
 
-	// Update session history and state.
+	// Update session history and the session row.
 	session.History = append(session.History, *step)
-	session.State.Modality = result.Modality()
-	// Reconcile any Vars the hooks wrote on the per-step copy back onto the
-	// shared session (last writer wins), under the lock.
-	mergeVars(&session.State, stepSession.State.Vars)
 	if err := s.e.sessions.Update(ctx, session); err != nil {
 		s.e.log.Error("update session after step", "session_id", session.ID, "err", err)
 	}
@@ -854,8 +864,11 @@ func listSessions(ctx context.Context, db *sql.DB, prefix, platformID string, li
 func querySteps(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID) ([]Step, error) {
 	return sqlQuerySteps(ctx, db, prefix, sessionID)
 }
-func insertStep(ctx context.Context, db *sql.DB, prefix string, step *Step) error {
-	return sqlInsertStep(ctx, db, prefix, step)
+func insertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, checkpoint *State) error {
+	return sqlInsertStep(ctx, db, prefix, step, checkpoint)
+}
+func querySnapshotAt(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID, stepIndex int) (State, bool, error) {
+	return sqlQuerySnapshotAt(ctx, db, prefix, sessionID, stepIndex)
 }
 
 // JudgeRegistry is the public interface returned by Engine.Judges().
