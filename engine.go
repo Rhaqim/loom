@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"sync"
 	"text/template"
 	"time"
@@ -56,6 +57,11 @@ type Config struct {
 	Pricing map[string]ModelPrice
 	// DefaultPrice is used for models absent from Pricing (default: $1/$3 per 1M).
 	DefaultPrice *ModelPrice
+	// BranchGC configures the branch garbage collector used by Engine.GC().
+	// Nil uses safe defaults (DryRun=true, so nothing is deleted); set an explicit
+	// config with DryRun=false to actually sweep. The Dialect is filled in from
+	// Config.Dialect automatically.
+	BranchGC *BranchGCConfig
 }
 
 // Logger is the minimal logging interface the engine uses.
@@ -147,9 +153,6 @@ func New(cfg Config) (*Engine, error) {
 	if cfg.AsyncPoller.Workers > 0 {
 		e.poller = newAsyncPollerService(e, cfg.AsyncPoller)
 	}
-
-	// Register built-in budget enforcer pre-hook.
-	e.hooks.RegisterPre("budget-enforcer", e.budgets.enforceHook)
 
 	return e, nil
 }
@@ -431,6 +434,15 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		}
 	}
 
+	// Enforce budgets before the generator is chosen: an exceeded budget may
+	// block this step (BudgetExceededError) or downgrade it to the agent's
+	// fallback, so it must run before generator resolution.
+	if downgraded, err := s.e.budgets.enforce(ctx, session, agent); err != nil {
+		return nil, err
+	} else {
+		agent = downgraded
+	}
+
 	// Look up generator. A per-request GeneratorOverride wins over the agent's
 	// configured generator, enabling per-call provider/model routing.
 	genSlug := agent.GeneratorSlug
@@ -603,6 +615,26 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	return step, nil
 }
 
+// resolveSystemPrompt loads a system-prompt override from the registry
+// (Slug+Version) or a file (File). An empty ref yields "".
+func (s *stepService) resolveSystemPrompt(ctx context.Context, ref PromptRef) (string, error) {
+	if ref.File != "" {
+		b, err := os.ReadFile(ref.File)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	if ref.Slug != "" {
+		p, err := s.e.prompts.Get(ctx, ref.Slug, ref.Version)
+		if err != nil {
+			return "", err
+		}
+		return p.Body, nil
+	}
+	return "", nil
+}
+
 func (s *stepService) buildGenerateRequest(
 	ctx context.Context,
 	session *Session,
@@ -627,6 +659,17 @@ func (s *stepService) buildGenerateRequest(
 			cacheSet(ctx, s.e.cache, spKey, sp)
 		}
 		systemPrompt = sp.Body
+	}
+	// A per-call system-prompt override (e.g. a harness prompt variant) replaces
+	// the agent's system prompt for this step only.
+	if req.SystemPromptOverride != nil {
+		body, err := s.resolveSystemPrompt(ctx, *req.SystemPromptOverride)
+		if err != nil {
+			return GenerateRequest{}, fmt.Errorf("resolve system-prompt override: %w", err)
+		}
+		if body != "" {
+			systemPrompt = body
+		}
 	}
 
 	// Load and render user template — cached by UUID.
@@ -659,6 +702,11 @@ func (s *stepService) buildGenerateRequest(
 	if req.ParamOverride != nil {
 		params = *req.ParamOverride
 	}
+	// params is a shallow struct copy, so params.Extra still aliases the agent's
+	// (or override's) shared map. Clone it before applyParamsMap mutates it in
+	// place — otherwise concurrent steps sharing the agent race/corrupt that map
+	// and one turn's params leak into the next. Clone(nil) is nil (then allocated).
+	params.Extra = maps.Clone(params.Extra)
 	// Fold the free-form params map onto the typed params (known model keys) and
 	// keep the whole map for the generator and template.
 	applyParamsMap(&params, req.Params)
@@ -981,15 +1029,59 @@ func (p *asyncPollerService) pollPending(ctx context.Context) {
 			Provider: t.Provider,
 			Handle:   t.Handle,
 		})
-		if err != nil {
+		switch {
+		case err != nil:
 			p.e.log.Error("poll task", "task_id", t.ID, "err", err)
-			_ = sqlIncrementTaskAttempts(ctx, p.e.db, p.e.prefix, t.ID, err.Error())
-			continue
-		}
-		if result.Status() == ResultStatusReady {
-			_ = sqlMarkTaskReady(ctx, p.e.db, p.e.prefix, t.ID, result)
+			p.retryOrFail(ctx, t, err.Error())
+		case result == nil:
+			// Defensive: a generator returning (nil, nil) is a non-terminal miss,
+			// not a worker panic.
+			p.retryOrFail(ctx, t, "poll returned no result")
+		case result.Status() == ResultStatusReady:
+			if err := sqlMarkTaskReady(ctx, p.e.db, p.e.prefix, t.ID, result); err != nil {
+				p.e.log.Error("mark task ready", "task_id", t.ID, "err", err)
+			}
+		case result.Status() == ResultStatusFailed:
+			_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, resultErrorMessage(result))
+		default:
+			// Still pending at the provider: count the poll so a job that never
+			// resolves is eventually capped rather than polled forever.
+			p.retryOrFail(ctx, t, "still pending after maximum poll attempts")
 		}
 	}
+}
+
+// defaultMaxPollAttempts caps how many times a task is polled before it is
+// terminally failed when PollerConfig.MaxAttempts is unset.
+const defaultMaxPollAttempts = 60
+
+func (p *asyncPollerService) maxAttempts() int {
+	if p.cfg.MaxAttempts > 0 {
+		return p.cfg.MaxAttempts
+	}
+	return defaultMaxPollAttempts
+}
+
+// retryOrFail increments a task's attempt counter, or terminally fails it once it
+// reaches the attempt cap, so neither erroring nor perpetually-pending jobs are
+// polled forever.
+func (p *asyncPollerService) retryOrFail(ctx context.Context, t pendingTask, reason string) {
+	if t.Attempts+1 >= p.maxAttempts() {
+		_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, reason)
+	} else {
+		_ = sqlIncrementTaskAttempts(ctx, p.e.db, p.e.prefix, t.ID, reason)
+	}
+}
+
+// resultErrorMessage extracts a failed result's error string, falling back to a
+// generic message.
+func resultErrorMessage(r Result) string {
+	if r != nil {
+		if e, ok := r.Metadata()["error"].(string); ok && e != "" {
+			return e
+		}
+	}
+	return "provider reported failure"
 }
 
 // -----------------------------------------------------------------------
@@ -1001,6 +1093,7 @@ type pendingTask struct {
 	ID       uuid.UUID
 	Provider string
 	Handle   string
+	Attempts int
 }
 
 // UsageSummary aggregates cost metrics.
@@ -1065,9 +1158,10 @@ type Budget struct {
 	CreatedAt   time.Time
 }
 
-// BudgetTarget identifies the entity a budget applies to.
+// BudgetTarget identifies the entity a budget applies to. Only Kind ==
+// TargetPlatformID is currently enforced; Create rejects other kinds.
 type BudgetTarget struct {
-	Kind string // "session" | "platform_id" | "custom"
+	Kind string // currently only "platform_id" is enforced
 	Key  string
 }
 
@@ -1193,6 +1287,11 @@ func (c *costService) recordFromResult(ctx context.Context, step *Step, agent *A
 type budgetService struct{ e *Engine }
 
 func (b *budgetService) Create(ctx context.Context, budget *Budget) error {
+	// Only platform_id budgets are enforced today; reject other kinds rather than
+	// silently storing a budget that would never be applied.
+	if budget.Target.Kind != TargetPlatformID {
+		return fmt.Errorf("loom: budget target kind %q is not supported (only %q is enforced)", budget.Target.Kind, TargetPlatformID)
+	}
 	if budget.ID == uuid.Nil {
 		budget.ID = uuid.New()
 	}
@@ -1214,12 +1313,111 @@ func (b *budgetService) Delete(ctx context.Context, id uuid.UUID) error {
 	return sqlDeleteBudget(ctx, b.e.db, b.e.prefix, id)
 }
 
-// enforceHook is registered as the built-in "budget-enforcer" pre-hook.
-func (b *budgetService) enforceHook(ctx context.Context, req *StepRequest) error {
-	// In a real implementation this would query loom_cost_records and compare
-	// against active budgets for the session's platform_id.
-	// For now it is a pass-through — the mechanism is wired; data makes it real.
-	return nil
+// enforce checks active platform budgets and applies the configured action when
+// a limit is exceeded: block (returns *BudgetExceededError), downgrade (swaps to
+// the agent's fallback), or notify (logs and continues). It returns the agent to
+// use.
+//
+// The cap is BEST-EFFORT, not a hard ceiling: it reads only PRIOR recorded spend
+// (the current step's cost is recorded after the step, fire-and-forget), and a
+// turn's parallel followers each see the same prior spend — so spend can overshoot
+// by up to one step per concurrent call. It also fails OPEN on lookup/usage errors
+// so a transient DB glitch never silently breaks a run.
+func (b *budgetService) enforce(ctx context.Context, session *Session, agent *Agent) (*Agent, error) {
+	if session == nil || session.PlatformID == "" {
+		return agent, nil
+	}
+	budgets, err := b.List(ctx, TargetPlatformID, session.PlatformID)
+	if err != nil {
+		b.e.log.Error("budget: list", "err", err)
+		return agent, nil
+	}
+	now := time.Now()
+	for _, bud := range budgets {
+		if !bud.Active {
+			continue
+		}
+		used, err := b.e.costs.Usage(ctx, UsageQuery{Target: bud.Target, From: budgetWindowStart(bud.Window, now), To: now})
+		if err != nil {
+			b.e.log.Error("budget: usage", "budget", bud.Name, "err", err)
+			continue
+		}
+		if !budgetExceeded(bud.Limit, used) {
+			continue
+		}
+		switch bud.OnExceed {
+		case BudgetDowngrade:
+			if agent.FallbackAgentID != nil {
+				if fb, ferr := sqlQueryAgentByID(ctx, b.e.db, b.e.prefix, *agent.FallbackAgentID); ferr == nil {
+					b.e.log.Info("budget: downgrading to fallback", "budget", bud.Name, "from", agent.Slug, "to", fb.Slug)
+					return fb, nil
+				}
+			}
+			// No usable fallback — block rather than silently overspend.
+			return agent, budgetExceededErr(bud, used, now)
+		case BudgetNotify:
+			b.e.log.Info("budget: exceeded (notify)", "budget", bud.Name, "used_usd", used.TotalUSD, "limit_usd", bud.Limit.USD)
+		default: // BudgetBlock
+			return agent, budgetExceededErr(bud, used, now)
+		}
+	}
+	return agent, nil
+}
+
+func budgetExceeded(limit BudgetLimit, used *UsageSummary) bool {
+	if limit.USD > 0 && used.TotalUSD >= limit.USD {
+		return true
+	}
+	if limit.Tokens > 0 && used.TotalTokens >= limit.Tokens {
+		return true
+	}
+	if limit.Steps > 0 && used.StepCount >= limit.Steps {
+		return true
+	}
+	return false
+}
+
+func budgetExceededErr(bud *Budget, used *UsageSummary, now time.Time) *BudgetExceededError {
+	return &BudgetExceededError{
+		BudgetName:  bud.Name,
+		Window:      string(bud.Window),
+		UsedUSD:     used.TotalUSD,
+		LimitUSD:    bud.Limit.USD,
+		UsedTokens:  used.TotalTokens,
+		LimitTokens: bud.Limit.Tokens,
+		ResetsAt:    budgetWindowEnd(bud.Window, now),
+	}
+}
+
+// budgetWindowStart returns the lower bound of a rolling budget window.
+func budgetWindowStart(w BudgetWindow, now time.Time) time.Time {
+	switch w {
+	case BudgetWindowHour:
+		return now.Add(-time.Hour)
+	case BudgetWindowDay:
+		return now.Add(-24 * time.Hour)
+	case BudgetWindowWeek:
+		return now.Add(-7 * 24 * time.Hour)
+	case BudgetWindowMonth:
+		return now.Add(-30 * 24 * time.Hour)
+	default: // lifetime (or unknown) — count everything
+		return time.Time{}
+	}
+}
+
+func budgetWindowEnd(w BudgetWindow, now time.Time) time.Time {
+	switch w {
+	case BudgetWindowHour:
+		return now.Add(time.Hour)
+	case BudgetWindowDay:
+		return now.Add(24 * time.Hour)
+	case BudgetWindowWeek:
+		return now.Add(7 * 24 * time.Hour)
+	case BudgetWindowMonth:
+		return now.Add(30 * 24 * time.Hour)
+	default:
+		return time.Time{}
+	}
 }
 
 // -----------------------------------------------------------------------

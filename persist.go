@@ -63,6 +63,13 @@ func sqlQueryAgentLatest(ctx context.Context, db *sql.DB, prefix, slug string) (
 	return scanAgent(row)
 }
 
+func sqlQueryAgentByID(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Agent, error) {
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM %sagents WHERE id=$1`, agentColumns, prefix), id)
+	return scanAgent(row)
+}
+
 func sqlListAgents(ctx context.Context, db *sql.DB, prefix, category string) ([]*Agent, error) {
 	q := fmt.Sprintf(`SELECT %s FROM %sagents`, agentColumns, prefix)
 	args := []any{}
@@ -555,6 +562,14 @@ func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, c
 			return fmt.Errorf("persist action: %w", err)
 		}
 	}
+	// An async result carries a TaskHandle. Record the task row first so the
+	// background poller can later resolve it, and so the results.task_id foreign
+	// key is satisfied (loom_results.task_id references loom_tasks.id).
+	if th := step.Result.TaskHandle(); th != nil {
+		if err := sqlInsertTask(ctx, tx, prefix, th, step.Result.ResultID()); err != nil {
+			return fmt.Errorf("persist task: %w", err)
+		}
+	}
 	if err := sqlInsertResult(ctx, tx, prefix, step); err != nil {
 		return fmt.Errorf("persist result: %w", err)
 	}
@@ -646,9 +661,22 @@ func sqlQuerySteps(ctx context.Context, db *sql.DB, prefix string, sessionID uui
 // Task persistence (async provider jobs)
 // -----------------------------------------------------------------------
 
+// sqlInsertTask records an in-flight async provider job. It runs inside the step
+// transaction (hence execer) and MUST be written before the results row, because
+// loom_results.task_id references loom_tasks(id).
+func sqlInsertTask(ctx context.Context, db execer, prefix string, th *TaskHandle, resultID uuid.UUID) error {
+	now := time.Now()
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO %stasks (id, provider, handle, status, result_id, created_at, updated_at)
+		VALUES ($1,$2,$3,'pending',$4,$5,$6)`, prefix),
+		th.ID, th.Provider, th.Handle, resultID, now, now,
+	)
+	return err
+}
+
 func sqlListPendingTasks(ctx context.Context, db *sql.DB, prefix string) ([]pendingTask, error) {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT id, provider, handle FROM %stasks WHERE status='pending'`, prefix))
+		SELECT id, provider, handle, attempts FROM %stasks WHERE status='pending'`, prefix))
 	if err != nil {
 		return nil, err
 	}
@@ -656,7 +684,7 @@ func sqlListPendingTasks(ctx context.Context, db *sql.DB, prefix string) ([]pend
 	var tasks []pendingTask
 	for rows.Next() {
 		var t pendingTask
-		if err := rows.Scan(&t.ID, &t.Provider, &t.Handle); err != nil {
+		if err := rows.Scan(&t.ID, &t.Provider, &t.Handle, &t.Attempts); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
@@ -671,11 +699,67 @@ func sqlIncrementTaskAttempts(ctx context.Context, db *sql.DB, prefix string, id
 	return err
 }
 
-func sqlMarkTaskReady(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID, _ Result) error {
-	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+// sqlMarkTaskReady persists a resolved async Result. In one transaction it
+// overwrites the linked results row (matched by task_id) with the resolved
+// payload and status, then flips the task to ready. Previously the poller threw
+// the resolved Result away, so the result stayed pending with an empty payload
+// forever and the generated asset was unreachable.
+func sqlMarkTaskReady(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID, result Result) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now()
+	if result != nil {
+		payload, err := marshalResultForStorage(result)
+		if err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE %sresults SET status=$2, payload=$3, updated_at=$4 WHERE task_id=$1`, prefix),
+			id, string(result.Status()), payload, now,
+		)
+		if err != nil {
+			return err
+		}
+		// A resolved task must have a linked result row; refusing to flip the
+		// task to ready when none was updated avoids silently losing the asset.
+		if n, err := res.RowsAffected(); err == nil && n == 0 {
+			return fmt.Errorf("loom: task %s has no linked result row to update", id)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %stasks SET status='ready', updated_at=$2 WHERE id=$1`, prefix),
-		id, time.Now())
-	return err
+		id, now,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// sqlMarkTaskFailed terminally fails an async job: it flips both the linked
+// results row and the task to 'failed' so a stuck job stops being polled.
+func sqlMarkTaskFailed(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID, reason string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE %sresults SET status='failed', updated_at=$2 WHERE task_id=$1`, prefix),
+		id, now,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE %stasks SET status='failed', last_error=$2, updated_at=$3 WHERE id=$1`, prefix),
+		id, reason, now,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // -----------------------------------------------------------------------
@@ -915,6 +999,12 @@ func marshalResultForStorage(r Result) ([]byte, error) {
 			"height":        v.Height,
 			"preview_image": v.PreviewImage,
 		})
+	case *AudioResult:
+		return json.Marshal(map[string]any{
+			"url":          v.URL,
+			"duration_sec": v.DurationSec,
+			"format":       v.Format,
+		})
 	case *WorldResult:
 		return json.Marshal(map[string]any{"deltas": v.Deltas})
 	case *StructuredResult:
@@ -932,48 +1022,51 @@ func marshalResultForStorage(r Result) ([]byte, error) {
 func unmarshalResult(modal Modality, status ResultStatus, payload []byte) Result {
 	var m map[string]any
 	_ = json.Unmarshal(payload, &m)
+	str := func(k string) string { s, _ := m[k].(string); return s }
+	num := func(k string) int { f, _ := m[k].(float64); return int(f) }
+	fnum := func(k string) float64 { f, _ := m[k].(float64); return f }
 	switch modal {
 	case ModalityText:
-		r := &TextResult{}
-		r.modal = ModalityText
-		r.status = status
-		r.meta = map[string]any{}
-		if c, ok := m["content"].(string); ok {
-			r.Content = c
-		}
-		if fr, ok := m["finish_reason"].(string); ok {
-			r.FinishReason = fr
-		}
+		r := &TextResult{Content: str("content"), FinishReason: str("finish_reason"), InputTokens: num("input_tokens"), OutputTokens: num("output_tokens")}
+		r.modal, r.status, r.meta = ModalityText, status, map[string]any{}
 		return r
 	case ModalityImage:
-		r := &ImageResult{}
-		r.modal = ModalityImage
-		r.status = status
-		r.meta = map[string]any{}
-		if u, ok := m["url"].(string); ok {
-			r.URL = u
-		}
+		r := &ImageResult{URL: str("url"), Width: num("width"), Height: num("height"), Prompt: str("prompt")}
+		r.modal, r.status, r.meta = ModalityImage, status, map[string]any{}
 		return r
 	case ModalityVideo:
-		r := &VideoResult{}
-		r.modal = ModalityVideo
-		r.status = status
-		r.meta = map[string]any{}
-		if u, ok := m["url"].(string); ok {
-			r.URL = u
-		}
+		r := &VideoResult{URL: str("url"), DurationSec: fnum("duration_sec"), Width: num("width"), Height: num("height"), PreviewImage: str("preview_image")}
+		r.modal, r.status, r.meta = ModalityVideo, status, map[string]any{}
+		return r
+	case ModalityAudio:
+		r := &AudioResult{URL: str("url"), DurationSec: fnum("duration_sec"), Format: str("format")}
+		r.modal, r.status, r.meta = ModalityAudio, status, map[string]any{}
 		return r
 	case ModalityWorld:
 		r := &WorldResult{}
-		r.modal = ModalityWorld
-		r.status = status
-		r.meta = map[string]any{}
+		r.modal, r.status, r.meta = ModalityWorld, status, map[string]any{}
+		// Re-decode the deltas through JSON into the typed slice (they were
+		// dropped entirely before, losing all world/spatial output on reload).
+		if raw, ok := m["deltas"]; ok {
+			if b, err := json.Marshal(raw); err == nil {
+				_ = json.Unmarshal(b, &r.Deltas)
+			}
+		}
+		return r
+	case ModalityStructured:
+		r := &StructuredResult{InputTokens: num("input_tokens"), OutputTokens: num("output_tokens")}
+		r.modal, r.status, r.meta = ModalityStructured, status, map[string]any{}
+		// Read the inner data object; the marshaled payload wraps it as
+		// {"data":..., "input_tokens":..., "output_tokens":...}.
+		if data, ok := m["data"].(map[string]any); ok {
+			r.Data = data
+		} else {
+			r.Data = m
+		}
 		return r
 	default:
 		r := &StructuredResult{}
-		r.modal = modal
-		r.status = status
-		r.meta = map[string]any{}
+		r.modal, r.status, r.meta = modal, status, map[string]any{}
 		r.Data = m
 		return r
 	}

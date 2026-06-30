@@ -248,26 +248,27 @@ func expandVariants(m VariantMatrix) []variantConfig {
 	if len(providers) == 0 {
 		providers = []string{""}
 	}
+	prompts := m.SystemPrompts
+	if len(prompts) == 0 {
+		prompts = []loom.PromptRef{{}} // one no-op prompt slot
+	}
+	params := m.Params
+	if len(params) == 0 {
+		params = []loom.GenerateParams{{}} // one no-op param slot
+	}
 	for _, p := range providers {
-		if len(m.SystemPrompts) == 0 && len(m.Params) == 0 {
-			out = append(out, variantConfig{Provider: p})
-			continue
-		}
-		prompts := m.SystemPrompts
-		if len(prompts) == 0 {
-			prompts = []loom.PromptRef{{}}
-		}
-		params := m.Params
-		if len(params) == 0 {
-			params = []loom.GenerateParams{{}}
-		}
 		for pi := range prompts {
 			for qi := range params {
 				vc := variantConfig{Provider: p}
-				if prompts[pi].Slug != "" {
+				if prompts[pi].Slug != "" || prompts[pi].File != "" {
 					vc.SystemPrompt = &prompts[pi]
 				}
-				vc.Params = &params[qi]
+				// Only override params when the Params axis was actually given;
+				// otherwise leave nil so the agent's own params stand (an empty
+				// GenerateParams override would zero temperature/max_tokens/etc.).
+				if len(m.Params) > 0 {
+					vc.Params = &params[qi]
+				}
 				out = append(out, vc)
 			}
 		}
@@ -301,6 +302,18 @@ func runVariant(ctx context.Context, e *loom.Engine, plan *TestPlan, vc variantC
 		req := loom.StepRequest{
 			AgentSlug:    scriptStep.AgentSlug,
 			AgentVersion: scriptStep.AgentVersion,
+		}
+		// Apply the variant's overrides so each cross-product cell actually runs
+		// a different configuration. Without this the matrix was cosmetic — every
+		// variant ran the identical agent under a different label.
+		if vc.Provider != "" {
+			req.GeneratorOverride = vc.Provider
+		}
+		if vc.Params != nil {
+			req.ParamOverride = vc.Params
+		}
+		if vc.SystemPrompt != nil {
+			req.SystemPromptOverride = vc.SystemPrompt
 		}
 		if scriptStep.ActionPayload != "" {
 			req.Action = &loom.Action{

@@ -78,6 +78,11 @@ type StepRequest struct {
 	// this call only.
 	ParamOverride *GenerateParams
 
+	// SystemPromptOverride, when non-nil, replaces the agent's system prompt for
+	// this call only — resolved from the registry (Slug+Version) or a file
+	// (File). Used by the test harness to compare system-prompt variants.
+	SystemPromptOverride *PromptRef
+
 	// Overrides is opaque per-request data passed through to the generator on
 	// GenerateRequest.Overrides — e.g. {"api_key": "...", "model": "..."} for
 	// per-user key routing in a custom generator.
