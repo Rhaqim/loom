@@ -34,6 +34,10 @@ type Config struct {
 	// violation). Leave false for the offline stub, whose reduced output does not
 	// satisfy the full v2 schemas; enable for real providers.
 	ValidateSchemas bool
+	// QualityEngine registers the pre-process quality post-hooks (Slop Bans and
+	// the Staleness Detector) on the Author. Leave false for the offline stub
+	// (its fixed prose would trip the bans); enable for real providers.
+	QualityEngine bool
 }
 
 // Conexus is the application engine.
@@ -42,8 +46,10 @@ type Conexus struct {
 	flow loom.Flow
 }
 
-// New constructs the engine and registers the playthrough hooks (memory recall
-// pre-hook + Logician QA post-hook) on the loom engine.
+// New constructs the engine and registers the playthrough hooks on the loom
+// engine: the memory-recall pre-hook and Logician QA post-hook always, plus the
+// schema-validation and quality-engine (slop bans + staleness) post-hooks when
+// the corresponding Config flags are set.
 func New(cfg Config) *Conexus {
 	if cfg.StoryVersion == 0 {
 		cfg.StoryVersion = narrative.LatestVersion(cfg.Versions, narrative.AgentAuthor)
@@ -56,6 +62,12 @@ func New(cfg Config) *Conexus {
 		cfg.Loom.Hooks().RegisterPost("schema-validate", loom.SchemaValidationPostHook())
 	}
 	cfg.Loom.Hooks().RegisterPost("logician-qa", narrative.QAHook())
+	if cfg.QualityEngine {
+		// Author-side quality gates: reject cliché prose and scenes that repeat
+		// the previous turn, asking loom to retry with guidance.
+		cfg.Loom.Hooks().RegisterPost("slop-bans", narrative.SlopBanHook())
+		cfg.Loom.Hooks().RegisterPost("staleness", narrative.StalenessHook(0))
+	}
 	return c
 }
 
