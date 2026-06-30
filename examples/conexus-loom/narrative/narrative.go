@@ -61,33 +61,86 @@ func ParseLogician(text string) (domain.LogicianOutput, error) {
 }
 
 // ParseSensory extracts a SensoryOutput from a model's JSON, accepting both the
-// flat v1 shape ({image_prompt, style_lock, music_mood, intensity}) and the real
-// conexus v2 schema ({image:{prompt,...}, music:{mood,intensity,...}}).
+// flat v1 shape ({image_prompt, style_lock, music_mood, intensity}) and the full
+// conexus v2 schema with five channels (image, music, sfx, voice, ambient). The
+// flat fields mirror image+music for backward-compat; the per-channel directions
+// carry everything.
 func ParseSensory(text string) (domain.SensoryOutput, error) {
 	raw := []byte(extractJSON(text))
 	var flat domain.SensoryOutput
-	if err := json.Unmarshal(raw, &flat); err == nil && flat.ImagePrompt != "" {
+	if err := json.Unmarshal(raw, &flat); err == nil && (flat.ImagePrompt != "" || flat.MusicMood != "") {
+		// Mirror the flat fields into the channel structs so downstream code can
+		// rely on Image/Music uniformly regardless of which shape arrived.
+		flat.Image = domain.ImageDirection{Prompt: flat.ImagePrompt, StyleLock: flat.StyleLock}
+		flat.Music = domain.MusicDirection{Mood: flat.MusicMood, Intensity: flat.Intensity}
 		return flat, nil
 	}
-	var nested struct {
+	var v2 struct {
 		Image struct {
-			Prompt    string `json:"prompt"`
-			StyleLock string `json:"style_lock"`
+			Prompt            string                    `json:"prompt"`
+			StyleLock         string                    `json:"style_lock"`
+			NegativePrompt    string                    `json:"negative_prompt"`
+			CharactersVisible []domain.VisibleCharacter `json:"characters_visible"`
 		} `json:"image"`
 		Music struct {
-			Mood      string  `json:"mood"`
-			Intensity float64 `json:"intensity"`
+			Mood       string  `json:"mood"`
+			Intensity  float64 `json:"intensity"`
+			Transition string  `json:"transition"`
 		} `json:"music"`
+		SFXCue            string  `json:"sfx_cue"`
+		SFXTriggerPhrase  string  `json:"sfx_trigger_phrase"`
+		SFXTriggerWordIdx int     `json:"sfx_trigger_word_index"`
+		SFXGain           float64 `json:"sfx_gain"`
+		Voice             struct {
+			Emotion       string   `json:"emotion"`
+			SpeedModifier float64  `json:"speed_modifier"`
+			Intensity     float64  `json:"intensity"`
+			EmphasisWords []string `json:"emphasis_words"`
+		} `json:"voice"`
+		Ambient struct {
+			Atmosphere     *string `json:"atmosphere"`
+			Cinematography *string `json:"cinematography"`
+			OneShot        *string `json:"one_shot"`
+			Intensity      float64 `json:"intensity"`
+			ColorTint      *string `json:"color_tint"`
+		} `json:"ambient"`
 	}
-	if err := json.Unmarshal(raw, &nested); err != nil {
+	if err := json.Unmarshal(raw, &v2); err != nil {
 		return flat, err
 	}
 	return domain.SensoryOutput{
-		ImagePrompt: nested.Image.Prompt,
-		StyleLock:   nested.Image.StyleLock,
-		MusicMood:   nested.Music.Mood,
-		Intensity:   nested.Music.Intensity,
+		ImagePrompt: v2.Image.Prompt,
+		StyleLock:   v2.Image.StyleLock,
+		MusicMood:   v2.Music.Mood,
+		Intensity:   v2.Music.Intensity,
+		Image: domain.ImageDirection{
+			Prompt:            v2.Image.Prompt,
+			StyleLock:         v2.Image.StyleLock,
+			NegativePrompt:    v2.Image.NegativePrompt,
+			CharactersVisible: v2.Image.CharactersVisible,
+		},
+		Music: domain.MusicDirection{Mood: v2.Music.Mood, Intensity: v2.Music.Intensity, Transition: v2.Music.Transition},
+		SFX: domain.SFXDirection{
+			Cue: v2.SFXCue, TriggerPhrase: v2.SFXTriggerPhrase,
+			TriggerWordIndex: v2.SFXTriggerWordIdx, Gain: v2.SFXGain,
+		},
+		Voice: domain.VoiceDirection{
+			Emotion: v2.Voice.Emotion, SpeedModifier: v2.Voice.SpeedModifier,
+			Intensity: v2.Voice.Intensity, EmphasisWords: v2.Voice.EmphasisWords,
+		},
+		Ambient: domain.AmbientDirection{
+			Atmosphere: deref(v2.Ambient.Atmosphere), Cinematography: deref(v2.Ambient.Cinematography),
+			OneShot: deref(v2.Ambient.OneShot), Intensity: v2.Ambient.Intensity, ColorTint: deref(v2.Ambient.ColorTint),
+		},
 	}, nil
+}
+
+// deref returns the pointed-to string, or "" for a nil (JSON null) pointer.
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // ParseTitle extracts a chapter title from the Title agent's plain-text output:

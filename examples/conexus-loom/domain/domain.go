@@ -97,12 +97,68 @@ type StatePatch struct {
 	Tone             string   `json:"tone,omitempty"`
 }
 
-// SensoryOutput is the art/sound direction for a turn.
+// SensoryOutput is the art/sound direction for a turn. The flat fields mirror
+// the v1 shape; the per-channel directions carry the full v2 schema (image,
+// music, sfx, voice, ambient) and are populated by ParseSensory.
 type SensoryOutput struct {
 	ImagePrompt string  `json:"image_prompt"`
 	StyleLock   string  `json:"style_lock"`
 	MusicMood   string  `json:"music_mood"`
 	Intensity   float64 `json:"intensity"`
+
+	Image   ImageDirection   `json:"-"`
+	Music   MusicDirection   `json:"-"`
+	SFX     SFXDirection     `json:"-"`
+	Voice   VoiceDirection   `json:"-"`
+	Ambient AmbientDirection `json:"-"`
+}
+
+// ImageDirection is the art direction for the turn's key image.
+type ImageDirection struct {
+	Prompt            string
+	StyleLock         string
+	NegativePrompt    string
+	CharactersVisible []VisibleCharacter
+}
+
+// VisibleCharacter is a character the key image should depict.
+type VisibleCharacter struct {
+	Name       string
+	Appearance string
+	Action     string
+	Expression string
+}
+
+// MusicDirection is the scoring direction for the turn.
+type MusicDirection struct {
+	Mood       string  // calm | tense | combat | emotional | romantic | ... | silence
+	Intensity  float64 // 0..1
+	Transition string  // crossfade | hard_cut | fade_out_in
+}
+
+// SFXDirection is a one-shot sound-effect cue.
+type SFXDirection struct {
+	Cue              string
+	TriggerPhrase    string
+	TriggerWordIndex int
+	Gain             float64
+}
+
+// VoiceDirection modulates the narration TTS for the turn's prose.
+type VoiceDirection struct {
+	Emotion       string // neutral | happy | sad | angry | fearful | surprised
+	SpeedModifier float64
+	Intensity     float64
+	EmphasisWords []string
+}
+
+// AmbientDirection is the atmosphere / post-processing direction for the turn.
+type AmbientDirection struct {
+	Atmosphere     string
+	Cinematography string
+	OneShot        string
+	Intensity      float64
+	ColorTint      string
 }
 
 // Protagonist returns the protagonist's name, or "the protagonist".

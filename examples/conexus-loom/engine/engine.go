@@ -240,12 +240,8 @@ func (c *Conexus) PlayTurn(ctx context.Context, storyID uuid.UUID, accountID, ac
 		_ = c.cfg.Memory.Store(ctx, storyID, f)
 	}
 
-	// Enqueue async media from the sensory direction.
-	if res.Sensory != nil && res.Sensory.ImagePrompt != "" {
-		_ = c.cfg.Media.Enqueue(ctx, ports.MediaTask{
-			StoryID: storyID, TurnID: turn.ID.String(), Kind: ports.MediaImage, Prompt: res.Sensory.ImagePrompt,
-		})
-	}
+	// Enqueue async media for every channel the sensory director produced.
+	c.enqueueMedia(ctx, storyID, turn.ID.String(), res.Prose, res.Sensory)
 
 	// Save updated state.
 	sess.State.Vars["play"] = toMap(play)
@@ -258,6 +254,61 @@ func (c *Conexus) PlayTurn(ctx context.Context, storyID uuid.UUID, accountID, ac
 	res.Status = play.Status
 	res.Step = play.Step
 	return res, nil
+}
+
+// enqueueMedia fans the sensory direction out to the media queue, one task per
+// channel the turn produced. The provider behind the queue consumes Prompt (the
+// primary text) plus the channel-specific Params; an empty channel is skipped.
+func (c *Conexus) enqueueMedia(ctx context.Context, storyID uuid.UUID, turnID, prose string, s *domain.SensoryOutput) {
+	if s == nil {
+		return
+	}
+	enq := func(kind ports.MediaKind, prompt string, params map[string]any) {
+		_ = c.cfg.Media.Enqueue(ctx, ports.MediaTask{
+			StoryID: storyID, TurnID: turnID, Kind: kind, Prompt: prompt, Params: params,
+		})
+	}
+	if s.Image.Prompt != "" {
+		enq(ports.MediaImage, s.Image.Prompt, map[string]any{
+			"style_lock":         s.Image.StyleLock,
+			"negative_prompt":    s.Image.NegativePrompt,
+			"characters_visible": s.Image.CharactersVisible,
+		})
+	}
+	if s.Music.Mood != "" {
+		enq(ports.MediaMusic, s.Music.Mood, map[string]any{
+			"mood": s.Music.Mood, "intensity": s.Music.Intensity, "transition": s.Music.Transition,
+		})
+	}
+	if s.SFX.Cue != "" {
+		enq(ports.MediaSFX, s.SFX.Cue, map[string]any{
+			"trigger_phrase": s.SFX.TriggerPhrase, "trigger_word_index": s.SFX.TriggerWordIndex, "gain": s.SFX.Gain,
+		})
+	}
+	// Voice narrates the turn's prose with the director's emotion/speed.
+	if prose != "" {
+		enq(ports.MediaVoice, prose, map[string]any{
+			"emotion": s.Voice.Emotion, "speed_modifier": s.Voice.SpeedModifier,
+			"intensity": s.Voice.Intensity, "emphasis_words": s.Voice.EmphasisWords,
+		})
+	}
+	if s.Ambient.Atmosphere != "" || s.Ambient.Cinematography != "" || s.Ambient.OneShot != "" || s.Ambient.ColorTint != "" {
+		prompt := firstNonEmpty(s.Ambient.Atmosphere, s.Ambient.Cinematography, s.Ambient.OneShot, s.Ambient.ColorTint)
+		enq(ports.MediaAmbient, prompt, map[string]any{
+			"atmosphere": s.Ambient.Atmosphere, "cinematography": s.Ambient.Cinematography,
+			"one_shot": s.Ambient.OneShot, "intensity": s.Ambient.Intensity, "color_tint": s.Ambient.ColorTint,
+		})
+	}
+}
+
+// firstNonEmpty returns the first non-empty string, or "".
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // Fork branches the story at the current head for an alternate timeline.
