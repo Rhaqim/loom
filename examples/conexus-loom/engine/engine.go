@@ -112,6 +112,7 @@ func (c *Conexus) StartStory(ctx context.Context, blockText, accountID string) (
 // TurnResult is the app-facing outcome of one turn.
 type TurnResult struct {
 	TurnID    string
+	Title     string
 	Prose     string
 	Options   []domain.Option
 	Sensory   *domain.SensoryOutput
@@ -207,6 +208,14 @@ func (c *Conexus) PlayTurn(ctx context.Context, storyID uuid.UUID, accountID, ac
 		if so, perr := narrative.ParseSensory(narrative.JSONOf(ss.Result)); perr == nil {
 			res.Sensory = &so
 		}
+	}
+	// Parse the Title follower; fall back to the Logician's emitted title when
+	// the dedicated agent produced nothing.
+	if ts := turn.Followers[narrative.AgentTitle]; ts != nil {
+		res.Title = narrative.ParseTitle(loom.ResultText(ts.Result))
+	}
+	if res.Title == "" {
+		res.Title = strings.TrimSpace(logic.Title)
 	}
 
 	// Per-turn spend, summed synchronously from this turn's steps (lead +

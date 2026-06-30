@@ -80,6 +80,7 @@ type Option struct {
 // parsed from the model's JSON (mirrors Conexus's parse-and-validate approach).
 type LogicianOutput struct {
 	Status     string     `json:"status"`
+	Title      string     `json:"title"` // fallback chapter title; the Title agent overrides it
 	Options    []Option   `json:"options"`
 	StatePatch StatePatch `json:"state_patch"`
 	Reasoning  string     `json:"reasoning,omitempty"`
