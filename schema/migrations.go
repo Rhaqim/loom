@@ -51,6 +51,15 @@ func migrations() []Migration {
 				return nil
 			},
 		},
+		{
+			// Optimistic-concurrency version guards session updates against lost
+			// writes. Backfill it on databases that predate the column.
+			Version: 3,
+			Name:    "session-version",
+			Up: func(ctx context.Context, tx *sql.Tx, p string, d Dialect) error {
+				return addColumnIfMissing(ctx, tx, d, p+"sessions", "version", "INT NOT NULL DEFAULT 0")
+			},
+		},
 	}
 }
 

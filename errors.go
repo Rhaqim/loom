@@ -77,3 +77,8 @@ var ErrNotFound = errors.New("loom: not found")
 
 // ErrDuplicateSlug is returned when an agent or prompt slug+version already exists.
 var ErrDuplicateSlug = errors.New("loom: duplicate slug+version")
+
+// ErrSessionConflict is returned by Session update when the row's version no
+// longer matches the in-memory copy — another writer updated it first, so this
+// write would clobber theirs (optimistic-concurrency conflict).
+var ErrSessionConflict = errors.New("loom: session update conflict")

@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"sync"
@@ -584,6 +585,15 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	// Update session history and the session row.
 	session.History = append(session.History, *step)
 	if err := s.e.sessions.Update(ctx, session); err != nil {
+		// A version conflict means another writer advanced the row (only possible
+		// across engine instances). Resync our version so later steps aren't
+		// permanently frozen; the contended state resolves last-writer-wins.
+		// Full reconciliation is deferred with the multi-instance work.
+		if errors.Is(err, ErrSessionConflict) {
+			if fresh, gerr := querySession(ctx, s.e.db, s.e.prefix, session.ID); gerr == nil {
+				session.Version = fresh.Version
+			}
+		}
 		s.e.log.Error("update session after step", "session_id", session.ID, "err", err)
 	}
 

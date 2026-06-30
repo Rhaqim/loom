@@ -303,10 +303,10 @@ func sqlInsertSession(ctx context.Context, db *sql.DB, prefix string, s *Session
 	tagsJSON, _ := json.Marshal(s.Tags)
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %ssessions
-			(id, platform_id, parent_session_id, branch_point,
+			(id, platform_id, parent_session_id, branch_point, version,
 			 state, metadata, tags, pinned, deleted_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, prefix),
-		s.ID, s.PlatformID, nullableUUID(s.ParentSessionID), s.BranchPoint,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, prefix),
+		s.ID, s.PlatformID, nullableUUID(s.ParentSessionID), s.BranchPoint, s.Version,
 		stateJSON, metaJSON, tagsJSON, s.Pinned, s.DeletedAt,
 		s.CreatedAt, s.UpdatedAt,
 	)
@@ -315,7 +315,7 @@ func sqlInsertSession(ctx context.Context, db *sql.DB, prefix string, s *Session
 
 func sqlQuerySession(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Session, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT id, platform_id, parent_session_id, branch_point,
+		SELECT id, platform_id, parent_session_id, branch_point, version,
 		       state, metadata, tags, pinned, deleted_at, created_at, updated_at
 		FROM %ssessions WHERE id=$1`, prefix), id)
 	return scanSession(row)
@@ -325,18 +325,44 @@ func sqlUpdateSession(ctx context.Context, db *sql.DB, prefix string, s *Session
 	stateJSON, _ := json.Marshal(s.State)
 	metaJSON, _ := json.Marshal(s.Metadata)
 	tagsJSON, _ := json.Marshal(s.Tags)
-	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+	// Compare-and-set on version so a stale writer cannot silently overwrite a
+	// newer state. On success the row's version is bumped and mirrored in memory.
+	// pinned is owned exclusively by Pin/Unpin and deliberately not written here,
+	// so a state Update from a stale copy cannot clobber the pin flag. Soft-deleted
+	// rows are excluded so Updates do not keep mutating a discarded session.
+	res, err := db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %ssessions
-		SET state=$2, metadata=$3, tags=$4, pinned=$5, updated_at=$6
-		WHERE id=$1`, prefix),
-		s.ID, stateJSON, metaJSON, tagsJSON, s.Pinned, s.UpdatedAt,
+		SET state=$2, metadata=$3, tags=$4, updated_at=$5, version=version+1
+		WHERE id=$1 AND version=$6 AND deleted_at IS NULL`, prefix),
+		s.ID, stateJSON, metaJSON, tagsJSON, s.UpdatedAt, s.Version,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// Distinguish a version conflict from an absent or soft-deleted row.
+		var cnt int
+		if qerr := db.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT COUNT(*) FROM %ssessions WHERE id=$1 AND deleted_at IS NULL`, prefix),
+			s.ID).Scan(&cnt); qerr != nil {
+			return qerr
+		}
+		if cnt == 0 {
+			return ErrNotFound
+		}
+		return ErrSessionConflict
+	}
+	s.Version++
+	return nil
 }
 
 func sqlListSessions(ctx context.Context, db *sql.DB, prefix, platformID string, limit, offset int) ([]*Session, error) {
 	q := fmt.Sprintf(`
-		SELECT id, platform_id, parent_session_id, branch_point,
+		SELECT id, platform_id, parent_session_id, branch_point, version,
 		       state, metadata, tags, pinned, deleted_at, created_at, updated_at
 		FROM %ssessions WHERE platform_id=$1 AND deleted_at IS NULL
 		ORDER BY created_at DESC LIMIT $2 OFFSET $3`, prefix)
@@ -370,7 +396,7 @@ func sqlBuildBranchTree(ctx context.Context, db *sql.DB, prefix string, rootID u
 
 func buildChildren(ctx context.Context, db *sql.DB, prefix string, node *BranchNode) error {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT id, platform_id, parent_session_id, branch_point,
+		SELECT id, platform_id, parent_session_id, branch_point, version,
 		       state, metadata, tags, pinned, deleted_at, created_at, updated_at
 		FROM %ssessions WHERE parent_session_id=$1 AND deleted_at IS NULL
 		ORDER BY created_at`, prefix), node.Session.ID)
@@ -426,7 +452,7 @@ func scanSession(row sessionRow) (*Session, error) {
 		deletedAt                     sql.NullTime
 	)
 	err := row.Scan(
-		&s.ID, &s.PlatformID, &parentSessionID, &branchPoint,
+		&s.ID, &s.PlatformID, &parentSessionID, &branchPoint, &s.Version,
 		&stateJSON, &metaJSON, &tagsJSON, &s.Pinned, &deletedAt,
 		&s.CreatedAt, &s.UpdatedAt,
 	)

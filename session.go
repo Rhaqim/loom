@@ -15,14 +15,18 @@ type Session struct {
 	PlatformID      string     // opaque — set by the platform (user ID, story ID, etc.)
 	ParentSessionID *uuid.UUID // non-nil for branch sessions
 	BranchPoint     *int       // step index the branch forks from
-	State           State
-	History         []Step
-	Tags            []string
-	Pinned          bool
-	DeletedAt       *time.Time
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	Metadata        map[string]any // platform-controlled custom data
+	// Version is the optimistic-concurrency revision. Update writes are guarded
+	// by it (compare-and-set) so a stale writer cannot silently clobber a newer
+	// one; it is bumped on each successful Update.
+	Version   int
+	State     State
+	History   []Step
+	Tags      []string
+	Pinned    bool
+	DeletedAt *time.Time
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Metadata  map[string]any // platform-controlled custom data
 }
 
 // State is the live state of a session between steps.
