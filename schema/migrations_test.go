@@ -143,6 +143,61 @@ func TestAdoptPreMigrationSQLite(t *testing.T) {
 	}
 }
 
+// TestForeignKeysEnforcedSQLite proves the SQLite baseline gets cascade/restrict
+// parity with Postgres when the connection opts into PRAGMA foreign_keys=ON.
+func TestForeignKeysEnforcedSQLite(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite",
+		"file:fk_"+uuid.NewString()+"?mode=memory&cache=shared&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { db.Close() })
+
+	if err := NewLoader(DialectSQLite).Apply(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+
+	var fk int
+	if err := db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk); err != nil {
+		t.Fatal(err)
+	}
+	if fk != 1 {
+		t.Fatalf("foreign_keys pragma = %d, want 1 (DSN did not enable enforcement)", fk)
+	}
+
+	// A flow_agent referencing a non-existent flow must be rejected.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO loom_flow_agents (id, flow_id, position, agent_slug) VALUES ($1,$2,0,'a')`,
+		uuid.NewString(), uuid.NewString()); err == nil {
+		t.Fatal("expected a foreign-key violation inserting a flow_agent with a missing flow_id")
+	}
+
+	// Deleting a flow must cascade to its flow_agents.
+	flowID := uuid.NewString()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO loom_flows (id, slug, version, created_at) VALUES ($1,'f',1,CURRENT_TIMESTAMP)`, flowID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO loom_flow_agents (id, flow_id, position, agent_slug) VALUES ($1,$2,0,'a')`,
+		uuid.NewString(), flowID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM loom_flows WHERE id=$1`, flowID); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM loom_flow_agents WHERE flow_id=$1`, flowID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected cascade delete to remove flow_agents, found %d", n)
+	}
+}
+
 // TestApplyPostgres runs the runner against Postgres when LOOM_DSN is set,
 // covering the information_schema column-introspection path.
 func TestApplyPostgres(t *testing.T) {

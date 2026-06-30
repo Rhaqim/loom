@@ -280,6 +280,14 @@ func postgresStatements(p string) []string {
 }
 
 // sqliteStatements returns SQLite-compatible DDL (for testing and embedded use).
+// The foreign keys below mirror the Postgres constraints, but SQLite only
+// enforces them when the connection sets PRAGMA foreign_keys=ON — open the DB
+// with "...?_pragma=foreign_keys(1)" to get cascade/restrict parity. Without it
+// the constraints are declared but inert (the historical default), so enabling
+// enforcement is opt-in and does not change behavior for existing callers.
+// Caveat: SQLite cannot add a foreign key to an existing table, so these
+// constraints only apply to databases created fresh from this baseline; a
+// pre-existing FK-less table is not retrofitted.
 func sqliteStatements(p string) []string {
 	return []string{
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sprompts (
@@ -325,15 +333,15 @@ func sqliteStatements(p string) []string {
 			category TEXT NOT NULL DEFAULT '',
 			modality TEXT NOT NULL,
 			generator_slug TEXT NOT NULL,
-			system_prompt_id TEXT,
-			user_template_id TEXT,
-			response_format_id TEXT,
+			system_prompt_id TEXT REFERENCES %sprompts(id) ON DELETE RESTRICT,
+			user_template_id TEXT REFERENCES %sprompts(id) ON DELETE RESTRICT,
+			response_format_id TEXT REFERENCES %sresponse_formats(id) ON DELETE RESTRICT,
 			response_format TEXT,
 			params TEXT NOT NULL DEFAULT '{}',
 			fallback_agent_id TEXT,
 			created_at DATETIME NOT NULL,
 			UNIQUE (slug, version)
-		)`, p),
+		)`, p, p, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sflows (
 			id          TEXT PRIMARY KEY,
@@ -349,7 +357,7 @@ func sqliteStatements(p string) []string {
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sflow_agents (
 			id                 TEXT PRIMARY KEY,
-			flow_id            TEXT NOT NULL,
+			flow_id            TEXT NOT NULL REFERENCES %sflows(id) ON DELETE CASCADE,
 			position           INTEGER NOT NULL,
 			agent_slug         TEXT NOT NULL,
 			agent_version      INTEGER NOT NULL DEFAULT 0,
@@ -358,12 +366,12 @@ func sqliteStatements(p string) []string {
 			generator_override TEXT NOT NULL DEFAULT '',
 			params             TEXT NOT NULL DEFAULT '{}',
 			UNIQUE (flow_id, position)
-		)`, p),
+		)`, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %ssessions (
 			id TEXT PRIMARY KEY,
 			platform_id TEXT NOT NULL DEFAULT '',
-			parent_session_id TEXT,
+			parent_session_id TEXT REFERENCES %ssessions(id) ON DELETE SET NULL,
 			branch_point INTEGER,
 			state TEXT NOT NULL DEFAULT '{}',
 			metadata TEXT NOT NULL DEFAULT '{}',
@@ -372,7 +380,7 @@ func sqliteStatements(p string) []string {
 			deleted_at DATETIME,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
-		)`, p),
+		)`, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %stasks (
 			id TEXT PRIMARY KEY,
@@ -391,39 +399,39 @@ func sqliteStatements(p string) []string {
 			modality TEXT NOT NULL,
 			status TEXT NOT NULL DEFAULT 'ready',
 			payload TEXT NOT NULL DEFAULT '{}',
-			task_id TEXT,
+			task_id TEXT REFERENCES %stasks(id) ON DELETE SET NULL,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
-		)`, p),
+		)`, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sactions (
 			id TEXT PRIMARY KEY,
-			session_id TEXT NOT NULL,
+			session_id TEXT NOT NULL REFERENCES %ssessions(id) ON DELETE CASCADE,
 			step_index INTEGER NOT NULL,
 			kind TEXT NOT NULL,
 			payload TEXT NOT NULL DEFAULT '{}',
 			metadata TEXT NOT NULL DEFAULT '{}',
 			created_at DATETIME NOT NULL
-		)`, p),
+		)`, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %ssteps (
 			id TEXT PRIMARY KEY,
-			session_id TEXT NOT NULL,
+			session_id TEXT NOT NULL REFERENCES %ssessions(id) ON DELETE CASCADE,
 			step_index INTEGER NOT NULL,
-			agent_id TEXT NOT NULL,
+			agent_id TEXT NOT NULL REFERENCES %sagents(id) ON DELETE RESTRICT,
 			request TEXT NOT NULL DEFAULT '{}',
-			result_id TEXT NOT NULL,
-			action_id TEXT,
+			result_id TEXT NOT NULL REFERENCES %sresults(id) ON DELETE RESTRICT,
+			action_id TEXT REFERENCES %sactions(id) ON DELETE SET NULL,
 			annotations TEXT NOT NULL DEFAULT '[]',
 			diagnostics TEXT NOT NULL DEFAULT '{}',
 			duration_ms INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
 			UNIQUE (session_id, step_index)
-		)`, p),
+		)`, p, p, p, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %saction_templates (
 			id TEXT PRIMARY KEY,
-			session_id TEXT NOT NULL,
+			session_id TEXT NOT NULL REFERENCES %ssessions(id) ON DELETE CASCADE,
 			kind TEXT NOT NULL,
 			label TEXT NOT NULL DEFAULT '',
 			detail TEXT NOT NULL DEFAULT '',
@@ -432,22 +440,22 @@ func sqliteStatements(p string) []string {
 			ordering INTEGER NOT NULL DEFAULT 0,
 			active INTEGER NOT NULL DEFAULT 1,
 			created_at DATETIME NOT NULL
-		)`, p),
+		)`, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sstate_snapshots (
 			id TEXT PRIMARY KEY,
-			session_id TEXT NOT NULL,
+			session_id TEXT NOT NULL REFERENCES %ssessions(id) ON DELETE CASCADE,
 			step_index INTEGER NOT NULL,
 			snapshot BLOB,
 			vars TEXT NOT NULL DEFAULT '{}',
 			created_at DATETIME NOT NULL
-		)`, p),
+		)`, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %scost_records (
 			id TEXT PRIMARY KEY,
-			step_id TEXT,
-			session_id TEXT,
-			agent_id TEXT,
+			step_id TEXT REFERENCES %ssteps(id) ON DELETE SET NULL,
+			session_id TEXT REFERENCES %ssessions(id) ON DELETE SET NULL,
+			agent_id TEXT REFERENCES %sagents(id) ON DELETE SET NULL,
 			platform_id TEXT NOT NULL DEFAULT '',
 			provider TEXT NOT NULL DEFAULT '',
 			model TEXT NOT NULL DEFAULT '',
@@ -460,7 +468,7 @@ func sqliteStatements(p string) []string {
 			estimated INTEGER NOT NULL DEFAULT 0,
 			tags TEXT NOT NULL DEFAULT '[]',
 			created_at DATETIME NOT NULL
-		)`, p),
+		)`, p, p, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sbudgets (
 			id TEXT PRIMARY KEY,
