@@ -101,6 +101,8 @@ type Engine struct {
 	flows           *flowService
 	poller          *asyncPollerService
 
+	onTaskResolved func(context.Context, TaskResolution)
+
 	mu sync.RWMutex
 }
 
@@ -176,6 +178,42 @@ func (e *Engine) generator(slug string) (Generator, bool) {
 	defer e.mu.RUnlock()
 	g, ok := e.generators[slug]
 	return g, ok
+}
+
+// TaskResolution describes the terminal outcome of an async provider job,
+// delivered to the callback registered with OnTaskResolved.
+type TaskResolution struct {
+	TaskID    uuid.UUID
+	SessionID uuid.UUID
+	AgentID   uuid.UUID
+	Provider  string
+	Status    ResultStatus // ResultStatusReady or ResultStatusFailed
+	Result    Result       // the resolved asset on success; nil on failure
+	Err       string       // failure reason when Status is failed
+}
+
+// OnTaskResolved registers a callback fired when an async task resolves — ready
+// or terminally failed. It runs in the poller goroutine, so it must be fast and
+// non-blocking; offload real work. Only one callback is held; a later call
+// replaces it. Embedders use this to write a resolved asset into their own
+// tables without reaching into loom's internal task tables.
+func (e *Engine) OnTaskResolved(fn func(context.Context, TaskResolution)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.onTaskResolved = fn
+}
+
+func (e *Engine) taskResolvedHook() func(context.Context, TaskResolution) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.onTaskResolved
+}
+
+// TaskStatus reports a task's status ("pending", "ready", or "failed") and, when
+// ready, its resolved result. It lets an embedder check on an async job without
+// querying loom's internal tables. Returns ErrNotFound when no such task exists.
+func (e *Engine) TaskStatus(ctx context.Context, taskID uuid.UUID) (string, Result, error) {
+	return sqlTaskStatus(ctx, e.db, e.prefix, taskID)
 }
 
 // Agents returns the agent registry.
@@ -1194,9 +1232,13 @@ func (p *asyncPollerService) pollPending(ctx context.Context) {
 		case result.Status() == ResultStatusReady:
 			if err := sqlMarkTaskReady(ctx, p.e.db, p.e.prefix, t.ID, result); err != nil {
 				p.e.log.Error("mark task ready", "task_id", t.ID, "err", err)
+			} else {
+				p.notify(ctx, t, ResultStatusReady, result, "")
 			}
 		case result.Status() == ResultStatusFailed:
-			_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, resultErrorMessage(result))
+			msg := resultErrorMessage(result)
+			_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, msg)
+			p.notify(ctx, t, ResultStatusFailed, nil, msg)
 		default:
 			// Still pending at the provider: count the poll so a job that never
 			// resolves is eventually capped rather than polled forever.
@@ -1222,9 +1264,29 @@ func (p *asyncPollerService) maxAttempts() int {
 func (p *asyncPollerService) retryOrFail(ctx context.Context, t pendingTask, reason string) {
 	if t.Attempts+1 >= p.maxAttempts() {
 		_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, reason)
+		p.notify(ctx, t, ResultStatusFailed, nil, reason)
 	} else {
 		_ = sqlIncrementTaskAttempts(ctx, p.e.db, p.e.prefix, t.ID, reason)
 	}
+}
+
+// notify delivers a task's terminal resolution to the registered callback, if
+// any. It runs inline in the poller goroutine; the callback is documented as
+// fast and non-blocking.
+func (p *asyncPollerService) notify(ctx context.Context, t pendingTask, status ResultStatus, result Result, errMsg string) {
+	fn := p.e.taskResolvedHook()
+	if fn == nil {
+		return
+	}
+	fn(ctx, TaskResolution{
+		TaskID:    t.ID,
+		SessionID: t.SessionID,
+		AgentID:   t.AgentID,
+		Provider:  t.Provider,
+		Status:    status,
+		Result:    result,
+		Err:       errMsg,
+	})
 }
 
 // resultErrorMessage extracts a failed result's error string, falling back to a
@@ -1244,10 +1306,12 @@ func resultErrorMessage(r Result) string {
 // -----------------------------------------------------------------------
 
 type pendingTask struct {
-	ID       uuid.UUID
-	Provider string
-	Handle   string
-	Attempts int
+	ID        uuid.UUID
+	Provider  string
+	Handle    string
+	Attempts  int
+	SessionID uuid.UUID
+	AgentID   uuid.UUID
 }
 
 // UsageSummary aggregates cost metrics.
