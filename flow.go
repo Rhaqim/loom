@@ -47,6 +47,14 @@ type FlowAgent struct {
 	// inherit the engine default.
 	RetryMode  RetryMode
 	MaxRetries int
+	// SystemPrompt, when non-zero, is this agent's per-turn system prompt
+	// override (typically PromptRef{Literal: ...} assembled by the embedder).
+	// The zero value leaves the agent's registered system prompt in place.
+	SystemPrompt PromptRef
+	// Inputs are merged over the turn's shared Inputs for this agent only, so
+	// each agent can receive its own user_prompt / values while still seeing the
+	// lead's output. Nil leaves the shared Inputs untouched.
+	Inputs map[string]any
 }
 
 // Flow declares a turn as a lead agent plus parallel followers.
@@ -140,20 +148,21 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		}
 	}
 	leadStep, err := e.steps.run(ctx, session, StepRequest{
-		AgentSlug:         req.Flow.Lead.AgentSlug,
-		AgentVersion:      req.Flow.Lead.AgentVersion,
-		Action:            req.Action,
-		OnChunk:           onChunk,
-		OnStreamEnd:       req.OnStreamEnd,
-		RetryMode:         req.Flow.Lead.RetryMode,
-		MaxRetries:        req.Flow.Lead.MaxRetries,
-		Inputs:            cloneInputs(inputs),
-		Params:            mergeParams(req.Params, req.Flow.Lead.Params),
-		Overrides:         pickOverrides(req.Flow.Lead.Overrides, req.Overrides),
-		GeneratorOverride: req.Flow.Lead.GeneratorOverride,
-		turnID:            turnID,
-		turnRole:          "lead",
-		bus:               bus,
+		AgentSlug:            req.Flow.Lead.AgentSlug,
+		AgentVersion:         req.Flow.Lead.AgentVersion,
+		Action:               req.Action,
+		OnChunk:              onChunk,
+		OnStreamEnd:          req.OnStreamEnd,
+		RetryMode:            req.Flow.Lead.RetryMode,
+		MaxRetries:           req.Flow.Lead.MaxRetries,
+		SystemPromptOverride: promptRefOf(req.Flow.Lead.SystemPrompt),
+		Inputs:               agentInputs(inputs, req.Flow.Lead.Inputs),
+		Params:               mergeParams(req.Params, req.Flow.Lead.Params),
+		Overrides:            pickOverrides(req.Flow.Lead.Overrides, req.Overrides),
+		GeneratorOverride:    req.Flow.Lead.GeneratorOverride,
+		turnID:               turnID,
+		turnRole:             "lead",
+		bus:                  bus,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("loom: turn %q lead %q: %w", req.Flow.Slug, req.Flow.Lead.AgentSlug, err)
@@ -195,14 +204,15 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 				// The turn's Action is recorded once, on the lead step. Followers
 				// analyse the lead's output and read the action via Inputs, so they
 				// carry no Action (sharing the lead's would duplicate its ID).
-				Action:            nil,
-				RetryMode:         f.RetryMode,
-				MaxRetries:        f.MaxRetries,
-				Inputs:            cloneInputs(inputs),
-				Params:            mergeParams(req.Params, f.Params),
-				Overrides:         pickOverrides(f.Overrides, req.Overrides),
-				GeneratorOverride: f.GeneratorOverride,
-				turnID:            turnID,
+				Action:               nil,
+				RetryMode:            f.RetryMode,
+				MaxRetries:           f.MaxRetries,
+				SystemPromptOverride: promptRefOf(f.SystemPrompt),
+				Inputs:               agentInputs(inputs, f.Inputs),
+				Params:               mergeParams(req.Params, f.Params),
+				Overrides:            pickOverrides(f.Overrides, req.Overrides),
+				GeneratorOverride:    f.GeneratorOverride,
+				turnID:               turnID,
 				turnRole:          "follower:" + f.AgentSlug,
 				bus:               bus,
 			})
@@ -292,6 +302,24 @@ func cloneInputs(in map[string]any) map[string]any {
 	out := make(map[string]any, len(in))
 	maps.Copy(out, in)
 	return out
+}
+
+// agentInputs clones the shared turn inputs and merges the agent's own Inputs on
+// top, so each agent can carry its own values (e.g. a distinct user_prompt)
+// without disturbing siblings. cloneInputs always returns a non-nil map.
+func agentInputs(shared, own map[string]any) map[string]any {
+	m := cloneInputs(shared)
+	maps.Copy(m, own)
+	return m
+}
+
+// promptRefOf returns a pointer to ref when it carries an override, or nil when
+// it is the zero value (so the agent's registered system prompt is used).
+func promptRefOf(ref PromptRef) *PromptRef {
+	if ref == (PromptRef{}) {
+		return nil
+	}
+	return &ref
 }
 
 func pickOverrides(specific, fallback map[string]any) map[string]any {

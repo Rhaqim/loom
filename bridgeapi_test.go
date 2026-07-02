@@ -182,6 +182,67 @@ func TestPromptRefLiteral(t *testing.T) {
 	}
 }
 
+// promptRecGen records the (system, user) prompt pair of every Generate call,
+// keyed by system prompt, so a turn test can prove each agent got its own.
+type promptRecGen struct {
+	mu    sync.Mutex
+	pairs map[string]string
+}
+
+func (g *promptRecGen) Modality() Modality { return ModalityText }
+func (g *promptRecGen) Generate(_ context.Context, req GenerateRequest) (Result, error) {
+	g.mu.Lock()
+	if g.pairs == nil {
+		g.pairs = map[string]string{}
+	}
+	g.pairs[req.SystemPrompt] = req.UserPrompt
+	g.mu.Unlock()
+	return NewTextResult("ok", "stop", 1, 1), nil
+}
+
+// Per-agent prompts — each agent in a turn receives its own literal system
+// prompt and its own user_prompt input, not the turn-shared one.
+func TestFlowAgent_PerAgentPrompt(t *testing.T) {
+	ctx := context.Background()
+	gen := &promptRecGen{}
+	e, _ := reproEngine(t, "peragent", map[string]Generator{"g": gen}, PollerConfig{})
+	ut := &Prompt{Slug: "ut", Version: 1, Kind: PromptKindUserTemplate, Body: `{{index .Inputs "user_prompt"}}`}
+	if err := e.Prompts().Create(ctx, ut); err != nil {
+		t.Fatal(err)
+	}
+	for _, slug := range []string{"a1", "a2", "a3"} {
+		if err := e.Agents().Create(ctx, &Agent{Slug: slug, Version: 1, Modal: ModalityText, GeneratorSlug: "g", UserTemplateID: ut.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sess := &Session{PlatformID: "p", State: State{Modality: ModalityText}}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RunTurn(ctx, sess, TurnRequest{
+		Flow: Flow{
+			Slug: "t",
+			Lead: FlowAgent{AgentSlug: "a1", SystemPrompt: PromptRef{Literal: "sys-1"}, Inputs: map[string]any{"user_prompt": "usr-1"}},
+			Followers: []FlowAgent{
+				{AgentSlug: "a2", SystemPrompt: PromptRef{Literal: "sys-2"}, Inputs: map[string]any{"user_prompt": "usr-2"}},
+				{AgentSlug: "a3", SystemPrompt: PromptRef{Literal: "sys-3"}, Inputs: map[string]any{"user_prompt": "usr-3"}},
+			},
+		},
+		Action: &Action{Kind: ActionFreeText, Payload: map[string]any{"text": "go"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"sys-1": "usr-1", "sys-2": "usr-2", "sys-3": "usr-3"}
+	for sys, usr := range want {
+		if gen.pairs[sys] != usr {
+			t.Fatalf("agent with system %q got user %q, want %q (all: %v)", sys, gen.pairs[sys], usr, gen.pairs)
+		}
+	}
+	if len(gen.pairs) != 3 {
+		t.Fatalf("recorded %d distinct system prompts, want 3: %v", len(gen.pairs), gen.pairs)
+	}
+}
+
 // L6 — a turn can mix retry modes: a keep-best lead survives exhaustion with its
 // best draft while a discard follower fails on exhaustion.
 func TestFlowAgentRetryModes(t *testing.T) {
