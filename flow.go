@@ -78,6 +78,14 @@ type TurnRequest struct {
 	// its chunk sink the moment attempt 0 finishes even if a silent keep-best
 	// retry follows. See StepRequest.OnStreamEnd.
 	OnStreamEnd func(attempt int)
+	// OnStep fires as each agent's step settles: once for the lead (role "lead",
+	// err nil) guaranteed before any follower goroutine starts, then once per
+	// follower (role "follower:<slug>") on success (step set, err nil) or failure
+	// (step nil, err set), from the follower's own goroutine and outside the
+	// turn's mutex. The callback MUST NOT block — a slow OnStep would stall the
+	// turn. It lets an embedder build follower inputs from the lead and react to
+	// each follower in completion order.
+	OnStep func(role string, step *Step, err error)
 }
 
 // Turn is the result of RunTurn: the lead step plus follower steps, all sharing
@@ -85,7 +93,8 @@ type TurnRequest struct {
 type Turn struct {
 	ID        uuid.UUID
 	Lead      *Step
-	Followers map[string]*Step // keyed by follower AgentSlug
+	Followers map[string]*Step // keyed by follower AgentSlug (successes only)
+	Errors    map[string]error // keyed by follower AgentSlug (failures only)
 	Steps     []*Step          // lead first, then followers (completion order)
 	Messages  []Message        // everything published on the turn's Bus
 }
@@ -156,7 +165,14 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		ID:        turnID,
 		Lead:      leadStep,
 		Followers: map[string]*Step{},
+		Errors:    map[string]error{},
 		Steps:     []*Step{leadStep},
+	}
+	// Fire the lead callback synchronously, before any follower goroutine starts,
+	// so an embedder can build the follower inputs from the lead's output without
+	// racing the fan-out.
+	if req.OnStep != nil {
+		req.OnStep("lead", leadStep, nil)
 	}
 
 	// ---- Followers (concurrent) ----
@@ -194,14 +210,25 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 				// Publish the follower's output so concurrent siblings can react.
 				bus.Publish(f.AgentSlug, f.AgentSlug, ResultText(step.Result))
 			}
+			// Record the outcome under the mutex (map/slice writes only)...
 			mu.Lock()
-			defer mu.Unlock()
 			if ferr != nil {
+				turn.Errors[f.AgentSlug] = ferr
 				e.log.Error("turn follower failed", "turn_id", turnID, "agent", f.AgentSlug, "err", ferr)
-				return
+			} else {
+				turn.Followers[f.AgentSlug] = step
+				turn.Steps = append(turn.Steps, step)
 			}
-			turn.Followers[f.AgentSlug] = step
-			turn.Steps = append(turn.Steps, step)
+			mu.Unlock()
+			// ...then fire OnStep OUTSIDE the mutex so a slow callback on one
+			// follower cannot serialize the others.
+			if req.OnStep != nil {
+				if ferr != nil {
+					req.OnStep("follower:"+f.AgentSlug, nil, ferr)
+				} else {
+					req.OnStep("follower:"+f.AgentSlug, step, nil)
+				}
+			}
 		}()
 	}
 	wg.Wait()

@@ -697,6 +697,9 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		// permanently frozen; the contended state resolves last-writer-wins.
 		// Full reconciliation is deferred with the multi-instance work.
 		if errors.Is(err, ErrSessionConflict) {
+			// Flag the losing step so callers (and metrics) can observe the
+			// cross-instance contention rather than only seeing a log line.
+			step.Diagnostics["session_conflict"] = true
 			if fresh, gerr := querySession(ctx, s.e.db, s.e.prefix, session.ID); gerr == nil {
 				session.Version = fresh.Version
 			}
