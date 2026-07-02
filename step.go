@@ -122,6 +122,9 @@ type StepRequest struct {
 
 	// Annotations carried from previous retry attempts.
 	annotations []RetryAnnotation
+	// attempt is the 0-based index of the current generation attempt, set by the
+	// engine before each post-hook run so a hook can self-cap its own retries.
+	attempt int
 
 	// turn linkage — set by RunTurn so persisted steps can be grouped into a
 	// single logical turn for branching, replay, and cost rollups.
@@ -135,6 +138,28 @@ type StepRequest struct {
 // if the step is not part of a RunTurn. Hooks and plugins use it to publish or
 // subscribe alongside the turn's agents.
 func (r *StepRequest) Bus() Bus { return r.bus }
+
+// Attempt returns the 0-based index of the current generation attempt. A
+// post-hook reads it to self-cap how many times it re-requests its own
+// correction before accepting a draft.
+func (r *StepRequest) Attempt() int { return r.attempt }
+
+// RetryAnnotations returns a copy of the retry hints accumulated across prior
+// attempts of this step, so a hook can count how often its own annotation Kind
+// has already fired.
+func (r *StepRequest) RetryAnnotations() []RetryAnnotation {
+	if len(r.annotations) == 0 {
+		return nil
+	}
+	out := make([]RetryAnnotation, len(r.annotations))
+	copy(out, r.annotations)
+	return out
+}
+
+// TurnRole is "lead" or "follower:<slug>" when the step runs inside a RunTurn,
+// and "" for a standalone RunStep. Hooks use it to behave differently for the
+// streaming lead versus a parallel follower.
+func (r *StepRequest) TurnRole() string { return r.turnRole }
 
 // StepRunner executes a step request against a session.
 type StepRunner interface {

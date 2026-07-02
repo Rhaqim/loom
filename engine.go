@@ -595,7 +595,8 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 			}
 		}
 
-		// Run post-hooks.
+		// Run post-hooks. Expose the attempt index so a hook can self-cap retries.
+		req.attempt = attempt
 		var hookErr error
 		result, hookErr = s.e.hooks.RunPost(ctx, &req, result)
 		if hookErr == nil {
@@ -712,6 +713,9 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 // resolveSystemPrompt loads a system-prompt override from the registry
 // (Slug+Version) or a file (File). An empty ref yields "".
 func (s *stepService) resolveSystemPrompt(ctx context.Context, ref PromptRef) (string, error) {
+	if ref.Literal != "" {
+		return ref.Literal, nil
+	}
 	if ref.File != "" {
 		b, err := os.ReadFile(ref.File)
 		if err != nil {

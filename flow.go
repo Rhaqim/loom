@@ -42,6 +42,11 @@ type FlowAgent struct {
 	// Params are this agent's tuning knobs (model + domain), merged over the
 	// turn's Params. See StepRequest.Params.
 	Params map[string]any
+	// RetryMode and MaxRetries override the engine retry defaults for this
+	// agent's step (e.g. a keep-best lead, a discard follower). Zero values
+	// inherit the engine default.
+	RetryMode  RetryMode
+	MaxRetries int
 }
 
 // Flow declares a turn as a lead agent plus parallel followers.
@@ -68,6 +73,11 @@ type TurnRequest struct {
 	// Params are turn-wide tuning knobs (model + domain, e.g. temperature,
 	// tension) merged under each FlowAgent's own Params.
 	Params map[string]any
+	// OnStreamEnd fires when the lead's streamed draft is complete, before the
+	// lead's post-hooks run, carrying the attempt index. It lets the caller close
+	// its chunk sink the moment attempt 0 finishes even if a silent keep-best
+	// retry follows. See StepRequest.OnStreamEnd.
+	OnStreamEnd func(attempt int)
 }
 
 // Turn is the result of RunTurn: the lead step plus follower steps, all sharing
@@ -125,6 +135,9 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		AgentVersion:      req.Flow.Lead.AgentVersion,
 		Action:            req.Action,
 		OnChunk:           onChunk,
+		OnStreamEnd:       req.OnStreamEnd,
+		RetryMode:         req.Flow.Lead.RetryMode,
+		MaxRetries:        req.Flow.Lead.MaxRetries,
 		Inputs:            cloneInputs(inputs),
 		Params:            mergeParams(req.Params, req.Flow.Lead.Params),
 		Overrides:         pickOverrides(req.Flow.Lead.Overrides, req.Overrides),
@@ -167,6 +180,8 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 				// analyse the lead's output and read the action via Inputs, so they
 				// carry no Action (sharing the lead's would duplicate its ID).
 				Action:            nil,
+				RetryMode:         f.RetryMode,
+				MaxRetries:        f.MaxRetries,
 				Inputs:            cloneInputs(inputs),
 				Params:            mergeParams(req.Params, f.Params),
 				Overrides:         pickOverrides(f.Overrides, req.Overrides),
