@@ -493,7 +493,23 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	// clean base each attempt rather than stacking across attempts.
 	baseSystemPrompt := genReq.SystemPrompt
 
-	for attempt := 0; attempt <= s.maxRetries; attempt++ {
+	// A per-request cap overrides the engine default (0 = use the default).
+	maxRetries := s.maxRetries
+	if req.MaxRetries > 0 {
+		maxRetries = req.MaxRetries
+	}
+	// Under RetryKeepBest the engine scores every attempt and persists the
+	// lowest-scoring draft rather than failing on exhaustion; retries run
+	// silently (sync, no chunks) so only attempt 0 reaches the caller's OnChunk.
+	keepBest := req.RetryMode == RetryKeepBest
+	var best Result
+	var bestScore int
+	var haveBest bool
+	if keepBest {
+		diagnostics["retry_mode"] = "keep_best"
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			// Carry the accumulated retry hints on the request and fold them into
 			// the prompt itself, so any generator honors them — even ones that
@@ -502,10 +518,21 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 			genReq.SystemPrompt = withRetryDirective(baseSystemPrompt, req.annotations)
 		}
 
+		// Stream attempt 0; keep-best silences retries so a second draft never
+		// leaks to the caller's chunk sink.
+		onChunk := req.OnChunk
+		if keepBest && attempt > 0 {
+			onChunk = nil
+		}
+
 		// Streaming vs sync generation.
-		if sg, ok := gen.(StreamingGenerator); ok && req.OnChunk != nil {
+		if sg, ok := gen.(StreamingGenerator); ok && onChunk != nil {
 			chunks, resultCh, streamErr := sg.GenerateStream(ctx, genReq)
 			if streamErr != nil {
+				if keepBest && haveBest {
+					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = streamErr.Error()
+					break
+				}
 				return nil, fmt.Errorf("loom: generator stream: %w", streamErr)
 			}
 			// Forward chunks until the adapter closes the channel, honouring
@@ -517,7 +544,7 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 					if !more {
 						break drainChunks
 					}
-					req.OnChunk(c)
+					onChunk(c)
 				case <-ctx.Done():
 					return nil, fmt.Errorf("loom: generator stream: %w", ctx.Err())
 				}
@@ -531,35 +558,95 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 			// Mirror the sync error path: a closed channel (no result) or a failed
 			// result is a generator error, not a successful empty turn.
 			if !more || result == nil {
+				if keepBest && haveBest {
+					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = "no result"
+					break
+				}
 				return nil, fmt.Errorf("loom: generator stream: no result")
 			}
 			if result.Status() == ResultStatusFailed {
-				if msg, _ := result.Metadata()["error"].(string); msg != "" {
+				msg, _ := result.Metadata()["error"].(string)
+				if keepBest && haveBest {
+					if msg == "" {
+						msg = "failed"
+					}
+					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = msg
+					break
+				}
+				if msg != "" {
 					return nil, fmt.Errorf("loom: generator stream: %s", msg)
 				}
 				return nil, fmt.Errorf("loom: generator stream: failed")
 			}
+			// Signal that the streamed draft is complete, before post-hooks run,
+			// so the caller can close its chunk sink at this timing even if a
+			// silent keep-best retry follows.
+			if req.OnStreamEnd != nil {
+				req.OnStreamEnd(attempt)
+			}
 		} else {
 			result, err = gen.Generate(ctx, genReq)
 			if err != nil {
+				if keepBest && haveBest {
+					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = err.Error()
+					break
+				}
 				return nil, fmt.Errorf("loom: generator: %w", err)
 			}
 		}
 
 		// Run post-hooks.
-		result, err = s.e.hooks.RunPost(ctx, &req, result)
-		if err == nil {
+		var hookErr error
+		result, hookErr = s.e.hooks.RunPost(ctx, &req, result)
+		if hookErr == nil {
+			if keepBest {
+				best, bestScore, haveBest = result, 0, true
+			}
 			break // success
 		}
-		if !IsRetry(err) {
-			return nil, fmt.Errorf("loom: post-hook: %w", err)
+		if !IsRetry(hookErr) {
+			return nil, fmt.Errorf("loom: post-hook: %w", hookErr)
 		}
-		if attempt == s.maxRetries {
-			return nil, fmt.Errorf("loom: max retries (%d) exceeded: %w", s.maxRetries, err)
-		}
-		ann, _ := RetryAnnotationFrom(err)
-		req.annotations = append(req.annotations, ann)
+
+		var rerr *RetryError
+		errors.As(hookErr, &rerr)
+		ann := rerr.Annotation
 		diagnostics[fmt.Sprintf("retry_%d_reason", attempt+1)] = ann.Reason
+
+		if keepBest {
+			diagnostics[fmt.Sprintf("attempt_%d_score", attempt)] = rerr.Score
+			// A non-positive score with a keepable draft is an honor-system
+			// acceptance: keep it and stop.
+			if rerr.Score <= 0 && rerr.Draft != nil {
+				best, bestScore, haveBest = rerr.Draft, 0, true
+				break
+			}
+			// Track the lowest-scoring draft; strict < keeps the earlier on a tie.
+			if rerr.Draft != nil && (!haveBest || rerr.Score < bestScore) {
+				best, bestScore, haveBest = rerr.Draft, rerr.Score, true
+			}
+			if attempt == maxRetries {
+				break // exhaustion keeps the best draft rather than failing
+			}
+			req.annotations = append(req.annotations, ann)
+			continue
+		}
+
+		// RetryDiscard: exhausting the budget fails the step.
+		if attempt == maxRetries {
+			return nil, fmt.Errorf("loom: max retries (%d) exceeded: %w", maxRetries, hookErr)
+		}
+		req.annotations = append(req.annotations, ann)
+	}
+
+	// Resolve the kept draft for keep-best. A run where no attempt ever produced
+	// a keepable draft is the one keep-best failure mode.
+	if keepBest {
+		if !haveBest {
+			return nil, fmt.Errorf("loom: keep-best produced no usable result after %d attempts", maxRetries+1)
+		}
+		result = best
+		diagnostics["kept_score"] = bestScore
 	}
 
 	// Build and persist step.

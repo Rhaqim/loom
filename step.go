@@ -39,6 +39,20 @@ type Step struct {
 	CreatedAt   time.Time
 }
 
+// RetryMode selects how the engine treats post-hook retries.
+type RetryMode int
+
+const (
+	// RetryDiscard re-runs on a post-hook retry and discards the rejected
+	// attempt; exhausting the retry budget fails the step. This is the default.
+	RetryDiscard RetryMode = iota
+	// RetryKeepBest scores every attempt (post-hooks return ErrRetryScored) and
+	// persists the lowest-scoring draft. Exhausting the budget keeps the best
+	// draft instead of failing, a generator failure after attempt 0 keeps the
+	// best draft so far, and only attempt 0 streams (retries run silently).
+	RetryKeepBest
+)
+
 // StepRequest is the input to RunStep.
 type StepRequest struct {
 	// Agent is the agent to run. Exactly one of Agent or AgentSlug must be set.
@@ -52,9 +66,16 @@ type StepRequest struct {
 	// Callbacks (all optional)
 	OnChunk      func(Chunk)      // receives streaming text fragments
 	OnCostUpdate func(CostRecord) // receives incremental cost updates during streaming
+	// OnStreamEnd fires when a streaming attempt's chunk channel closes, before
+	// post-hooks run, carrying the 0-based attempt index. It lets a caller close
+	// its chunk sink the moment the streamed draft is complete, even when a
+	// silent RetryKeepBest retry follows.
+	OnStreamEnd func(attempt int)
 
 	// MaxRetries caps the number of post-hook retry attempts (default 3).
 	MaxRetries int
+	// RetryMode selects retry semantics (default RetryDiscard). See RetryMode.
+	RetryMode RetryMode
 
 	// Session is the session this step runs against. The engine populates it
 	// before pre-hooks run so hooks can read and mutate session state — e.g. a
