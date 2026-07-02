@@ -181,12 +181,12 @@ prompts:
     version: 1
     kind: system
     category: cli-test
-    body: "You are a CLI test narrator."
+    body: "You are a CLI test assistant."
   - slug: cli-test-user
     version: 1
     kind: user_template
     category: cli-test
-    body: "Player: {{.Action.Payload.text}}"
+    body: "User: {{.Action.Payload.text}}"
 agents:
   - slug: cli-test-agent
     version: 1

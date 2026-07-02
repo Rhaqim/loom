@@ -36,7 +36,7 @@ func TestRetryAnnotationReachesPrompt(t *testing.T) {
 	gen := &recordGen{}
 	e, _ := reproEngine(t, "retryann", map[string]Generator{"g": gen}, PollerConfig{})
 
-	const baseSys = "You are a narrator."
+	const baseSys = "You are an assistant."
 	sp := &Prompt{Slug: "sys", Version: 1, Kind: PromptKindSystem, Body: baseSys}
 	if err := e.Prompts().Create(ctx, sp); err != nil {
 		t.Fatal(err)

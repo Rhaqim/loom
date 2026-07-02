@@ -1,8 +1,8 @@
 # loom
 
-A modality-agnostic procgen engine for building AI-driven interactive narratives, games, and generative platforms.
+A modality-agnostic engine for orchestrating multi-agent AI applications.
 
-Loom handles the infrastructure — session management, versioned agents and prompts, hook pipelines, cost tracking, branch/replay, entity annotation, LLM-as-judge scoring, and a first-class test harness — so you can focus on your product, not the plumbing.
+Loom handles the infrastructure — session management, versioned agents and prompts, hook pipelines, cost tracking, branch/replay, LLM-as-judge scoring, and a first-class test harness — so you can focus on your product, not the plumbing.
 
 ---
 
@@ -13,9 +13,8 @@ Loom handles the infrastructure — session management, versioned agents and pro
 | **Modality-agnostic** | Text, image, video, and structured output in one pipeline |
 | **Versioned agents & prompts** | Slug + version addressing; swap models without touching session history |
 | **Session branching & replay** | Fork at any step; explore alternatives; GC stale branches automatically |
-| **Hook bus** | Pre- and post-hooks for validation, retry logic, content filtering, and annotation |
+| **Hook bus** | Pre- and post-hooks for validation, retry logic, and content filtering |
 | **Cost tracking & budgets** | Per-step token/USD recording; time-windowed budget enforcement |
-| **Entity annotator** | Automatic extraction of named entities from generated text |
 | **Judge subsystem** | Rubric scoring, pairwise comparison, and binary constraints via LLM |
 | **Test harness** | YAML-driven test plans, variant matrices, parallel execution, assertion DSL |
 | **Multiple generators** | OpenAI, Anthropic, Replicate (images), Runway (video), plus an echo stub |
@@ -70,30 +69,30 @@ func main() {
 
     // Seed a prompt and agent (idempotent in practice via slug+version).
     e.Prompts().Create(ctx, &loom.Prompt{
-        Slug: "narrator-sys", Version: 1, Kind: loom.PromptKindSystem,
+        Slug: "assistant-sys", Version: 1, Kind: loom.PromptKindSystem,
         Body: "You are a vivid storyteller. Keep responses to 2-3 paragraphs.",
     })
     e.Prompts().Create(ctx, &loom.Prompt{
-        Slug: "narrator-user", Version: 1, Kind: loom.PromptKindUserTemplate,
-        Body: "The player does: {{.Action.Payload.text}}",
+        Slug: "assistant-user", Version: 1, Kind: loom.PromptKindUserTemplate,
+        Body: "The user says: {{.Action.Payload.text}}",
     })
 
-    sys, _  := e.Prompts().Get(ctx, "narrator-sys", 1)
-    user, _ := e.Prompts().Get(ctx, "narrator-user", 1)
+    sys, _  := e.Prompts().Get(ctx, "assistant-sys", 1)
+    user, _ := e.Prompts().Get(ctx, "assistant-user", 1)
 
     e.Agents().Create(ctx, &loom.Agent{
-        Slug: "narrator", Version: 1, Modal: loom.ModalityText,
+        Slug: "assistant", Version: 1, Modal: loom.ModalityText,
         GeneratorSlug:  "gpt4o",
         SystemPromptID: sys.ID,
         UserTemplateID: user.ID,
     })
 
     // Open a session and run steps.
-    sess := &loom.Session{PlatformID: "player-1", State: loom.State{Modality: loom.ModalityText}}
+    sess := &loom.Session{PlatformID: "user-1", State: loom.State{Modality: loom.ModalityText}}
     e.Sessions().Create(ctx, sess)
 
     step, err := e.RunStep(ctx, sess, loom.StepRequest{
-        AgentSlug: "narrator",
+        AgentSlug: "assistant",
         Action: &loom.Action{
             Kind:    loom.ActionFreeText,
             Payload: map[string]any{"text": "I push open the ancient door."},
@@ -153,7 +152,7 @@ User templates are Go `text/template` strings. The template data is:
 
 ### Sessions & Steps
 
-A **Session** holds the full conversation history, state variables, and tags. A **Step** is one agent invocation — it records the request, result, action, annotations, and duration.
+A **Session** holds the full conversation history, state variables, and tags. A **Step** is one agent invocation — it records the request, result, action, and duration.
 
 ```go
 sess := &loom.Session{
@@ -166,7 +165,7 @@ sess := &loom.Session{
 e.Sessions().Create(ctx, sess)
 
 step, err := e.RunStep(ctx, sess, loom.StepRequest{
-    AgentSlug: "narrator",
+    AgentSlug: "assistant",
     Action: &loom.Action{
         Kind:    loom.ActionFreeText,
         Payload: map[string]any{"text": "I order a drink."},
@@ -186,7 +185,7 @@ concurrently. Every resulting step is persisted and tagged with one `turn_id`.
 
 ```go
 flow := loom.Flow{
-    Slug: "story-turn",
+    Slug: "chat-turn",
     Lead: loom.FlowAgent{AgentSlug: "author", Stream: true, OutputKey: "Prose"},
     Followers: []loom.FlowAgent{
         {AgentSlug: "logician"}, // sees the lead's prose via {{.Inputs.Prose}}
@@ -207,7 +206,7 @@ Because every agent in a flow is an ordinary versioned agent, the only thing tha
 changes between products — or between text, image, video, and spatial/AR
 modalities — is the set of agents/prompts the flow references plus the registered
 generators. See [examples/conexus-loom](examples/conexus-loom) for a full
-multi-agent, multimodal playthrough that runs with no API keys.
+multi-agent, multimodal session that runs with no API keys.
 
 #### Per-step inputs, session-aware hooks, provider overrides
 
@@ -230,7 +229,7 @@ Fork a session at any step index to explore an alternative timeline. The parent 
 branch, err := e.Sessions().Fork(ctx, sess.ID, 2)
 
 // Run a divergent step on the branch.
-e.RunStep(ctx, branch, loom.StepRequest{AgentSlug: "narrator", Action: action})
+e.RunStep(ctx, branch, loom.StepRequest{AgentSlug: "assistant", Action: action})
 
 // Inspect the tree.
 tree, _ := e.Sessions().BranchTree(ctx, sess.ID)
@@ -265,7 +264,7 @@ type StreamingGenerator interface {
 
 ### Actions
 
-Actions carry structured player/user input into a step:
+Actions carry structured user input into a step:
 
 | Kind | Payload type | Use case |
 |---|---|---|
@@ -320,23 +319,6 @@ usage, _ := e.Cost().SessionUsage(ctx, sess.ID)
 fmt.Printf("Session cost: $%.4f (%d input tokens)\n", usage.TotalUSD, usage.InputTokens)
 ```
 
-### Entity annotator
-
-Extract named entities from generated text automatically:
-
-```go
-import "github.com/rhaqim/loom/entity"
-
-// Exact-match annotator.
-a := entity.NewExactMatch([]string{"Phandelver", "Sildar", "Wave Echo Cave"})
-
-// Fuzzy (Levenshtein distance).
-a := entity.NewFuzzy(knownEntities, 2)
-
-// LLM-based (uses a generator to extract entities).
-a := entity.NewLLM(gen, "Extract all character and location names.")
-```
-
 ### Judge subsystem
 
 Score and compare outputs using another LLM as judge:
@@ -368,12 +350,12 @@ Write test plans in code or YAML. The harness runs all variants in parallel:
 import "github.com/rhaqim/loom/harness"
 
 plan := &harness.TestPlan{
-    Name: "narrator-v2",
+    Name: "assistant-v2",
     Session: harness.SessionScript{
         PlatformID: "test-user",
         Steps: []harness.ScriptedStep{
-            {AgentSlug: "narrator", ActionPayload: "I enter the cave."},
-            {AgentSlug: "narrator", ActionPayload: "I search for traps."},
+            {AgentSlug: "assistant", ActionPayload: "I enter the cave."},
+            {AgentSlug: "assistant", ActionPayload: "I search for traps."},
         },
     },
     Variants: harness.VariantMatrix{
@@ -417,14 +399,14 @@ Set `LOOM_DSN` to your Postgres connection string (or pass `--dsn`).
 
 ```yaml
 prompts:
-  - slug: narrator-sys
+  - slug: assistant-sys
     version: 1
     kind: system
-    category: story
+    category: chat
     body: "You are a vivid storyteller."
 
 agents:
-  - slug: narrator
+  - slug: assistant
     version: 1
     modal: text
     generator_slug: openai
@@ -444,7 +426,7 @@ make migrate
 # Seed example data.
 make seed
 
-# Run the example story app.
+# Run the example app.
 make example
 
 # Run all integration tests.
@@ -471,7 +453,6 @@ loom/
 ├── hook.go            # HookBus, PreHook, PostHook
 ├── modality.go        # Modality constants
 ├── errors.go          # ErrSkip, ErrRetryWith, BudgetExceededError
-├── entity.go          # Entity annotator wiring
 ├── judges.go          # JudgeRegistry wiring
 ├── gc_service.go      # GC service wiring
 ├── persist.go         # All SQL persistence (unexported)
@@ -483,14 +464,13 @@ loom/
 │   ├── runway/        # Async video generation
 │   └── echo/          # Echo stub (testing, no API key needed)
 ├── judge/             # RubricJudge, PairwiseJudge, ConstraintJudge
-├── entity/            # ExactMatch, Fuzzy, LLM annotators
 ├── gc/                # Background branch GC worker
 ├── harness/           # TestPlan, VariantMatrix, Assertion DSL, parallel runner
 ├── cmd/loom-cli/      # CLI: migrate, seed, test
 ├── examples/
-│   ├── story/         # Simple narrative example
+│   ├── story/         # Minimal single-agent example
 │   ├── dnd/           # Full D&D solo experience (own go.mod)
-│   └── conexus-loom/  # Multi-agent, multimodal playthrough via RunTurn (own go.mod, zero-setup)
+│   └── conexus-loom/  # Multi-agent, multimodal session via RunTurn (own go.mod, zero-setup)
 └── internal/
     ├── enginetest/    # Engine integration tests
     └── clitest/       # CLI integration tests

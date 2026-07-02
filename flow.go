@@ -54,7 +54,7 @@ type Flow struct {
 // TurnRequest is the input to RunTurn.
 type TurnRequest struct {
 	Flow Flow
-	// Action is the player/user input that drives the turn (nil for an opening).
+	// Action is the user input that drives the turn (nil for an opening).
 	Action *Action
 	// OnChunk receives streaming fragments from the lead agent (if Lead.Stream).
 	OnChunk func(Chunk)
