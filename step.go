@@ -34,7 +34,6 @@ type Step struct {
 	Request     StoredRequest
 	Result      Result
 	Action      *Action // the discriminator's action that triggered this step (nil for step 0)
-	Annotations []EntityAnnotation
 	Diagnostics map[string]any // anything pre/post processors logged
 	DurationMs  int
 	CreatedAt   time.Time

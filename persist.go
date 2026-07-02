@@ -543,7 +543,6 @@ func sqlQuerySnapshotAt(ctx context.Context, db *sql.DB, prefix string, sessionI
 func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, checkpoint *State) error {
 	reqJSON, _ := json.Marshal(step.Request)
 	diagJSON, _ := json.Marshal(step.Diagnostics)
-	annJSON, _ := json.Marshal(step.Annotations)
 
 	// All writes (action, result, step, snapshot) commit atomically so a failure
 	// on a later INSERT cannot orphan earlier rows or split a step from its
@@ -576,11 +575,11 @@ func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, c
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %ssteps
 			(id, session_id, step_index, agent_id, request, result_id,
-			 action_id, annotations, diagnostics, duration_ms, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, prefix),
+			 action_id, diagnostics, duration_ms, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, prefix),
 		step.ID, step.SessionID, step.Index, step.AgentID,
 		reqJSON, step.Result.ResultID(),
-		actionID, annJSON, diagJSON, step.DurationMs, step.CreatedAt,
+		actionID, diagJSON, step.DurationMs, step.CreatedAt,
 	); err != nil {
 		return err
 	}
