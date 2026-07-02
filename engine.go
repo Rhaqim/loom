@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"strings"
 	"sync"
 	"text/template"
 	"time"
@@ -488,11 +489,17 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	// Generation loop with retry support.
 	var result Result
 	diagnostics := map[string]any{}
+	// The directive-free system prompt, so retry hints are re-applied from a
+	// clean base each attempt rather than stacking across attempts.
+	baseSystemPrompt := genReq.SystemPrompt
 
 	for attempt := 0; attempt <= s.maxRetries; attempt++ {
 		if attempt > 0 {
-			// Merge forbidden phrases into the next request.
+			// Carry the accumulated retry hints on the request and fold them into
+			// the prompt itself, so any generator honors them — even ones that
+			// ignore GenerateRequest.Annotations.
 			genReq.Annotations = req.annotations
+			genReq.SystemPrompt = withRetryDirective(baseSystemPrompt, req.annotations)
 		}
 
 		// Streaming vs sync generation.
@@ -743,6 +750,59 @@ func (s *stepService) buildGenerateRequest(
 		ParamsMap:      req.Params,
 		Bus:            req.bus,
 	}, nil
+}
+
+// withRetryDirective appends a system-prompt addendum describing why the prior
+// attempt was rejected and what to avoid, so the model actually corrects on the
+// next attempt. Generators also receive the hints on GenerateRequest.Annotations,
+// but most ignore that field — folding them into the prompt makes retries work
+// regardless of the generator. Returns systemPrompt unchanged when there is
+// nothing to add.
+func withRetryDirective(systemPrompt string, anns []RetryAnnotation) string {
+	d := annotationDirective(anns)
+	switch {
+	case d == "":
+		return systemPrompt
+	case systemPrompt == "":
+		return d
+	default:
+		return systemPrompt + "\n\n" + d
+	}
+}
+
+// annotationDirective renders retry hints into one instruction block, de-duping
+// reasons and forbidden phrases, or "" when there is nothing to say.
+func annotationDirective(anns []RetryAnnotation) string {
+	var reasons, forbidden []string
+	seenReason, seenPhrase := map[string]bool{}, map[string]bool{}
+	for _, a := range anns {
+		if r := strings.TrimSpace(a.Reason); r != "" && !seenReason[r] {
+			seenReason[r] = true
+			reasons = append(reasons, r)
+		}
+		for _, f := range a.Forbidden {
+			if f = strings.TrimSpace(f); f != "" && !seenPhrase[f] {
+				seenPhrase[f] = true
+				forbidden = append(forbidden, f)
+			}
+		}
+	}
+	if len(reasons) == 0 && len(forbidden) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Your previous attempt was rejected and must be corrected.")
+	if len(reasons) > 0 {
+		b.WriteString(" Reason: ")
+		b.WriteString(strings.Join(reasons, "; "))
+		b.WriteString(".")
+	}
+	if len(forbidden) > 0 {
+		b.WriteString(" Do not use any of these words or phrases: ")
+		b.WriteString(strings.Join(forbidden, ", "))
+		b.WriteString(".")
+	}
+	return b.String()
 }
 
 // applyParamsMap folds known model keys from a free-form params map onto the
