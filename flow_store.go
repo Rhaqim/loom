@@ -26,9 +26,6 @@ type FlowRecord struct {
 	Owner   string // opaque app-owned scope; "" = global
 	Slug    string
 	Version int
-	// TopicID is an optional per-story override (nil = applies to the owner
-	// broadly). Stored as an opaque string; loom does not interpret it.
-	TopicID   *string
 	Category  string
 	IsActive  bool
 	Agents    []FlowAgentEntry // ordered; index 0 is the lead
@@ -150,7 +147,7 @@ func (e *Engine) RunTurnBySlug(ctx context.Context, session *Session, owner, slu
 // SQL
 // -----------------------------------------------------------------------
 
-const flowColumns = `id, owner, slug, version, topic_id, category, is_active, created_at`
+const flowColumns = `id, owner, slug, version, category, is_active, created_at`
 const flowAgentColumns = `position, agent_slug, agent_version, output_key, stream, generator_override, params`
 
 func sqlInsertFlow(ctx context.Context, db *sql.DB, prefix string, r *FlowRecord) error {
@@ -160,14 +157,10 @@ func sqlInsertFlow(ctx context.Context, db *sql.DB, prefix string, r *FlowRecord
 	}
 	defer tx.Rollback()
 
-	var topic any
-	if r.TopicID != nil {
-		topic = *r.TopicID
-	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %sflows (id, owner, slug, version, topic_id, category, is_active, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, prefix),
-		r.ID, r.Owner, r.Slug, r.Version, topic, r.Category, flowBool(r.IsActive), r.CreatedAt,
+		INSERT INTO %sflows (id, owner, slug, version, category, is_active, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`, prefix),
+		r.ID, r.Owner, r.Slug, r.Version, r.Category, flowBool(r.IsActive), r.CreatedAt,
 	); err != nil {
 		return err
 	}
@@ -269,19 +262,14 @@ type flowRow interface {
 func scanFlow(row flowRow) (*FlowRecord, error) {
 	var (
 		r        FlowRecord
-		topic    sql.NullString
 		isActive int
 	)
-	err := row.Scan(&r.ID, &r.Owner, &r.Slug, &r.Version, &topic, &r.Category, &isActive, &r.CreatedAt)
+	err := row.Scan(&r.ID, &r.Owner, &r.Slug, &r.Version, &r.Category, &isActive, &r.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
-	}
-	if topic.Valid {
-		t := topic.String
-		r.TopicID = &t
 	}
 	r.IsActive = isActive != 0
 	return &r, nil
