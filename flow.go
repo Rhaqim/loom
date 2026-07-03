@@ -198,6 +198,26 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			role := "follower:" + f.AgentSlug
+			fired := false
+			// A follower panic (in the generator, a hook, or an OnStep callback)
+			// must degrade only this follower, not crash the whole process. Record
+			// it as a follower error and, if the normal path had not already fired
+			// OnStep, surface it there too.
+			defer func() {
+				if r := recover(); r != nil {
+					perr := fmt.Errorf("loom: follower %q panicked: %v", f.AgentSlug, r)
+					mu.Lock()
+					if _, ok := turn.Followers[f.AgentSlug]; !ok {
+						turn.Errors[f.AgentSlug] = perr
+					}
+					mu.Unlock()
+					e.log.Error("turn follower panicked", "turn_id", turnID, "agent", f.AgentSlug, "err", perr)
+					if req.OnStep != nil && !fired {
+						req.OnStep(role, nil, perr)
+					}
+				}
+			}()
 			step, ferr := e.steps.run(ctx, session, StepRequest{
 				AgentSlug:    f.AgentSlug,
 				AgentVersion: f.AgentVersion,
@@ -213,8 +233,8 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 				Overrides:            pickOverrides(f.Overrides, req.Overrides),
 				GeneratorOverride:    f.GeneratorOverride,
 				turnID:               turnID,
-				turnRole:          "follower:" + f.AgentSlug,
-				bus:               bus,
+				turnRole:             role,
+				bus:                  bus,
 			})
 			if ferr == nil {
 				// Publish the follower's output so concurrent siblings can react.
@@ -233,10 +253,11 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 			// ...then fire OnStep OUTSIDE the mutex so a slow callback on one
 			// follower cannot serialize the others.
 			if req.OnStep != nil {
+				fired = true
 				if ferr != nil {
-					req.OnStep("follower:"+f.AgentSlug, nil, ferr)
+					req.OnStep(role, nil, ferr)
 				} else {
-					req.OnStep("follower:"+f.AgentSlug, step, nil)
+					req.OnStep(role, step, nil)
 				}
 			}
 		}()
