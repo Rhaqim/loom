@@ -2,6 +2,7 @@
 package anthropic
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -36,6 +37,12 @@ func NewChatGenerator(apiKey, model string) *ChatGenerator {
 		baseURL: defaultBaseURL,
 		client:  &http.Client{Timeout: 120 * time.Second},
 	}
+}
+
+// WithBaseURL overrides the API base URL (useful for testing / proxies).
+func (g *ChatGenerator) WithBaseURL(url string) *ChatGenerator {
+	g.baseURL = url
+	return g
 }
 
 func (g *ChatGenerator) Modality() loom.Modality { return loom.ModalityText }
@@ -75,25 +82,63 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 		defer respBody.Close()
 
 		var assembled strings.Builder
-		dec := json.NewDecoder(respBody)
+		stop := "end_turn"
+		var inTok, outTok int
 
-		for {
+		// Anthropic streams Server-Sent Events: "event: <type>" and "data: <json>"
+		// lines separated by blanks. A bufio.Scanner over lines parses this; the
+		// old json.Decoder over the raw body broke on the first non-JSON "event:"
+		// line and silently returned empty content with fabricated zero usage.
+		sc := bufio.NewScanner(respBody)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" || !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			var event struct {
-				Type  string `json:"type"`
+				Type    string `json:"type"`
+				Message struct {
+					Usage struct {
+						InputTokens int `json:"input_tokens"`
+					} `json:"usage"`
+				} `json:"message"`
 				Delta struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
+					Text       string `json:"text"`
+					StopReason string `json:"stop_reason"`
 				} `json:"delta"`
+				Usage struct {
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
 			}
-			if err := dec.Decode(&event); err != nil {
-				break
+			if json.Unmarshal([]byte(payload), &event) != nil {
+				continue
 			}
-			if event.Type == "content_block_delta" && event.Delta.Text != "" {
-				assembled.WriteString(event.Delta.Text)
-				chunks <- loom.Chunk{Content: event.Delta.Text}
+			switch event.Type {
+			case "message_start":
+				inTok = event.Message.Usage.InputTokens
+			case "content_block_delta":
+				if event.Delta.Text != "" {
+					assembled.WriteString(event.Delta.Text)
+					chunks <- loom.Chunk{Content: event.Delta.Text}
+				}
+			case "message_delta":
+				if event.Usage.OutputTokens > 0 {
+					outTok = event.Usage.OutputTokens
+				}
+				if event.Delta.StopReason != "" {
+					stop = event.Delta.StopReason
+				}
 			}
 		}
-		results <- loom.NewTextResult(assembled.String(), "end_turn", 0, 0)
+		if err := sc.Err(); err != nil && assembled.Len() == 0 {
+			results <- loom.NewFailedResult(loom.ModalityText, err)
+			return
+		}
+		tr := loom.NewTextResult(assembled.String(), stop, inTok, outTok)
+		tr.Metadata()["model"] = g.model
+		results <- tr
 	}()
 
 	return chunks, results, nil
@@ -104,11 +149,13 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 // -----------------------------------------------------------------------
 
 type messagesRequest struct {
-	Model     string         `json:"model"`
-	MaxTokens int            `json:"max_tokens"`
-	System    string         `json:"system,omitempty"`
-	Messages  []anthropicMsg `json:"messages"`
-	Stream    bool           `json:"stream,omitempty"`
+	Model       string         `json:"model"`
+	MaxTokens   int            `json:"max_tokens"`
+	Temperature float64        `json:"temperature,omitempty"`
+	TopP        float64        `json:"top_p,omitempty"`
+	System      string         `json:"system,omitempty"`
+	Messages    []anthropicMsg `json:"messages"`
+	Stream      bool           `json:"stream,omitempty"`
 }
 
 type anthropicMsg struct {
@@ -134,13 +181,39 @@ func (g *ChatGenerator) buildBody(req loom.GenerateRequest, stream bool) ([]byte
 		maxTokens = 4096
 	}
 	mr := messagesRequest{
-		Model:     g.model,
-		MaxTokens: maxTokens,
-		System:    req.SystemPrompt,
-		Messages:  []anthropicMsg{{Role: "user", Content: req.UserPrompt}},
-		Stream:    stream,
+		Model:       g.model,
+		MaxTokens:   maxTokens,
+		Temperature: req.Params.Temperature,
+		TopP:        req.Params.TopP,
+		System:      systemWithFormat(req),
+		Messages:    []anthropicMsg{{Role: "user", Content: req.UserPrompt}},
+		Stream:      stream,
 	}
 	return json.Marshal(mr)
+}
+
+// systemWithFormat appends JSON-output guidance to the system prompt when the
+// agent declares a response format. The Anthropic Messages API has no native
+// response_format field, so the contract is steered through the system prompt
+// and validated by loom's SchemaValidationPostHook; parseResponse then decodes
+// the JSON into a StructuredResult.
+func systemWithFormat(req loom.GenerateRequest) string {
+	if req.ResponseFormat == nil {
+		return req.SystemPrompt
+	}
+	var b strings.Builder
+	b.WriteString(req.SystemPrompt)
+	if req.SystemPrompt != "" {
+		b.WriteString("\n\n")
+	}
+	b.WriteString("Respond with a single valid JSON object and nothing else.")
+	if len(req.ResponseFormat.Schema) > 0 {
+		if schemaJSON, err := json.Marshal(req.ResponseFormat.Schema); err == nil {
+			b.WriteString(" It must conform to this JSON schema:\n")
+			b.Write(schemaJSON)
+		}
+	}
+	return b.String()
 }
 
 func (g *ChatGenerator) parseResponse(body []byte, req loom.GenerateRequest) (loom.Result, error) {
@@ -160,10 +233,14 @@ func (g *ChatGenerator) parseResponse(body []byte, req loom.GenerateRequest) (lo
 	if req.ResponseFormat != nil {
 		var data map[string]any
 		if err := json.Unmarshal([]byte(content), &data); err == nil {
-			return loom.NewStructuredResult(data, in, out), nil
+			sr := loom.NewStructuredResult(data, in, out)
+			sr.Metadata()["model"] = g.model
+			return sr, nil
 		}
 	}
-	return loom.NewTextResult(content, mr.StopReason, in, out), nil
+	tr := loom.NewTextResult(content, mr.StopReason, in, out)
+	tr.Metadata()["model"] = g.model
+	return tr, nil
 }
 
 func (g *ChatGenerator) post(ctx context.Context, path string, body []byte) ([]byte, error) {

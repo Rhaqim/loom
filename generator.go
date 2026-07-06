@@ -83,4 +83,8 @@ type StreamingGenerator interface {
 type PollerConfig struct {
 	Interval time.Duration // how often to poll pending tasks
 	Workers  int           // number of concurrent poll goroutines
+	// MaxAttempts caps how many times a task is polled before it is terminally
+	// failed, so neither an erroring nor a perpetually-pending job is polled
+	// forever. Zero uses defaultMaxPollAttempts.
+	MaxAttempts int
 }

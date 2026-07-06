@@ -137,6 +137,11 @@ func (e *Engine) RunTurnBySlug(ctx context.Context, session *Session, owner, slu
 	if err != nil {
 		return nil, fmt.Errorf("loom: load flow %q: %w", slug, err)
 	}
+	// A retired/disabled flow version must not execute. Re-activate by storing a
+	// new version with IsActive set.
+	if !rec.IsActive {
+		return nil, fmt.Errorf("loom: flow %q v%d is not active", slug, rec.Version)
+	}
 	req.Flow = rec.Flow()
 	return e.RunTurn(ctx, session, req)
 }
