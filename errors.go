@@ -29,6 +29,12 @@ type RetryAnnotation struct {
 // RetryError signals a post-hook wants the step re-executed with updated hints.
 type RetryError struct {
 	Annotation RetryAnnotation
+	// Score rates the rejected draft; lower is better. Used only under
+	// RetryKeepBest to decide which attempt to keep. Zero when unused.
+	Score int
+	// Draft is the (hook-transformed) result eligible to be kept under
+	// RetryKeepBest when every attempt is rejected. Nil means not keepable.
+	Draft Result
 }
 
 func (e *RetryError) Error() string {
@@ -38,6 +44,14 @@ func (e *RetryError) Error() string {
 // ErrRetryWith constructs a RetryError with the given annotation.
 func ErrRetryWith(ann RetryAnnotation) error {
 	return &RetryError{Annotation: ann}
+}
+
+// ErrRetryScored is ErrRetryWith plus a score for the rejected draft and the
+// draft itself, for RetryKeepBest steps: the engine keeps the lowest-scoring
+// draft across attempts rather than failing on exhaustion. A non-positive score
+// with a non-nil draft signals acceptance (keep it and stop retrying).
+func ErrRetryScored(ann RetryAnnotation, score int, draft Result) error {
+	return &RetryError{Annotation: ann, Score: score, Draft: draft}
 }
 
 // IsRetry reports whether err is a RetryError.

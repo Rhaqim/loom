@@ -101,6 +101,8 @@ type Engine struct {
 	flows           *flowService
 	poller          *asyncPollerService
 
+	onTaskResolved func(context.Context, TaskResolution)
+
 	mu sync.RWMutex
 }
 
@@ -176,6 +178,42 @@ func (e *Engine) generator(slug string) (Generator, bool) {
 	defer e.mu.RUnlock()
 	g, ok := e.generators[slug]
 	return g, ok
+}
+
+// TaskResolution describes the terminal outcome of an async provider job,
+// delivered to the callback registered with OnTaskResolved.
+type TaskResolution struct {
+	TaskID    uuid.UUID
+	SessionID uuid.UUID
+	AgentID   uuid.UUID
+	Provider  string
+	Status    ResultStatus // ResultStatusReady or ResultStatusFailed
+	Result    Result       // the resolved asset on success; nil on failure
+	Err       string       // failure reason when Status is failed
+}
+
+// OnTaskResolved registers a callback fired when an async task resolves — ready
+// or terminally failed. It runs in the poller goroutine, so it must be fast and
+// non-blocking; offload real work. Only one callback is held; a later call
+// replaces it. Embedders use this to write a resolved asset into their own
+// tables without reaching into loom's internal task tables.
+func (e *Engine) OnTaskResolved(fn func(context.Context, TaskResolution)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.onTaskResolved = fn
+}
+
+func (e *Engine) taskResolvedHook() func(context.Context, TaskResolution) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.onTaskResolved
+}
+
+// TaskStatus reports a task's status ("pending", "ready", or "failed") and, when
+// ready, its resolved result. It lets an embedder check on an async job without
+// querying loom's internal tables. Returns ErrNotFound when no such task exists.
+func (e *Engine) TaskStatus(ctx context.Context, taskID uuid.UUID) (string, Result, error) {
+	return sqlTaskStatus(ctx, e.db, e.prefix, taskID)
 }
 
 // Agents returns the agent registry.
@@ -493,7 +531,23 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	// clean base each attempt rather than stacking across attempts.
 	baseSystemPrompt := genReq.SystemPrompt
 
-	for attempt := 0; attempt <= s.maxRetries; attempt++ {
+	// A per-request cap overrides the engine default (0 = use the default).
+	maxRetries := s.maxRetries
+	if req.MaxRetries > 0 {
+		maxRetries = req.MaxRetries
+	}
+	// Under RetryKeepBest the engine scores every attempt and persists the
+	// lowest-scoring draft rather than failing on exhaustion; retries run
+	// silently (sync, no chunks) so only attempt 0 reaches the caller's OnChunk.
+	keepBest := req.RetryMode == RetryKeepBest
+	var best Result
+	var bestScore int
+	var haveBest bool
+	if keepBest {
+		diagnostics["retry_mode"] = "keep_best"
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			// Carry the accumulated retry hints on the request and fold them into
 			// the prompt itself, so any generator honors them — even ones that
@@ -502,10 +556,21 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 			genReq.SystemPrompt = withRetryDirective(baseSystemPrompt, req.annotations)
 		}
 
+		// Stream attempt 0; keep-best silences retries so a second draft never
+		// leaks to the caller's chunk sink.
+		onChunk := req.OnChunk
+		if keepBest && attempt > 0 {
+			onChunk = nil
+		}
+
 		// Streaming vs sync generation.
-		if sg, ok := gen.(StreamingGenerator); ok && req.OnChunk != nil {
+		if sg, ok := gen.(StreamingGenerator); ok && onChunk != nil {
 			chunks, resultCh, streamErr := sg.GenerateStream(ctx, genReq)
 			if streamErr != nil {
+				if keepBest && haveBest {
+					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = streamErr.Error()
+					break
+				}
 				return nil, fmt.Errorf("loom: generator stream: %w", streamErr)
 			}
 			// Forward chunks until the adapter closes the channel, honouring
@@ -517,7 +582,7 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 					if !more {
 						break drainChunks
 					}
-					req.OnChunk(c)
+					onChunk(c)
 				case <-ctx.Done():
 					return nil, fmt.Errorf("loom: generator stream: %w", ctx.Err())
 				}
@@ -531,35 +596,96 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 			// Mirror the sync error path: a closed channel (no result) or a failed
 			// result is a generator error, not a successful empty turn.
 			if !more || result == nil {
+				if keepBest && haveBest {
+					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = "no result"
+					break
+				}
 				return nil, fmt.Errorf("loom: generator stream: no result")
 			}
 			if result.Status() == ResultStatusFailed {
-				if msg, _ := result.Metadata()["error"].(string); msg != "" {
+				msg, _ := result.Metadata()["error"].(string)
+				if keepBest && haveBest {
+					if msg == "" {
+						msg = "failed"
+					}
+					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = msg
+					break
+				}
+				if msg != "" {
 					return nil, fmt.Errorf("loom: generator stream: %s", msg)
 				}
 				return nil, fmt.Errorf("loom: generator stream: failed")
 			}
+			// Signal that the streamed draft is complete, before post-hooks run,
+			// so the caller can close its chunk sink at this timing even if a
+			// silent keep-best retry follows.
+			if req.OnStreamEnd != nil {
+				req.OnStreamEnd(attempt)
+			}
 		} else {
 			result, err = gen.Generate(ctx, genReq)
 			if err != nil {
+				if keepBest && haveBest {
+					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = err.Error()
+					break
+				}
 				return nil, fmt.Errorf("loom: generator: %w", err)
 			}
 		}
 
-		// Run post-hooks.
-		result, err = s.e.hooks.RunPost(ctx, &req, result)
-		if err == nil {
+		// Run post-hooks. Expose the attempt index so a hook can self-cap retries.
+		req.attempt = attempt
+		var hookErr error
+		result, hookErr = s.e.hooks.RunPost(ctx, &req, result)
+		if hookErr == nil {
+			if keepBest {
+				best, bestScore, haveBest = result, 0, true
+			}
 			break // success
 		}
-		if !IsRetry(err) {
-			return nil, fmt.Errorf("loom: post-hook: %w", err)
+		if !IsRetry(hookErr) {
+			return nil, fmt.Errorf("loom: post-hook: %w", hookErr)
 		}
-		if attempt == s.maxRetries {
-			return nil, fmt.Errorf("loom: max retries (%d) exceeded: %w", s.maxRetries, err)
-		}
-		ann, _ := RetryAnnotationFrom(err)
-		req.annotations = append(req.annotations, ann)
+
+		var rerr *RetryError
+		errors.As(hookErr, &rerr)
+		ann := rerr.Annotation
 		diagnostics[fmt.Sprintf("retry_%d_reason", attempt+1)] = ann.Reason
+
+		if keepBest {
+			diagnostics[fmt.Sprintf("attempt_%d_score", attempt)] = rerr.Score
+			// A non-positive score with a keepable draft is an honor-system
+			// acceptance: keep it and stop.
+			if rerr.Score <= 0 && rerr.Draft != nil {
+				best, bestScore, haveBest = rerr.Draft, 0, true
+				break
+			}
+			// Track the lowest-scoring draft; strict < keeps the earlier on a tie.
+			if rerr.Draft != nil && (!haveBest || rerr.Score < bestScore) {
+				best, bestScore, haveBest = rerr.Draft, rerr.Score, true
+			}
+			if attempt == maxRetries {
+				break // exhaustion keeps the best draft rather than failing
+			}
+			req.annotations = append(req.annotations, ann)
+			continue
+		}
+
+		// RetryDiscard: exhausting the budget fails the step.
+		if attempt == maxRetries {
+			return nil, fmt.Errorf("loom: max retries (%d) exceeded: %w", maxRetries, hookErr)
+		}
+		req.annotations = append(req.annotations, ann)
+	}
+
+	// Resolve the kept draft for keep-best. A run where no attempt ever produced
+	// a keepable draft is the one keep-best failure mode.
+	if keepBest {
+		if !haveBest {
+			return nil, fmt.Errorf("loom: keep-best produced no usable result after %d attempts", maxRetries+1)
+		}
+		result = best
+		diagnostics["kept_score"] = bestScore
 	}
 
 	// Build and persist step.
@@ -609,6 +735,9 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		// permanently frozen; the contended state resolves last-writer-wins.
 		// Full reconciliation is deferred with the multi-instance work.
 		if errors.Is(err, ErrSessionConflict) {
+			// Flag the losing step so callers (and metrics) can observe the
+			// cross-instance contention rather than only seeing a log line.
+			step.Diagnostics["session_conflict"] = true
 			if fresh, gerr := querySession(ctx, s.e.db, s.e.prefix, session.ID); gerr == nil {
 				session.Version = fresh.Version
 			}
@@ -625,6 +754,9 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 // resolveSystemPrompt loads a system-prompt override from the registry
 // (Slug+Version) or a file (File). An empty ref yields "".
 func (s *stepService) resolveSystemPrompt(ctx context.Context, ref PromptRef) (string, error) {
+	if ref.Literal != "" {
+		return ref.Literal, nil
+	}
 	if ref.File != "" {
 		b, err := os.ReadFile(ref.File)
 		if err != nil {
@@ -1100,9 +1232,13 @@ func (p *asyncPollerService) pollPending(ctx context.Context) {
 		case result.Status() == ResultStatusReady:
 			if err := sqlMarkTaskReady(ctx, p.e.db, p.e.prefix, t.ID, result); err != nil {
 				p.e.log.Error("mark task ready", "task_id", t.ID, "err", err)
+			} else {
+				p.notify(ctx, t, ResultStatusReady, result, "")
 			}
 		case result.Status() == ResultStatusFailed:
-			_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, resultErrorMessage(result))
+			msg := resultErrorMessage(result)
+			_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, msg)
+			p.notify(ctx, t, ResultStatusFailed, nil, msg)
 		default:
 			// Still pending at the provider: count the poll so a job that never
 			// resolves is eventually capped rather than polled forever.
@@ -1128,9 +1264,29 @@ func (p *asyncPollerService) maxAttempts() int {
 func (p *asyncPollerService) retryOrFail(ctx context.Context, t pendingTask, reason string) {
 	if t.Attempts+1 >= p.maxAttempts() {
 		_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, reason)
+		p.notify(ctx, t, ResultStatusFailed, nil, reason)
 	} else {
 		_ = sqlIncrementTaskAttempts(ctx, p.e.db, p.e.prefix, t.ID, reason)
 	}
+}
+
+// notify delivers a task's terminal resolution to the registered callback, if
+// any. It runs inline in the poller goroutine; the callback is documented as
+// fast and non-blocking.
+func (p *asyncPollerService) notify(ctx context.Context, t pendingTask, status ResultStatus, result Result, errMsg string) {
+	fn := p.e.taskResolvedHook()
+	if fn == nil {
+		return
+	}
+	fn(ctx, TaskResolution{
+		TaskID:    t.ID,
+		SessionID: t.SessionID,
+		AgentID:   t.AgentID,
+		Provider:  t.Provider,
+		Status:    status,
+		Result:    result,
+		Err:       errMsg,
+	})
 }
 
 // resultErrorMessage extracts a failed result's error string, falling back to a
@@ -1150,10 +1306,12 @@ func resultErrorMessage(r Result) string {
 // -----------------------------------------------------------------------
 
 type pendingTask struct {
-	ID       uuid.UUID
-	Provider string
-	Handle   string
-	Attempts int
+	ID        uuid.UUID
+	Provider  string
+	Handle    string
+	Attempts  int
+	SessionID uuid.UUID
+	AgentID   uuid.UUID
 }
 
 // UsageSummary aggregates cost metrics.

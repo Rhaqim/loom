@@ -65,6 +65,10 @@ type PromptRef struct {
 	Slug    string
 	Version int    // 0 = LATEST
 	File    string // non-empty → load from file instead of DB
+	// Literal, when non-empty, is used verbatim and takes precedence over Slug
+	// and File. It is the seam for embedders that assemble a system prompt per
+	// turn (from world state, memory, etc.) rather than storing it in the DB.
+	Literal string
 }
 
 // PromptByName constructs a PromptRef for a specific slug+version.
