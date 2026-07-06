@@ -62,7 +62,7 @@ type Gesture struct {
 type ActionTemplate struct {
 	ID          uuid.UUID
 	Kind        ActionKind
-	Label       string // player-facing wording
+	Label       string // user-facing wording
 	Detail      string // longer description
 	Payload     any    // pre-filled fields
 	Constraints any    // e.g. "must be a direction in {N, E, S, W}"

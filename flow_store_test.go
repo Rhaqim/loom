@@ -84,7 +84,7 @@ func flowRoundTrip(t *testing.T, e *loom.Engine) {
 
 	flowSlug := "flow-" + uniq
 	if err := e.Flows().Create(ctx, &loom.FlowRecord{
-		Owner: "", Slug: flowSlug, Version: 1, Category: "story", IsActive: true,
+		Owner: "", Slug: flowSlug, Version: 1, Category: "demo", IsActive: true,
 		Agents: []loom.FlowAgentEntry{
 			{AgentSlug: lead, AgentVersion: 1},
 			{AgentSlug: follower, AgentVersion: 1, OutputKey: "Critic", Params: map[string]any{"temperature": 0.5}},
@@ -97,7 +97,7 @@ func flowRoundTrip(t *testing.T, e *loom.Engine) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Slug != flowSlug || got.Version != 1 || got.Owner != "" || got.Category != "story" || !got.IsActive {
+	if got.Slug != flowSlug || got.Version != 1 || got.Owner != "" || got.Category != "demo" || !got.IsActive {
 		t.Fatalf("flow header mismatch: %+v", got)
 	}
 	if len(got.Agents) != 2 {
@@ -124,7 +124,7 @@ func flowRoundTrip(t *testing.T, e *loom.Engine) {
 		t.Fatalf("latest: %v", err)
 	}
 	// List returns the flow header (without agents).
-	list, err := e.Flows().List(ctx, "", "story")
+	list, err := e.Flows().List(ctx, "", "demo")
 	if err != nil {
 		t.Fatal(err)
 	}

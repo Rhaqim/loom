@@ -8,11 +8,11 @@
 // Example:
 //
 //	plan := &harness.TestPlan{
-//	    Name: "story-generation-v1",
+//	    Name: "chat-v1",
 //	    Session: harness.SessionScript{
 //	        PlatformID: "test-user",
 //	        Steps: []harness.ScriptedStep{
-//	            {AgentSlug: "narrator", ActionPayload: "Begin the story"},
+//	            {AgentSlug: "assistant", ActionPayload: "Begin"},
 //	        },
 //	    },
 //	    Variants: harness.VariantMatrix{

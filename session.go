@@ -8,11 +8,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// Session is a running playthrough. It holds state, action log, result history,
+// Session is a running conversation. It holds state, action log, result history,
 // and any custom data the platform attaches.
 type Session struct {
 	ID              uuid.UUID
-	PlatformID      string     // opaque — set by the platform (user ID, story ID, etc.)
+	PlatformID      string     // opaque — set by the platform (user ID, tenant ID, etc.)
 	ParentSessionID *uuid.UUID // non-nil for branch sessions
 	BranchPoint     *int       // step index the branch forks from
 	// Version is the optimistic-concurrency revision. Update writes are guarded

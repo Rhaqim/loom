@@ -22,7 +22,7 @@ func buildHarnessPlan(agentSlug string) *harness.TestPlan {
 			PlatformID: "harness-test-user",
 			Tags:       []string{"test:true"},
 			Steps: []harness.ScriptedStep{
-				{AgentSlug: agentSlug, ActionPayload: "Open the dungeon door"},
+				{AgentSlug: agentSlug, ActionPayload: "Open the door"},
 				{AgentSlug: agentSlug, ActionPayload: "Enter the first chamber"},
 			},
 		},
