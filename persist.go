@@ -310,10 +310,10 @@ func sqlInsertSession(ctx context.Context, db *sql.DB, prefix string, s *Session
 	tagsJSON, _ := json.Marshal(s.Tags)
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %ssessions
-			(id, platform_id, parent_session_id, branch_point,
+			(id, platform_id, parent_session_id, branch_point, version,
 			 state, metadata, tags, pinned, deleted_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, prefix),
-		s.ID, s.PlatformID, nullableUUID(s.ParentSessionID), s.BranchPoint,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, prefix),
+		s.ID, s.PlatformID, nullableUUID(s.ParentSessionID), s.BranchPoint, s.Version,
 		stateJSON, metaJSON, tagsJSON, s.Pinned, s.DeletedAt,
 		s.CreatedAt, s.UpdatedAt,
 	)
@@ -322,7 +322,7 @@ func sqlInsertSession(ctx context.Context, db *sql.DB, prefix string, s *Session
 
 func sqlQuerySession(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Session, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT id, platform_id, parent_session_id, branch_point,
+		SELECT id, platform_id, parent_session_id, branch_point, version,
 		       state, metadata, tags, pinned, deleted_at, created_at, updated_at
 		FROM %ssessions WHERE id=$1`, prefix), id)
 	return scanSession(row)
@@ -332,18 +332,44 @@ func sqlUpdateSession(ctx context.Context, db *sql.DB, prefix string, s *Session
 	stateJSON, _ := json.Marshal(s.State)
 	metaJSON, _ := json.Marshal(s.Metadata)
 	tagsJSON, _ := json.Marshal(s.Tags)
-	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+	// Compare-and-set on version so a stale writer cannot silently overwrite a
+	// newer state. On success the row's version is bumped and mirrored in memory.
+	// pinned is owned exclusively by Pin/Unpin and deliberately not written here,
+	// so a state Update from a stale copy cannot clobber the pin flag. Soft-deleted
+	// rows are excluded so Updates do not keep mutating a discarded session.
+	res, err := db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %ssessions
-		SET state=$2, metadata=$3, tags=$4, pinned=$5, updated_at=$6
-		WHERE id=$1`, prefix),
-		s.ID, stateJSON, metaJSON, tagsJSON, s.Pinned, s.UpdatedAt,
+		SET state=$2, metadata=$3, tags=$4, updated_at=$5, version=version+1
+		WHERE id=$1 AND version=$6 AND deleted_at IS NULL`, prefix),
+		s.ID, stateJSON, metaJSON, tagsJSON, s.UpdatedAt, s.Version,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// Distinguish a version conflict from an absent or soft-deleted row.
+		var cnt int
+		if qerr := db.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT COUNT(*) FROM %ssessions WHERE id=$1 AND deleted_at IS NULL`, prefix),
+			s.ID).Scan(&cnt); qerr != nil {
+			return qerr
+		}
+		if cnt == 0 {
+			return ErrNotFound
+		}
+		return ErrSessionConflict
+	}
+	s.Version++
+	return nil
 }
 
 func sqlListSessions(ctx context.Context, db *sql.DB, prefix, platformID string, limit, offset int) ([]*Session, error) {
 	q := fmt.Sprintf(`
-		SELECT id, platform_id, parent_session_id, branch_point,
+		SELECT id, platform_id, parent_session_id, branch_point, version,
 		       state, metadata, tags, pinned, deleted_at, created_at, updated_at
 		FROM %ssessions WHERE platform_id=$1 AND deleted_at IS NULL
 		ORDER BY created_at DESC LIMIT $2 OFFSET $3`, prefix)
@@ -377,7 +403,7 @@ func sqlBuildBranchTree(ctx context.Context, db *sql.DB, prefix string, rootID u
 
 func buildChildren(ctx context.Context, db *sql.DB, prefix string, node *BranchNode) error {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT id, platform_id, parent_session_id, branch_point,
+		SELECT id, platform_id, parent_session_id, branch_point, version,
 		       state, metadata, tags, pinned, deleted_at, created_at, updated_at
 		FROM %ssessions WHERE parent_session_id=$1 AND deleted_at IS NULL
 		ORDER BY created_at`, prefix), node.Session.ID)
@@ -433,7 +459,7 @@ func scanSession(row sessionRow) (*Session, error) {
 		deletedAt                     sql.NullTime
 	)
 	err := row.Scan(
-		&s.ID, &s.PlatformID, &parentSessionID, &branchPoint,
+		&s.ID, &s.PlatformID, &parentSessionID, &branchPoint, &s.Version,
 		&stateJSON, &metaJSON, &tagsJSON, &s.Pinned, &deletedAt,
 		&s.CreatedAt, &s.UpdatedAt,
 	)
@@ -470,13 +496,58 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step) error {
+// sqlInsertSnapshot records a per-step state checkpoint so a later Fork can
+// reconstruct full session state as of a given step instead of inheriting the
+// parent's latest. The whole State (modality, opaque snapshot, vars, available
+// actions) is serialized into the snapshot column; the vars column is also
+// populated for external introspection.
+func sqlInsertSnapshot(ctx context.Context, db execer, prefix string, id, sessionID uuid.UUID, stepIndex int, state State, createdAt time.Time) error {
+	stateJSON, _ := json.Marshal(state)
+	varsJSON, _ := json.Marshal(state.Vars)
+	if len(varsJSON) == 0 || string(varsJSON) == "null" {
+		varsJSON = []byte("{}")
+	}
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO %sstate_snapshots (id, session_id, step_index, snapshot, vars, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6)`, prefix),
+		id, sessionID, stepIndex, stateJSON, varsJSON, createdAt)
+	return err
+}
+
+// sqlQuerySnapshotAt returns the full checkpointed State at or before stepIndex
+// for a session. found is false when no checkpoint exists that early.
+func sqlQuerySnapshotAt(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID, stepIndex int) (state State, found bool, err error) {
+	var stateJSON []byte
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT snapshot FROM %sstate_snapshots
+		WHERE session_id = $1 AND step_index <= $2
+		ORDER BY step_index DESC, created_at DESC
+		LIMIT 1`, prefix), sessionID, stepIndex)
+	switch scanErr := row.Scan(&stateJSON); scanErr {
+	case nil:
+	case sql.ErrNoRows:
+		return State{}, false, nil
+	default:
+		return State{}, false, scanErr
+	}
+	if len(stateJSON) > 0 {
+		_ = json.Unmarshal(stateJSON, &state)
+	}
+	return state, true, nil
+}
+
+// sqlInsertStep persists the step (with its result and action) and, when
+// checkpoint is non-nil, the post-step state snapshot — all in one transaction
+// so a step never commits without its checkpoint (which would let a later Fork
+// silently rewind to the wrong state).
+func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, checkpoint *State) error {
 	reqJSON, _ := json.Marshal(step.Request)
 	diagJSON, _ := json.Marshal(step.Diagnostics)
 	annJSON, _ := json.Marshal(step.Annotations)
 
-	// All three writes (action, result, step) commit atomically so a failure on
-	// the final steps INSERT cannot orphan the result/action rows.
+	// All writes (action, result, step, snapshot) commit atomically so a failure
+	// on a later INSERT cannot orphan earlier rows or split a step from its
+	// checkpoint.
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -512,6 +583,11 @@ func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step) e
 		actionID, annJSON, diagJSON, step.DurationMs, step.CreatedAt,
 	); err != nil {
 		return err
+	}
+	if checkpoint != nil {
+		if err := sqlInsertSnapshot(ctx, tx, prefix, uuid.New(), step.SessionID, step.Index, *checkpoint, step.CreatedAt); err != nil {
+			return fmt.Errorf("persist snapshot: %w", err)
+		}
 	}
 	return tx.Commit()
 }
