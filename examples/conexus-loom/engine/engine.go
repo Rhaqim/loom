@@ -34,6 +34,10 @@ type Config struct {
 	// violation). Leave false for the offline stub, whose reduced output does not
 	// satisfy the full v2 schemas; enable for real providers.
 	ValidateSchemas bool
+	// QualityEngine registers the pre-process quality post-hooks (Slop Bans and
+	// the Staleness Detector) on the Author. Leave false for the offline stub
+	// (its fixed prose would trip the bans); enable for real providers.
+	QualityEngine bool
 }
 
 // Conexus is the application engine.
@@ -42,8 +46,10 @@ type Conexus struct {
 	flow loom.Flow
 }
 
-// New constructs the engine and registers the playthrough hooks (memory recall
-// pre-hook + Logician QA post-hook) on the loom engine.
+// New constructs the engine and registers the playthrough hooks on the loom
+// engine: the memory-recall pre-hook and Logician QA post-hook always, plus the
+// schema-validation and quality-engine (slop bans + staleness) post-hooks when
+// the corresponding Config flags are set.
 func New(cfg Config) *Conexus {
 	if cfg.StoryVersion == 0 {
 		cfg.StoryVersion = narrative.LatestVersion(cfg.Versions, narrative.AgentAuthor)
@@ -56,6 +62,12 @@ func New(cfg Config) *Conexus {
 		cfg.Loom.Hooks().RegisterPost("schema-validate", loom.SchemaValidationPostHook())
 	}
 	cfg.Loom.Hooks().RegisterPost("logician-qa", narrative.QAHook())
+	if cfg.QualityEngine {
+		// Author-side quality gates: reject cliché prose and scenes that repeat
+		// the previous turn, asking loom to retry with guidance.
+		cfg.Loom.Hooks().RegisterPost("slop-bans", narrative.SlopBanHook())
+		cfg.Loom.Hooks().RegisterPost("staleness", narrative.StalenessHook(0))
+	}
 	return c
 }
 
@@ -112,6 +124,7 @@ func (c *Conexus) StartStory(ctx context.Context, blockText, accountID string) (
 // TurnResult is the app-facing outcome of one turn.
 type TurnResult struct {
 	TurnID    string
+	Title     string
 	Prose     string
 	Options   []domain.Option
 	Sensory   *domain.SensoryOutput
@@ -208,6 +221,14 @@ func (c *Conexus) PlayTurn(ctx context.Context, storyID uuid.UUID, accountID, ac
 			res.Sensory = &so
 		}
 	}
+	// Parse the Title follower; fall back to the Logician's emitted title when
+	// the dedicated agent produced nothing.
+	if ts := turn.Followers[narrative.AgentTitle]; ts != nil {
+		res.Title = narrative.ParseTitle(loom.ResultText(ts.Result))
+	}
+	if res.Title == "" {
+		res.Title = strings.TrimSpace(logic.Title)
+	}
 
 	// Per-turn spend, summed synchronously from this turn's steps (lead +
 	// followers, including QA retries' final results).
@@ -231,12 +252,8 @@ func (c *Conexus) PlayTurn(ctx context.Context, storyID uuid.UUID, accountID, ac
 		_ = c.cfg.Memory.Store(ctx, storyID, f)
 	}
 
-	// Enqueue async media from the sensory direction.
-	if res.Sensory != nil && res.Sensory.ImagePrompt != "" {
-		_ = c.cfg.Media.Enqueue(ctx, ports.MediaTask{
-			StoryID: storyID, TurnID: turn.ID.String(), Kind: ports.MediaImage, Prompt: res.Sensory.ImagePrompt,
-		})
-	}
+	// Enqueue async media for every channel the sensory director produced.
+	c.enqueueMedia(ctx, storyID, turn.ID.String(), res.Prose, res.Sensory)
 
 	// Save updated state.
 	sess.State.Vars["play"] = toMap(play)
@@ -249,6 +266,61 @@ func (c *Conexus) PlayTurn(ctx context.Context, storyID uuid.UUID, accountID, ac
 	res.Status = play.Status
 	res.Step = play.Step
 	return res, nil
+}
+
+// enqueueMedia fans the sensory direction out to the media queue, one task per
+// channel the turn produced. The provider behind the queue consumes Prompt (the
+// primary text) plus the channel-specific Params; an empty channel is skipped.
+func (c *Conexus) enqueueMedia(ctx context.Context, storyID uuid.UUID, turnID, prose string, s *domain.SensoryOutput) {
+	if s == nil {
+		return
+	}
+	enq := func(kind ports.MediaKind, prompt string, params map[string]any) {
+		_ = c.cfg.Media.Enqueue(ctx, ports.MediaTask{
+			StoryID: storyID, TurnID: turnID, Kind: kind, Prompt: prompt, Params: params,
+		})
+	}
+	if s.Image.Prompt != "" {
+		enq(ports.MediaImage, s.Image.Prompt, map[string]any{
+			"style_lock":         s.Image.StyleLock,
+			"negative_prompt":    s.Image.NegativePrompt,
+			"characters_visible": s.Image.CharactersVisible,
+		})
+	}
+	if s.Music.Mood != "" {
+		enq(ports.MediaMusic, s.Music.Mood, map[string]any{
+			"mood": s.Music.Mood, "intensity": s.Music.Intensity, "transition": s.Music.Transition,
+		})
+	}
+	if s.SFX.Cue != "" {
+		enq(ports.MediaSFX, s.SFX.Cue, map[string]any{
+			"trigger_phrase": s.SFX.TriggerPhrase, "trigger_word_index": s.SFX.TriggerWordIndex, "gain": s.SFX.Gain,
+		})
+	}
+	// Voice narrates the turn's prose with the director's emotion/speed.
+	if prose != "" {
+		enq(ports.MediaVoice, prose, map[string]any{
+			"emotion": s.Voice.Emotion, "speed_modifier": s.Voice.SpeedModifier,
+			"intensity": s.Voice.Intensity, "emphasis_words": s.Voice.EmphasisWords,
+		})
+	}
+	if s.Ambient.Atmosphere != "" || s.Ambient.Cinematography != "" || s.Ambient.OneShot != "" || s.Ambient.ColorTint != "" {
+		prompt := firstNonEmpty(s.Ambient.Atmosphere, s.Ambient.Cinematography, s.Ambient.OneShot, s.Ambient.ColorTint)
+		enq(ports.MediaAmbient, prompt, map[string]any{
+			"atmosphere": s.Ambient.Atmosphere, "cinematography": s.Ambient.Cinematography,
+			"one_shot": s.Ambient.OneShot, "intensity": s.Ambient.Intensity, "color_tint": s.Ambient.ColorTint,
+		})
+	}
+}
+
+// firstNonEmpty returns the first non-empty string, or "".
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // Fork branches the story at the current head for an alternate timeline.

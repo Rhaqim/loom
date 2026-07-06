@@ -23,6 +23,7 @@ const (
 	AgentAuthor   = "author"
 	AgentLogician = "logician"
 	AgentSensory  = "sensory"
+	AgentTitle    = "title"
 	AgentMigrate  = "migrate"
 )
 

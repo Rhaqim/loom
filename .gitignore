@@ -11,6 +11,19 @@ bin/
 *.out
 /vendor/
 
+# Compiled example binaries (go build in-place names them after the dir)
+/examples/quickstart/quickstart
+/examples/story/story
+/examples/dnd/dnd
+/examples/storyapi/storyapi
+/examples/conexus-loom/conexus-loom
+
+# Local scratch / planning docs, not part of the library
+/LOOM_*.md
+
+# Stray local copy of the loom-ui playground (it lives in its own repo)
+/examples/loom-ui/
+
 # Environment / secrets
 .env
 .env.*

@@ -35,17 +35,25 @@ type MemoryVault interface {
 type MediaKind string
 
 const (
-	MediaImage MediaKind = "image"
-	MediaTTS   MediaKind = "tts"
-	MediaVideo MediaKind = "video"
+	MediaImage   MediaKind = "image"
+	MediaMusic   MediaKind = "music"
+	MediaSFX     MediaKind = "sfx"
+	MediaVoice   MediaKind = "voice"
+	MediaAmbient MediaKind = "ambient"
+	MediaVideo   MediaKind = "video"
+	MediaTTS     MediaKind = "tts" // legacy alias for voice
 )
 
-// MediaTask is one queued async media job.
+// MediaTask is one queued async media job. Prompt is the primary text (image
+// prompt, sfx cue, or the prose to voice); Params carries the channel-specific
+// direction (mood, emotion, intensity, transition, …) for the provider behind
+// the queue to consume.
 type MediaTask struct {
 	StoryID uuid.UUID
 	TurnID  string
 	Kind    MediaKind
 	Prompt  string
+	Params  map[string]any
 }
 
 // MultimediaQueue is the async media seam (monorepo: app/conexus/multimedia).

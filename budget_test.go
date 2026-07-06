@@ -76,6 +76,16 @@ func TestBudget_DowngradeToFallback(t *testing.T) {
 	}
 }
 
+func TestBudget_DowngradeWithoutFallbackBlocks(t *testing.T) {
+	// Downgrade is configured but the over-budget agent has no fallback: it must
+	// block (money safety), not silently proceed on the main agent.
+	step, mainID, _, err := runWithBudget(t, BudgetDowngrade, 5.0, false)
+	var be *BudgetExceededError
+	if !errors.As(err, &be) {
+		t.Fatalf("downgrade with no fallback agent must block, got step=%v err=%v (mainID=%s)", step, err, mainID)
+	}
+}
+
 func TestBudget_NotifyStillRunsOnMainAgent(t *testing.T) {
 	step, mainID, _, err := runWithBudget(t, BudgetNotify, 5.0, false)
 	if err != nil {

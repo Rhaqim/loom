@@ -81,14 +81,14 @@ func seedTestAgent(t *testing.T, e *loom.Engine, slug string) string {
 		Version:  1,
 		Kind:     loom.PromptKindSystem,
 		Category: "test",
-		Body:     "You are a test narrator.",
+		Body:     "You are a test assistant.",
 	}
 	userTmpl := &loom.Prompt{
 		Slug:     slug + "-user",
 		Version:  1,
 		Kind:     loom.PromptKindUserTemplate,
 		Category: "test",
-		Body:     "Player says: {{.Action.Payload.text}}",
+		Body:     "User says: {{.Action.Payload.text}}",
 	}
 
 	// Ignore duplicate-slug errors — test may re-run.

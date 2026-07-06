@@ -1,0 +1,4 @@
+THE SCENE
+{{.Inputs.Prose}}
+
+Give the chapter title.

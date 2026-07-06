@@ -543,7 +543,6 @@ func sqlQuerySnapshotAt(ctx context.Context, db *sql.DB, prefix string, sessionI
 func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, checkpoint *State) error {
 	reqJSON, _ := json.Marshal(step.Request)
 	diagJSON, _ := json.Marshal(step.Diagnostics)
-	annJSON, _ := json.Marshal(step.Annotations)
 
 	// All writes (action, result, step, snapshot) commit atomically so a failure
 	// on a later INSERT cannot orphan earlier rows or split a step from its
@@ -576,11 +575,11 @@ func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, c
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %ssteps
 			(id, session_id, step_index, agent_id, request, result_id,
-			 action_id, annotations, diagnostics, duration_ms, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, prefix),
+			 action_id, diagnostics, duration_ms, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, prefix),
 		step.ID, step.SessionID, step.Index, step.AgentID,
 		reqJSON, step.Result.ResultID(),
-		actionID, annJSON, diagJSON, step.DurationMs, step.CreatedAt,
+		actionID, diagJSON, step.DurationMs, step.CreatedAt,
 	); err != nil {
 		return err
 	}
@@ -675,8 +674,15 @@ func sqlInsertTask(ctx context.Context, db execer, prefix string, th *TaskHandle
 }
 
 func sqlListPendingTasks(ctx context.Context, db *sql.DB, prefix string) ([]pendingTask, error) {
+	// Join through the linked result to the step so each pending task carries the
+	// session and agent it belongs to. Every task is written in the same
+	// transaction as its result and step, so the inner join never drops one.
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT id, provider, handle, attempts FROM %stasks WHERE status='pending'`, prefix))
+		SELECT t.id, t.provider, t.handle, t.attempts, s.session_id, s.agent_id
+		FROM %stasks t
+		JOIN %sresults r ON r.task_id = t.id
+		JOIN %ssteps s ON s.result_id = r.id
+		WHERE t.status='pending'`, prefix, prefix, prefix))
 	if err != nil {
 		return nil, err
 	}
@@ -684,12 +690,36 @@ func sqlListPendingTasks(ctx context.Context, db *sql.DB, prefix string) ([]pend
 	var tasks []pendingTask
 	for rows.Next() {
 		var t pendingTask
-		if err := rows.Scan(&t.ID, &t.Provider, &t.Handle, &t.Attempts); err != nil {
+		if err := rows.Scan(&t.ID, &t.Provider, &t.Handle, &t.Attempts, &t.SessionID, &t.AgentID); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
 	}
 	return tasks, rows.Err()
+}
+
+// sqlTaskStatus returns a task's status and, when ready, its resolved result.
+func sqlTaskStatus(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (string, Result, error) {
+	var (
+		status, modal, rStatus string
+		payload                []byte
+	)
+	err := db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT t.status, r.modality, r.status, r.payload
+		FROM %stasks t
+		JOIN %sresults r ON r.task_id = t.id
+		WHERE t.id=$1`, prefix, prefix), id).Scan(&status, &modal, &rStatus, &payload)
+	if err == sql.ErrNoRows {
+		return "", nil, ErrNotFound
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	var result Result
+	if status == "ready" {
+		result = unmarshalResult(Modality(modal), ResultStatus(rStatus), payload)
+	}
+	return status, result, nil
 }
 
 func sqlIncrementTaskAttempts(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID, lastErr string) error {
