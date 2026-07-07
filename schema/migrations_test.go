@@ -247,6 +247,52 @@ func TestAdoptSessionVersionSQLite(t *testing.T) {
 	}
 }
 
+// TestAdoptAgentResponseFormatSQLite reproduces the reported failure: an agents
+// table created before the reusable-response-format feature lacks
+// response_format_id, so inserts naming that column fail. Migration v4 must
+// backfill it (and the response_format column) and ensure the referenced table
+// exists.
+func TestAdoptAgentResponseFormatSQLite(t *testing.T) {
+	ctx := context.Background()
+	db := openMemSQLite(t)
+
+	// Pre-feature agents table: no response_format_id / response_format.
+	if _, err := db.ExecContext(ctx, `CREATE TABLE loom_agents (
+		id                TEXT PRIMARY KEY,
+		slug              TEXT NOT NULL,
+		owner             TEXT NOT NULL DEFAULT '',
+		version           INTEGER NOT NULL,
+		category          TEXT NOT NULL DEFAULT '',
+		modality          TEXT NOT NULL,
+		generator_slug    TEXT NOT NULL,
+		system_prompt_id  TEXT,
+		user_template_id  TEXT,
+		params            TEXT NOT NULL DEFAULT '{}',
+		fallback_agent_id TEXT,
+		created_at        DATETIME NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if hasColumn(t, db, DialectSQLite, "loom_agents", "response_format_id") {
+		t.Fatal("precondition: loom_agents should not have response_format_id yet")
+	}
+
+	if err := NewLoader(DialectSQLite).Apply(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	for _, col := range []string{"response_format_id", "response_format"} {
+		if !hasColumn(t, db, DialectSQLite, "loom_agents", col) {
+			t.Fatalf("migration v4 did not backfill loom_agents.%s", col)
+		}
+	}
+	// An insert naming response_format_id (the operation that was failing) works.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO loom_agents (id, slug, version, modality, generator_slug, response_format_id, created_at)
+		 VALUES ($1,'dm',1,'text','g',NULL,CURRENT_TIMESTAMP)`, uuid.NewString()); err != nil {
+		t.Fatalf("insert with response_format_id failed after backfill: %v", err)
+	}
+}
+
 // TestApplyPostgres runs the runner against Postgres when LOOM_DSN is set,
 // covering the information_schema column-introspection path.
 func TestApplyPostgres(t *testing.T) {
