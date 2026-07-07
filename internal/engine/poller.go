@@ -70,7 +70,9 @@ func (p *asyncPollerService) pollPending(ctx context.Context) {
 			}
 		case result.Status() == ResultStatusFailed:
 			msg := resultErrorMessage(result)
-			_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, msg)
+			if err := sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, msg); err != nil {
+				p.e.log.Error("mark task failed", "task_id", t.ID, "err", err)
+			}
 			p.notify(ctx, t, ResultStatusFailed, nil, msg)
 		default:
 			// Still pending at the provider: count the poll so a job that never
@@ -96,10 +98,14 @@ func (p *asyncPollerService) maxAttempts() int {
 // polled forever.
 func (p *asyncPollerService) retryOrFail(ctx context.Context, t pendingTask, reason string) {
 	if t.Attempts+1 >= p.maxAttempts() {
-		_ = sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, reason)
+		if err := sqlMarkTaskFailed(ctx, p.e.db, p.e.prefix, t.ID, reason); err != nil {
+			p.e.log.Error("mark task failed", "task_id", t.ID, "err", err)
+		}
 		p.notify(ctx, t, ResultStatusFailed, nil, reason)
 	} else {
-		_ = sqlIncrementTaskAttempts(ctx, p.e.db, p.e.prefix, t.ID, reason)
+		if err := sqlIncrementTaskAttempts(ctx, p.e.db, p.e.prefix, t.ID, reason); err != nil {
+			p.e.log.Error("increment task attempts", "task_id", t.ID, "err", err)
+		}
 	}
 }
 

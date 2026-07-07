@@ -115,10 +115,10 @@ type Engine struct {
 // It does NOT run schema migrations — call NewSchemaLoader(dialect).Apply(ctx, db) first.
 func New(cfg Config) (*Engine, error) {
 	if cfg.DB == nil {
-		return nil, fmt.Errorf("loom: DB is required")
+		return nil, fmt.Errorf("%w: DB is required", ErrInvalidConfig)
 	}
 	if cfg.Dialect == "" {
-		return nil, fmt.Errorf("loom: Dialect is required")
+		return nil, fmt.Errorf("%w: Dialect is required", ErrInvalidConfig)
 	}
 	prefix := cfg.SchemaPrefix
 	if prefix == "" {

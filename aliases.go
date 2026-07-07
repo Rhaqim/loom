@@ -593,8 +593,16 @@ var RetryAnnotationFrom = engine.RetryAnnotationFrom
 // BudgetExceededError is returned when a step would exceed a configured budget.
 type BudgetExceededError = engine.BudgetExceededError
 
-// ErrNotFound is returned when a requested entity does not exist.
+// ErrNotFound is returned when a requested entity does not exist. Errors from
+// the registries (Agents/Prompts/Sessions/Budgets/ResponseFormats) unwrap to it,
+// so errors.Is(err, ErrNotFound) is the portable "does not exist" check; use
+// errors.As with *NotFoundError to learn which entity and key were missing.
 var ErrNotFound = engine.ErrNotFound
+
+// NotFoundError identifies which entity was missing and by what key. It unwraps
+// to ErrNotFound, so both errors.Is(err, ErrNotFound) and
+// errors.As(err, &loom.NotFoundError{}) work.
+type NotFoundError = engine.NotFoundError
 
 // ErrDuplicateSlug is returned when an agent or prompt slug+version already exists.
 var ErrDuplicateSlug = engine.ErrDuplicateSlug
@@ -603,3 +611,31 @@ var ErrDuplicateSlug = engine.ErrDuplicateSlug
 // longer matches the in-memory copy — another writer updated it first, so this
 // write would clobber theirs (optimistic-concurrency conflict).
 var ErrSessionConflict = engine.ErrSessionConflict
+
+// ErrInvalidConfig is returned by New when the Config is missing a required
+// field or is otherwise unusable. Wrapped errors carry the specific reason.
+var ErrInvalidConfig = engine.ErrInvalidConfig
+
+// ErrGeneratorNotRegistered is returned when a step references a generator slug
+// that was never registered with the engine. Wrapped errors name the slug.
+var ErrGeneratorNotRegistered = engine.ErrGeneratorNotRegistered
+
+// GenerationErrorKind classifies why a generator failed to produce a result, so
+// applications can react differently (e.g. retry transport failures but surface
+// provider rejections to the user).
+type GenerationErrorKind = engine.GenerationErrorKind
+
+// GenerationTransport is a network, stream, or context failure reaching or
+// reading from the provider. The underlying error is available via Unwrap.
+const GenerationTransport = engine.GenerationTransport
+
+// GenerationRejected means the provider ran but returned a failed result
+// (content policy, safety refusal, provider-side error).
+const GenerationRejected = engine.GenerationRejected
+
+// GenerationEmpty means the provider returned no usable result.
+const GenerationEmpty = engine.GenerationEmpty
+
+// GenerationError is returned when a generator fails to produce a usable result.
+// Inspect it with errors.As(err, &loom.GenerationError{}) and switch on Kind.
+type GenerationError = engine.GenerationError

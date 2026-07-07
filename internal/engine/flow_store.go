@@ -22,10 +22,10 @@ import (
 
 // FlowRecord is a persisted, versioned agent map.
 type FlowRecord struct {
-	ID      uuid.UUID
-	Owner   string // opaque app-owned scope; "" = global
-	Slug    string
-	Version int
+	ID        uuid.UUID
+	Owner     string // opaque app-owned scope; "" = global
+	Slug      string
+	Version   int
 	Category  string
 	IsActive  bool
 	Agents    []FlowAgentEntry // ordered; index 0 is the lead

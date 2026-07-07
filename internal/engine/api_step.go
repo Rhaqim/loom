@@ -33,7 +33,7 @@ type Step struct {
 	AgentID     uuid.UUID
 	Request     StoredRequest
 	Result      Result
-	Action      *Action // the discriminator's action that triggered this step (nil for step 0)
+	Action      *Action        // the discriminator's action that triggered this step (nil for step 0)
 	Diagnostics map[string]any // anything pre/post processors logged
 	DurationMs  int
 	CreatedAt   time.Time

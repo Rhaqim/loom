@@ -48,7 +48,7 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	}
 	gen, ok := s.e.generator(genSlug)
 	if !ok {
-		return nil, fmt.Errorf("loom: generator %q not registered", genSlug)
+		return nil, fmt.Errorf("generator %q: %w", genSlug, ErrGeneratorNotRegistered)
 	}
 
 	// Each step runs against a per-step copy of the session so concurrent
@@ -129,7 +129,7 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = streamErr.Error()
 					break
 				}
-				return nil, fmt.Errorf("loom: generator stream: %w", streamErr)
+				return nil, &GenerationError{Kind: GenerationTransport, Provider: genSlug, Err: streamErr}
 			}
 			// Forward chunks until the adapter closes the channel, honouring
 			// cancellation so a stuck stream cannot hang the step.
@@ -142,14 +142,14 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 					}
 					onChunk(c)
 				case <-ctx.Done():
-					return nil, fmt.Errorf("loom: generator stream: %w", ctx.Err())
+					return nil, &GenerationError{Kind: GenerationTransport, Provider: genSlug, Err: ctx.Err()}
 				}
 			}
 			var more bool
 			select {
 			case result, more = <-resultCh:
 			case <-ctx.Done():
-				return nil, fmt.Errorf("loom: generator stream: %w", ctx.Err())
+				return nil, &GenerationError{Kind: GenerationTransport, Provider: genSlug, Err: ctx.Err()}
 			}
 			// Mirror the sync error path: a closed channel (no result) or a failed
 			// result is a generator error, not a successful empty turn.
@@ -158,7 +158,7 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = "no result"
 					break
 				}
-				return nil, fmt.Errorf("loom: generator stream: no result")
+				return nil, &GenerationError{Kind: GenerationEmpty, Provider: genSlug, Message: "stream produced no result"}
 			}
 			if result.Status() == ResultStatusFailed {
 				msg, _ := result.Metadata()["error"].(string)
@@ -169,10 +169,7 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = msg
 					break
 				}
-				if msg != "" {
-					return nil, fmt.Errorf("loom: generator stream: %s", msg)
-				}
-				return nil, fmt.Errorf("loom: generator stream: failed")
+				return nil, &GenerationError{Kind: GenerationRejected, Provider: genSlug, Message: msg}
 			}
 			// Signal that the streamed draft is complete, before post-hooks run,
 			// so the caller can close its chunk sink at this timing even if a
@@ -187,7 +184,7 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = err.Error()
 					break
 				}
-				return nil, fmt.Errorf("loom: generator: %w", err)
+				return nil, &GenerationError{Kind: GenerationTransport, Provider: genSlug, Err: err}
 			}
 		}
 

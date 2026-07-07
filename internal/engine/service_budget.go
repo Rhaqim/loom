@@ -26,7 +26,8 @@ func (b *budgetService) Create(ctx context.Context, budget *Budget) error {
 }
 
 func (b *budgetService) Get(ctx context.Context, id uuid.UUID) (*Budget, error) {
-	return sqlQueryBudget(ctx, b.e.db, b.e.prefix, id)
+	bud, err := sqlQueryBudget(ctx, b.e.db, b.e.prefix, id)
+	return bud, wrapNotFound(err, "budget", id.String())
 }
 
 func (b *budgetService) List(ctx context.Context, targetKind, targetKey string) ([]*Budget, error) {

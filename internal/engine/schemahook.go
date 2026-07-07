@@ -38,7 +38,8 @@ func SchemaValidationPostHook() PostHook {
 		}
 		if errs := ValidateJSONSchema(req.ResponseFormat.Schema, val); len(errs) > 0 {
 			return nil, ErrRetryWith(RetryAnnotation{
-				Reason: "output failed schema validation: " + strings.Join(capStrings(errs, 6), "; "),
+				Reason:     "output failed schema validation: " + strings.Join(capStrings(errs, 6), "; "),
+				Violations: errs,
 			})
 		}
 		return res, nil

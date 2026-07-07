@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"github.com/google/uuid"
 )
@@ -16,10 +17,12 @@ import (
 // in persist.go so this file stays readable.
 
 func queryAgent(ctx context.Context, db *sql.DB, prefix, slug string, version int) (*Agent, error) {
-	return sqlQueryAgent(ctx, db, prefix, slug, version)
+	a, err := sqlQueryAgent(ctx, db, prefix, slug, version)
+	return a, wrapNotFound(err, "agent", fmt.Sprintf("%s@v%d", slug, version))
 }
 func queryAgentLatest(ctx context.Context, db *sql.DB, prefix, slug string) (*Agent, error) {
-	return sqlQueryAgentLatest(ctx, db, prefix, slug)
+	a, err := sqlQueryAgentLatest(ctx, db, prefix, slug)
+	return a, wrapNotFound(err, "agent", slug)
 }
 func insertAgent(ctx context.Context, db *sql.DB, prefix string, a *Agent) error {
 	return sqlInsertAgent(ctx, db, prefix, a)
@@ -29,13 +32,16 @@ func listAgents(ctx context.Context, db *sql.DB, prefix, category string) ([]*Ag
 }
 
 func queryPrompt(ctx context.Context, db *sql.DB, prefix, slug string, version int) (*Prompt, error) {
-	return sqlQueryPrompt(ctx, db, prefix, slug, version)
+	p, err := sqlQueryPrompt(ctx, db, prefix, slug, version)
+	return p, wrapNotFound(err, "prompt", fmt.Sprintf("%s@v%d", slug, version))
 }
 func queryPromptLatest(ctx context.Context, db *sql.DB, prefix, slug string) (*Prompt, error) {
-	return sqlQueryPromptLatest(ctx, db, prefix, slug)
+	p, err := sqlQueryPromptLatest(ctx, db, prefix, slug)
+	return p, wrapNotFound(err, "prompt", slug)
 }
 func queryPromptByID(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Prompt, error) {
-	return sqlQueryPromptByID(ctx, db, prefix, id)
+	p, err := sqlQueryPromptByID(ctx, db, prefix, id)
+	return p, wrapNotFound(err, "prompt", id.String())
 }
 func insertPrompt(ctx context.Context, db *sql.DB, prefix string, p *Prompt) error {
 	return sqlInsertPrompt(ctx, db, prefix, p)
@@ -45,7 +51,8 @@ func listPrompts(ctx context.Context, db *sql.DB, prefix string, kind PromptKind
 }
 
 func querySession(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Session, error) {
-	return sqlQuerySession(ctx, db, prefix, id)
+	s, err := sqlQuerySession(ctx, db, prefix, id)
+	return s, wrapNotFound(err, "session", id.String())
 }
 func insertSession(ctx context.Context, db *sql.DB, prefix string, s *Session) error {
 	return sqlInsertSession(ctx, db, prefix, s)

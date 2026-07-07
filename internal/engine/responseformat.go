@@ -74,14 +74,15 @@ func (s *responseFormatService) Get(ctx context.Context, slug string, version in
 	}
 	r, err := sqlQueryResponseFormat(ctx, s.e.db, s.e.prefix, slug, version)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotFound(err, "response_format", fmt.Sprintf("%s@v%d", slug, version))
 	}
 	cacheSet(ctx, s.e.cache, key, r)
 	return r, nil
 }
 
 func (s *responseFormatService) Latest(ctx context.Context, slug string) (*ResponseFormatRecord, error) {
-	return sqlQueryResponseFormatLatest(ctx, s.e.db, s.e.prefix, slug)
+	r, err := sqlQueryResponseFormatLatest(ctx, s.e.db, s.e.prefix, slug)
+	return r, wrapNotFound(err, "response_format", slug)
 }
 
 func (s *responseFormatService) GetByID(ctx context.Context, id uuid.UUID) (*ResponseFormatRecord, error) {
@@ -91,7 +92,7 @@ func (s *responseFormatService) GetByID(ctx context.Context, id uuid.UUID) (*Res
 	}
 	r, err := sqlQueryResponseFormatByID(ctx, s.e.db, s.e.prefix, id)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotFound(err, "response_format", id.String())
 	}
 	cacheSet(ctx, s.e.cache, key, r)
 	return r, nil
