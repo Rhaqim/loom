@@ -64,16 +64,27 @@ Status legend: ⬜ open · ✅ fixed · 🔷 won't-fix / accepted risk
 - ✅ **M3 — Hook-bus data race.** `hook.go` had no mutex; registering hooks while
   steps run races the slice. **Fix:** `sync.RWMutex` guarding register/run.
 
-- ⬜ **M4 — Harness unbounded fan-out.** `harness.Run` launches one goroutine per
-  expanded variant with no semaphore. **Fix:** bound concurrency, cap variants.
+- ✅ **M4 — Harness unbounded fan-out.** `harness.Run` launched one goroutine per
+  expanded variant with no semaphore. **Fix:** total variant cap (`maxVariants`,
+  rejected with an error), plus a concurrency semaphore (`TestPlan.MaxParallel`,
+  default 8).
 
-- ⬜ **M5 — Generator `http://` base_url + unbounded response reads.** (Partly
-  covered by H1's https enforcement.) Add `io.LimitReader` on response bodies.
+- ✅ **M5 — Unbounded generator response reads.** **Fix:** `io.LimitReader` on all
+  non-streaming response bodies (8 MiB) across openai/anthropic/replicate/runway,
+  and upstream error bodies truncated (4 KiB) before being echoed into errors.
+  (The `base_url` https question is subsumed by H1's allowlist.)
 
-- ⬜ **M6 — storyapi info leaks / session hygiene.** Raw `err.Error()` to clients;
-  user enumeration (register-409 + login timing); no token revocation/logout.
+- ✅ **M6 — storyapi info leaks / session hygiene.** **Fix:** generic client error
+  messages (token-validation, narrator, decode) with detail logged server-side;
+  login now runs a dummy bcrypt on the user-not-found path to close the timing
+  enumeration oracle. The register-409 signal is retained (UX) but is now
+  rate-limited by H5. Token revocation/logout remains open (see below).
 
-- ⬜ **M7 — DB creds in `--dsn` argv** (visible via `ps`). Prefer env / `--dsn-file`.
+- ✅ **M7 — DB creds in `--dsn` argv** (visible via `ps`). **Fix:** loom-cli adds
+  `--dsn-file` and resolves DSN as dsn-file → `LOOM_DSN` → `--dsn`, warning on the
+  flag path.
+
+- ⬜ **M6-residual — no token revocation/logout** (7-day stateless tokens).
 
 ## Low / hardening
 

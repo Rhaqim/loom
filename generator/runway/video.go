@@ -18,6 +18,23 @@ import (
 
 const defaultBaseURL = "https://api.dev.runwayml.com/v1"
 
+const (
+	// maxResponseBytes caps a response body so a malicious or misbehaving
+	// upstream cannot exhaust memory with a huge reply.
+	maxResponseBytes = 8 << 20 // 8 MiB
+	// maxErrorBodyBytes truncates an upstream error body before it is echoed
+	// into an error string (and thus logs).
+	maxErrorBodyBytes = 4 << 10 // 4 KiB
+)
+
+// truncErr caps an upstream body slice for safe inclusion in an error message.
+func truncErr(b []byte) []byte {
+	if len(b) > maxErrorBodyBytes {
+		return b[:maxErrorBodyBytes]
+	}
+	return b
+}
+
 // VideoGenerator implements loom.Generator for RunwayML Gen-3 video models.
 type VideoGenerator struct {
 	apiKey  string
@@ -125,9 +142,9 @@ func (g *VideoGenerator) getTask(ctx context.Context, id string) (*runwayTask, e
 		return nil, fmt.Errorf("runway: http: %w", err)
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("runway: http %d: %s", resp.StatusCode, b)
+		return nil, fmt.Errorf("runway: http %d: %s", resp.StatusCode, truncErr(b))
 	}
 	var task runwayTask
 	if err := json.Unmarshal(b, &task); err != nil {
@@ -150,9 +167,9 @@ func (g *VideoGenerator) post(ctx context.Context, path string, body []byte) ([]
 		return nil, fmt.Errorf("runway: http: %w", err)
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("runway: http %d: %s", resp.StatusCode, b)
+		return nil, fmt.Errorf("runway: http %d: %s", resp.StatusCode, truncErr(b))
 	}
 	return b, nil
 }

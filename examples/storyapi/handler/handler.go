@@ -47,7 +47,11 @@ func (h *Handler) protected(next http.HandlerFunc) http.HandlerFunc {
 		}
 		claims, err := auth.ValidateToken(h.secret, token)
 		if err != nil {
-			h.fail(w, http.StatusUnauthorized, err.Error())
+			// Return a single generic message: distinguishing "expired" from
+			// "bad signature" from "bad payload" tells an attacker exactly why a
+			// forged/edited token failed.
+			h.log.Info("token validation failed", "err", err)
+			h.fail(w, http.StatusUnauthorized, "invalid or expired token")
 			return
 		}
 		user, err := h.store.GetUserByID(r.Context(), claims.UserID)

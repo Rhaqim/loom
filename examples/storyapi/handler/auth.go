@@ -63,6 +63,9 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 	user, err := h.store.GetUserByUsername(r.Context(), body.Username)
 	if err != nil {
+		// Spend bcrypt-equivalent time even when the user does not exist, so
+		// response latency cannot be used to enumerate valid usernames.
+		auth.DummyCompare(body.Password)
 		h.fail(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}

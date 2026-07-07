@@ -18,6 +18,13 @@ import (
 const (
 	defaultBaseURL   = "https://api.anthropic.com/v1"
 	anthropicVersion = "2023-06-01"
+	// maxResponseBytes caps a full (non-streaming) response body so a malicious
+	// or misbehaving upstream cannot exhaust memory with a huge reply. The
+	// streaming path is bounded separately by the scanner's per-line limit.
+	maxResponseBytes = 8 << 20 // 8 MiB
+	// maxErrorBodyBytes truncates an upstream error body before it is echoed
+	// into an error string (and thus logs).
+	maxErrorBodyBytes = 4 << 10 // 4 KiB
 )
 
 // ChatGenerator implements loom.Generator and loom.StreamingGenerator for
@@ -319,7 +326,7 @@ func (g *ChatGenerator) post(ctx context.Context, path string, body []byte) ([]b
 		return nil, err
 	}
 	defer rc.Close()
-	return io.ReadAll(rc)
+	return io.ReadAll(io.LimitReader(rc, maxResponseBytes))
 }
 
 func (g *ChatGenerator) postRaw(ctx context.Context, path string, body []byte) (io.ReadCloser, error) {
@@ -337,7 +344,7 @@ func (g *ChatGenerator) postRaw(ctx context.Context, path string, body []byte) (
 	}
 	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		return nil, fmt.Errorf("anthropic: http %d: %s", resp.StatusCode, b)
 	}
 	return resp.Body, nil

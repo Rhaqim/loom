@@ -55,7 +55,7 @@ func (h *Handler) Play(w http.ResponseWriter, r *http.Request) {
 	result, err := h.engine.Play(ctx, sess, agentSlug, body.Action)
 	if err != nil {
 		h.log.Error("play", "story_id", story.ID, "err", err)
-		h.fail(w, http.StatusInternalServerError, "narrator error: "+err.Error())
+		h.fail(w, http.StatusInternalServerError, "the narrator failed to respond")
 		return
 	}
 
@@ -147,7 +147,7 @@ func (h *Handler) PlayStream(w http.ResponseWriter, r *http.Request) {
 	result := <-resultCh
 	if result.Err != nil {
 		h.log.Error("play stream", "story_id", story.ID, "err", result.Err)
-		writeSSE(w, flusher, "error", map[string]any{"error": result.Err.Error()})
+		writeSSE(w, flusher, "error", map[string]any{"error": "the narrator failed to respond"})
 		return
 	}
 

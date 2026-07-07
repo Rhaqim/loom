@@ -18,6 +18,23 @@ import (
 
 const defaultBaseURL = "https://api.replicate.com/v1"
 
+const (
+	// maxResponseBytes caps a response body so a malicious or misbehaving
+	// upstream cannot exhaust memory with a huge reply.
+	maxResponseBytes = 8 << 20 // 8 MiB
+	// maxErrorBodyBytes truncates an upstream error body before it is echoed
+	// into an error string (and thus logs).
+	maxErrorBodyBytes = 4 << 10 // 4 KiB
+)
+
+// truncErr caps an upstream body slice for safe inclusion in an error message.
+func truncErr(b []byte) []byte {
+	if len(b) > maxErrorBodyBytes {
+		return b[:maxErrorBodyBytes]
+	}
+	return b
+}
+
 // ImageGenerator implements loom.Generator for Replicate image models.
 // Generation is asynchronous: Generate returns a PendingResult and Poll
 // resolves it once the prediction completes.
@@ -124,9 +141,9 @@ func (g *ImageGenerator) getPrediction(ctx context.Context, id string) (*predict
 		return nil, fmt.Errorf("replicate: http: %w", err)
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("replicate: http %d: %s", resp.StatusCode, b)
+		return nil, fmt.Errorf("replicate: http %d: %s", resp.StatusCode, truncErr(b))
 	}
 	var pred prediction
 	if err := json.Unmarshal(b, &pred); err != nil {
@@ -148,9 +165,9 @@ func (g *ImageGenerator) post(ctx context.Context, path string, body []byte) ([]
 		return nil, fmt.Errorf("replicate: http: %w", err)
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("replicate: http %d: %s", resp.StatusCode, b)
+		return nil, fmt.Errorf("replicate: http %d: %s", resp.StatusCode, truncErr(b))
 	}
 	return b, nil
 }
