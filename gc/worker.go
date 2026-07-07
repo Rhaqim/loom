@@ -254,13 +254,16 @@ func (w *Worker) sweepTier4(ctx context.Context) (int, error) {
 }
 
 // testTagMatch returns the dialect-appropriate predicate matching the
-// "test:true" tag. Postgres stores tags as JSONB (needs a ::text cast); SQLite
-// stores it as TEXT.
+// "test:true" tag. Tags are stored as a JSON array of strings — JSONB on
+// Postgres, TEXT on SQLite. The match tests array *membership*, not a raw
+// substring: a substring match (e.g. LIKE '%test:true%') would also match
+// unrelated tags such as "latest:true" or "contest:true" and hard-delete
+// those sessions. "test:true" is a fixed constant, so it is safe to inline.
 func (w *Worker) testTagMatch() string {
 	if w.cfg.Dialect == "sqlite" {
-		return `tags LIKE '%test:true%'`
+		return `EXISTS (SELECT 1 FROM json_each(tags) WHERE value = 'test:true')`
 	}
-	return `tags::text LIKE '%test:true%'`
+	return `tags @> '["test:true"]'::jsonb`
 }
 
 // hardSweep deletes (or, in dry-run, counts) sessions matching where. The delete

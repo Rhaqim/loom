@@ -18,6 +18,10 @@ bin/
 /examples/storyapi/storyapi
 /examples/conexus-loom/conexus-loom
 
+# Stray facade-generator binary if someone runs `go build ./internal/tools/facadegen`
+# (go generate uses `go run`, so this is never produced by the normal flow)
+/facadegen
+
 # Local scratch / planning docs, not part of the library
 /LOOM_*.md
 

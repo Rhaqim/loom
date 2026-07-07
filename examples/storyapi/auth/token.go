@@ -37,6 +37,19 @@ func CheckPassword(hash, password string) error {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
 }
 
+// dummyHash is a valid bcrypt hash used only to spend bcrypt-equivalent time
+// when authenticating a non-existent user, so a login attempt takes roughly the
+// same time whether or not the username exists. Generated at init at the same
+// cost as real hashes (bcrypt.DefaultCost, via HashPassword).
+var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("timing-equalizer"), bcrypt.DefaultCost)
+
+// DummyCompare performs a throwaway bcrypt comparison. Call it on the
+// user-not-found path of login to close the timing side-channel that would
+// otherwise let an attacker enumerate valid usernames.
+func DummyCompare(password string) {
+	_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
+}
+
 // CreateToken creates a signed token for the given user.
 func CreateToken(secret []byte, userID uuid.UUID, username string) (string, error) {
 	claims := Claims{

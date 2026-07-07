@@ -29,11 +29,23 @@ package harness
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	loom "github.com/rhaqim/loom"
+)
+
+const (
+	// maxVariants caps the total expanded cross-product. A plan whose
+	// Providers × SystemPrompts × Params exceeds this is rejected rather than
+	// spawning a runaway number of sessions and paid provider calls.
+	maxVariants = 1024
+	// defaultMaxParallel bounds how many variants run concurrently when the plan
+	// does not set MaxParallel. Unbounded fan-out would exhaust the DB
+	// connection pool and amplify outbound provider requests.
+	defaultMaxParallel = 8
 )
 
 // -----------------------------------------------------------------------
@@ -50,6 +62,9 @@ type TestPlan struct {
 	Variants VariantMatrix `yaml:"variants" json:"variants"`
 	// Assertions are checked against every step Result.
 	Assertions []Assertion `yaml:"-" json:"-"`
+	// MaxParallel bounds how many variants run concurrently. 0 uses a safe
+	// default (see defaultMaxParallel); negative or excessive values are clamped.
+	MaxParallel int `yaml:"max_parallel,omitempty" json:"max_parallel,omitempty"`
 }
 
 // SessionScript describes the session lifecycle for a test.
@@ -213,6 +228,23 @@ func Run(ctx context.Context, e *loom.Engine, plan *TestPlan) (*TestReport, erro
 	if len(variants) == 0 {
 		variants = []variantConfig{{}} // single default variant
 	}
+	if len(variants) > maxVariants {
+		return nil, fmt.Errorf("harness: variant matrix expands to %d variants, exceeding the limit of %d", len(variants), maxVariants)
+	}
+
+	// Bound concurrency: a semaphore caps how many variants run at once so a
+	// large matrix cannot exhaust the DB pool or amplify provider traffic.
+	parallel := plan.MaxParallel
+	if parallel <= 0 {
+		parallel = defaultMaxParallel
+	}
+	if parallel > runtime.GOMAXPROCS(0)*4 {
+		parallel = runtime.GOMAXPROCS(0) * 4
+	}
+	if parallel > len(variants) {
+		parallel = len(variants)
+	}
+	sem := make(chan struct{}, parallel)
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -220,8 +252,10 @@ func Run(ctx context.Context, e *loom.Engine, plan *TestPlan) (*TestReport, erro
 
 	for i, v := range variants {
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(idx int, vc variantConfig) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			vr := runVariant(ctx, e, plan, vc, idx)
 			mu.Lock()
 			variantReports[idx] = vr

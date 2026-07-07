@@ -8,6 +8,7 @@ package harness
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -60,6 +61,22 @@ func TestExpandVariants(t *testing.T) {
 	}
 	if vs[0].Params != nil {
 		t.Errorf("params must stay nil when only SystemPrompts axis is given")
+	}
+}
+
+func TestRunRejectsOversizeVariantMatrix(t *testing.T) {
+	providers := make([]string, maxVariants+1)
+	for i := range providers {
+		providers[i] = fmt.Sprintf("p%d", i)
+	}
+	plan := &TestPlan{
+		Name:     "too-big",
+		Session:  SessionScript{PlatformID: "t", Steps: []ScriptedStep{{AgentSlug: "x"}}},
+		Variants: VariantMatrix{Providers: providers},
+	}
+	// The cap is enforced before any variant runs, so the engine is never used.
+	if _, err := Run(context.Background(), nil, plan); err == nil {
+		t.Fatal("expected oversize variant matrix to be rejected")
 	}
 }
 

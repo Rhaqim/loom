@@ -47,7 +47,11 @@ func (h *Handler) protected(next http.HandlerFunc) http.HandlerFunc {
 		}
 		claims, err := auth.ValidateToken(h.secret, token)
 		if err != nil {
-			h.fail(w, http.StatusUnauthorized, err.Error())
+			// Return a single generic message: distinguishing "expired" from
+			// "bad signature" from "bad payload" tells an attacker exactly why a
+			// forged/edited token failed.
+			h.log.Info("token validation failed", "err", err)
+			h.fail(w, http.StatusUnauthorized, "invalid or expired token")
 			return
 		}
 		user, err := h.store.GetUserByID(r.Context(), claims.UserID)
@@ -86,9 +90,16 @@ func (h *Handler) fail(w http.ResponseWriter, code int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+// maxBodyBytes caps request bodies to prevent memory-exhaustion DoS from an
+// unbounded JSON payload (and, for the play endpoints, unbounded LLM input).
+const maxBodyBytes = 64 << 10 // 64 KiB
+
 func (h *Handler) decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		h.fail(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		h.fail(w, http.StatusBadRequest, "invalid or oversized request body")
 		return false
 	}
 	return true
@@ -109,7 +120,9 @@ func (h *Handler) parseStoryID(w http.ResponseWriter, r *http.Request) (*domain.
 	}
 	user := currentUser(r)
 	if story.UserID != user.ID {
-		h.fail(w, http.StatusForbidden, "story belongs to another user")
+		// Return 404 (not 403) for a story owned by someone else, so the response
+		// does not reveal whether a given story id exists — no existence oracle.
+		h.fail(w, http.StatusNotFound, "story not found")
 		return nil, false
 	}
 	return story, true
