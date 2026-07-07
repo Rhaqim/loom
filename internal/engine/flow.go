@@ -112,6 +112,11 @@ type Turn struct {
 // all follower agents concurrently. Every resulting step is persisted and tagged
 // with the same turn ID. A follower failure does not abort the turn — its error
 // is recorded on the Turn but siblings still complete.
+//
+// A non-nil error means the lead step failed; it is the lead's RunStep error
+// (see RunStep for the error contract) wrapped with the turn and agent slug.
+// Follower failures are never returned here — inspect Turn.Errors (keyed by
+// agent slug) for those.
 func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest) (*Turn, error) {
 	turnID := uuid.New()
 

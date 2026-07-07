@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"testing"
+	"time"
 )
 
 // syncErrGen fails synchronously, like a transport/adapter error.
@@ -38,6 +39,31 @@ func TestErrInvalidConfig(t *testing.T) {
 	}
 	if _, err := New(Config{Dialect: DialectSQLite}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("New(no DB) err = %v, want Is(ErrInvalidConfig)", err)
+	}
+}
+
+func TestConfigCacheTTL(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:ttltest?mode=memory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Explicit TTL is honored.
+	e, err := New(Config{DB: db, Dialect: DialectSQLite, CacheTTL: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.cacheTTL != 5*time.Minute {
+		t.Fatalf("cacheTTL = %v, want %v", e.cacheTTL, 5*time.Minute)
+	}
+	// Zero falls back to the default.
+	e2, err := New(Config{DB: db, Dialect: DialectSQLite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e2.cacheTTL != defaultCacheTTL {
+		t.Fatalf("default cacheTTL = %v, want %v", e2.cacheTTL, defaultCacheTTL)
 	}
 }
 

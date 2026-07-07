@@ -526,11 +526,6 @@ const TargetPlatformID = engine.TargetPlatformID
 // A nil Cache in Config disables caching (the default).
 type Cache = engine.Cache
 
-// CacheTTL controls how long immutable loom objects are cached.
-// Agents and prompts are versioned and never mutated, so the default is
-// effectively permanent — adjust only if your cache backend enforces eviction.
-var CacheTTL = engine.CacheTTL
-
 // InProcessCache is a lightweight in-process cache backed by a sync.Map.
 // It supports optional TTL-based expiry, checked lazily on Get.
 // Suitable for single-instance deployments or integration testing.

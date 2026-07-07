@@ -23,7 +23,7 @@ func (s *promptService) Get(ctx context.Context, slug string, version int) (*Pro
 	if err != nil {
 		return nil, err
 	}
-	cacheSet(ctx, s.e.cache, key, p)
+	cacheSet(ctx, s.e.cache, key, p, s.e.cacheTTL)
 	return p, nil
 }
 

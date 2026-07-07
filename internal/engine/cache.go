@@ -30,10 +30,11 @@ type Cache interface {
 	Delete(ctx context.Context, key string)
 }
 
-// CacheTTL controls how long immutable loom objects are cached.
-// Agents and prompts are versioned and never mutated, so the default is
-// effectively permanent — adjust only if your cache backend enforces eviction.
-var CacheTTL = 24 * time.Hour
+// defaultCacheTTL is how long immutable loom objects are cached when
+// Config.CacheTTL is unset. Agents and prompts are versioned and never mutated,
+// so the default is effectively permanent — override via Config.CacheTTL only if
+// your cache backend enforces eviction.
+const defaultCacheTTL = 24 * time.Hour
 
 // cacheKey formats a cache key for a given kind, prefix, slug, and version.
 func cacheKey(kind, prefix, slug string, version int) string {
@@ -57,9 +58,10 @@ func cacheGet[T any](ctx context.Context, c Cache, key string) (*T, bool) {
 	return &v, true
 }
 
-// cacheSet serialises v and writes it to the cache. Errors are silently ignored
-// — a failed cache write degrades to a DB read, not an application error.
-func cacheSet[T any](ctx context.Context, c Cache, key string, v *T) {
+// cacheSet serialises v and writes it to the cache with the given ttl. Errors
+// are silently ignored — a failed cache write degrades to a DB read, not an
+// application error.
+func cacheSet[T any](ctx context.Context, c Cache, key string, v *T, ttl time.Duration) {
 	if c == nil {
 		return
 	}
@@ -67,7 +69,7 @@ func cacheSet[T any](ctx context.Context, c Cache, key string, v *T) {
 	if err != nil {
 		return
 	}
-	c.Set(ctx, key, raw, CacheTTL)
+	c.Set(ctx, key, raw, ttl)
 }
 
 // cacheDelete evicts a key. No-op when the cache is nil.

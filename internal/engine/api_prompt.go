@@ -83,7 +83,8 @@ func PromptFromFile(path string) PromptRef {
 
 // PromptRegistry resolves and manages prompts.
 type PromptRegistry interface {
-	// Get retrieves a specific version. Version 0 resolves to LATEST.
+	// Get retrieves a specific version. Version 0 resolves to LATEST. A missing
+	// prompt returns *NotFoundError (which unwraps to ErrNotFound).
 	Get(ctx context.Context, slug string, version int) (*Prompt, error)
 	// Latest resolves the highest version of slug.
 	Latest(ctx context.Context, slug string) (*Prompt, error)

@@ -28,7 +28,7 @@ func (s *agentService) Get(ctx context.Context, slug string, version int) (*Agen
 	if err != nil {
 		return nil, err
 	}
-	cacheSet(ctx, s.e.cache, key, a)
+	cacheSet(ctx, s.e.cache, key, a, s.e.cacheTTL)
 	return a, nil
 }
 

@@ -405,7 +405,7 @@ func (s *stepService) buildGenerateRequest(
 			if err != nil {
 				return GenerateRequest{}, fmt.Errorf("load system prompt: %w", err)
 			}
-			cacheSet(ctx, s.e.cache, spKey, sp)
+			cacheSet(ctx, s.e.cache, spKey, sp, s.e.cacheTTL)
 		}
 		systemPrompt = sp.Body
 	}
@@ -434,7 +434,7 @@ func (s *stepService) buildGenerateRequest(
 			if err != nil {
 				return GenerateRequest{}, fmt.Errorf("load user template: %w", err)
 			}
-			cacheSet(ctx, s.e.cache, utKey, ut)
+			cacheSet(ctx, s.e.cache, utKey, ut, s.e.cacheTTL)
 		}
 		// Render under a read lock — a sibling follower's locked tail may be
 		// appending to session.History / writing session.State right now.

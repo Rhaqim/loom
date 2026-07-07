@@ -76,7 +76,7 @@ func (s *responseFormatService) Get(ctx context.Context, slug string, version in
 	if err != nil {
 		return nil, wrapNotFound(err, "response_format", fmt.Sprintf("%s@v%d", slug, version))
 	}
-	cacheSet(ctx, s.e.cache, key, r)
+	cacheSet(ctx, s.e.cache, key, r, s.e.cacheTTL)
 	return r, nil
 }
 
@@ -94,7 +94,7 @@ func (s *responseFormatService) GetByID(ctx context.Context, id uuid.UUID) (*Res
 	if err != nil {
 		return nil, wrapNotFound(err, "response_format", id.String())
 	}
-	cacheSet(ctx, s.e.cache, key, r)
+	cacheSet(ctx, s.e.cache, key, r, s.e.cacheTTL)
 	return r, nil
 }
 

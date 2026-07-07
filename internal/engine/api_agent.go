@@ -32,7 +32,8 @@ type Agent struct {
 
 // AgentRegistry resolves and manages agents.
 type AgentRegistry interface {
-	// Get retrieves a specific version. Version 0 resolves to LATEST.
+	// Get retrieves a specific version. Version 0 resolves to LATEST. A missing
+	// agent returns *NotFoundError (which unwraps to ErrNotFound).
 	Get(ctx context.Context, slug string, version int) (*Agent, error)
 	// Latest resolves the highest version of slug.
 	Latest(ctx context.Context, slug string) (*Agent, error)

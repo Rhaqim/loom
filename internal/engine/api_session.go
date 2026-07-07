@@ -69,7 +69,8 @@ type BranchNode struct {
 type SessionRegistry interface {
 	// Create persists a new session.
 	Create(ctx context.Context, s *Session) error
-	// Get retrieves a session by ID.
+	// Get retrieves a session by ID. A missing session returns *NotFoundError
+	// (which unwraps to ErrNotFound).
 	Get(ctx context.Context, id uuid.UUID) (*Session, error)
 	// Update persists state changes to an existing session.
 	Update(ctx context.Context, s *Session) error

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"maps"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -49,6 +50,11 @@ type Config struct {
 	// cache, or supply any implementation of the Cache interface (Redis, etc.).
 	// A nil Cache disables caching — every RunStep hits the database directly.
 	Cache Cache
+	// CacheTTL is how long cached immutable objects (agents, prompts) live.
+	// Zero uses the default (24h). Since these records are versioned and never
+	// mutated, a long TTL is safe; set a shorter one only if your cache backend
+	// requires eviction.
+	CacheTTL time.Duration
 	// Pricing maps model id → per-million-token price for accurate cost tracking.
 	// Generators report their model on Result metadata ("model"); a model not in
 	// the table falls back to DefaultPrice. Nil disables per-model pricing (the
@@ -91,6 +97,7 @@ type Engine struct {
 	hooks        *hookBus
 	log          Logger
 	cache        Cache
+	cacheTTL     time.Duration
 	pricing      map[string]ModelPrice
 	defaultPrice *ModelPrice
 
@@ -139,6 +146,10 @@ func New(cfg Config) (*Engine, error) {
 	if maxRetries == 0 {
 		maxRetries = 3
 	}
+	cacheTTL := cfg.CacheTTL
+	if cacheTTL <= 0 {
+		cacheTTL = defaultCacheTTL
+	}
 	gens := make(map[string]Generator)
 	maps.Copy(gens, cfg.Generators)
 
@@ -148,6 +159,7 @@ func New(cfg Config) (*Engine, error) {
 		prefix:       prefix,
 		generators:   gens,
 		cache:        cfg.Cache,
+		cacheTTL:     cacheTTL,
 		hooks:        newHookBus(),
 		log:          log,
 		pricing:      cfg.Pricing,
@@ -274,6 +286,16 @@ func (e *Engine) StartPoller(ctx context.Context) {
 // RunStep executes one step of the generation loop against session.
 // It resolves the agent, renders the user template, runs pre-hooks, calls the
 // generator, runs post-hooks, persists the step, and returns it.
+//
+// Errors (match with errors.Is / errors.As):
+//   - ErrSkip — a pre-hook cancelled the step (use IsSkip); not a failure.
+//   - *NotFoundError (unwraps to ErrNotFound) — the agent slug/version, or a
+//     referenced prompt/response-format, does not exist.
+//   - ErrGeneratorNotRegistered — the agent's generator slug is not registered.
+//   - *BudgetExceededError — a configured budget blocked the step.
+//   - *GenerationError — the generator failed; switch on Kind (transport /
+//     rejected / empty).
+//   - otherwise, a wrapped error from a hook, template render, or persistence.
 func (e *Engine) RunStep(ctx context.Context, session *Session, req StepRequest) (*Step, error) {
 	return e.steps.run(ctx, session, req)
 }
