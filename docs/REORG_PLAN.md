@@ -157,5 +157,34 @@ only if/when desired; Phase 1 already delivers the encapsulation.
 ## Status
 
 - [x] Phase 0 — split god-files, apply naming convention
-- [ ] Phase 1 — move to `internal/engine` + root facade
+- [x] Phase 1 — move to `internal/engine` + root facade
 - [ ] Phase 2 — extract `internal/core` and `internal/store`
+
+### Phase 1 — as-built notes
+
+- All 58 root `*.go` files moved to `internal/engine/`, `package loom` →
+  `package engine`. The engine remained a single cohesive package, so it compiled
+  essentially untouched; hub-and-spoke coupling stays internal.
+- Root facade is **generated**: `internal/tools/facadegen` scans the exported
+  top-level declarations of `internal/engine` and emits `aliases.go`
+  (98 type aliases, 31 const re-exports, 35 func/var re-exports). Regenerate with
+  `go generate ./...` (directive in `doc.go`).
+- `facade_test.go` is the **drift guard**: it fails if any exported
+  `internal/engine` symbol is missing from the facade. Verified it both passes on
+  the current tree and fails when a new un-re-exported symbol is introduced.
+- Zero changes needed in `generator/*`, `harness`, `cmd/loom-cli`, or the three
+  example modules — they import the facade and it re-exports everything they use.
+  No import cycles (the engine imports `judge`/`gc`/`schema`, none of which import
+  the facade; `generator`/`harness` import the facade, which the engine does not
+  import back).
+- Encapsulation confirmed: example modules (separate modules) cannot import
+  `internal/engine`; Go's `internal/` rule enforces this at build time.
+- Full `-race` suite and all example-module builds are green.
+
+**Known follow-up (Phase 2 candidates):** `CacheTTL` is re-exported as a copied
+value; it is never reassigned anywhere today, but if a settable global is ever
+required it should move behind a setter or Config field (a facade copy cannot
+propagate writes across the package boundary). A few files under `internal/engine`
+(`hook.go`, `cache.go`, `bus.go`, `responseformat.go`, `flow.go`, `schemahook.go`)
+still mix public types with implementation; splitting them into `internal/core`
+(types/interfaces) and `internal/store` (SQL) is the Phase 2 work.

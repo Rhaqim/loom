@@ -12,14 +12,14 @@ help: ## Show this help
 # ── Infrastructure ─────────────────────────────────────────────────────────────
 
 up: ## Start PostgreSQL 16 via Docker (from the loom root)
-	docker compose -f ../../../docker-compose.yml up -d
+	docker compose -f ../../docker-compose.yml up -d
 	@echo "Waiting for Postgres..."
-	@until docker compose -f ../../../docker-compose.yml exec postgres \
+	@until docker compose -f ../../docker-compose.yml exec postgres \
 		pg_isready -U loom -d loom >/dev/null 2>&1; do sleep 1; done
 	@echo "Postgres is ready."
 
 down: ## Stop PostgreSQL
-	docker compose -f ../../../docker-compose.yml down
+	docker compose -f ../../docker-compose.yml down
 
 # ── Build ───────────────────────────────────────────────────────────────────────
 
