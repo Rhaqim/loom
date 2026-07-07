@@ -86,9 +86,16 @@ func (h *Handler) fail(w http.ResponseWriter, code int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+// maxBodyBytes caps request bodies to prevent memory-exhaustion DoS from an
+// unbounded JSON payload (and, for the play endpoints, unbounded LLM input).
+const maxBodyBytes = 64 << 10 // 64 KiB
+
 func (h *Handler) decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		h.fail(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		h.fail(w, http.StatusBadRequest, "invalid or oversized request body")
 		return false
 	}
 	return true

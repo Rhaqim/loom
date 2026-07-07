@@ -1,6 +1,9 @@
 package loom
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // PreHook runs before the agent. It may modify the request, cancel the step
 // (return ErrSkip), or annotate the state. Hooks run in registration order.
@@ -28,8 +31,13 @@ type HookBus interface {
 	PostNames() []string
 }
 
-// hookBus is the default in-process HookBus.
+// hookBus is the default in-process HookBus. All access is guarded by mu so
+// that registering a hook concurrently with a running step (RunStep/RunTurn fan
+// out steps across goroutines that share the engine's bus) is race-free: Run*
+// snapshots the slices under a read lock before invoking any hook, so a hook is
+// never invoked while the slice header is being mutated.
 type hookBus struct {
+	mu        sync.RWMutex
 	preNames  []string
 	preHooks  []PreHook
 	postNames []string
@@ -39,17 +47,24 @@ type hookBus struct {
 func newHookBus() *hookBus { return &hookBus{} }
 
 func (b *hookBus) RegisterPre(name string, h PreHook) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.preNames = append(b.preNames, name)
 	b.preHooks = append(b.preHooks, h)
 }
 
 func (b *hookBus) RegisterPost(name string, h PostHook) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.postNames = append(b.postNames, name)
 	b.postHooks = append(b.postHooks, h)
 }
 
 func (b *hookBus) RunPre(ctx context.Context, req *StepRequest) error {
-	for _, h := range b.preHooks {
+	b.mu.RLock()
+	hooks := b.preHooks[:len(b.preHooks):len(b.preHooks)]
+	b.mu.RUnlock()
+	for _, h := range hooks {
 		if err := h(ctx, req); err != nil {
 			return err
 		}
@@ -58,7 +73,10 @@ func (b *hookBus) RunPre(ctx context.Context, req *StepRequest) error {
 }
 
 func (b *hookBus) RunPost(ctx context.Context, req *StepRequest, res Result) (Result, error) {
-	for _, h := range b.postHooks {
+	b.mu.RLock()
+	hooks := b.postHooks[:len(b.postHooks):len(b.postHooks)]
+	b.mu.RUnlock()
+	for _, h := range hooks {
 		var err error
 		res, err = h(ctx, req, res)
 		if err != nil {
@@ -68,5 +86,14 @@ func (b *hookBus) RunPost(ctx context.Context, req *StepRequest, res Result) (Re
 	return res, nil
 }
 
-func (b *hookBus) PreNames() []string  { return append([]string(nil), b.preNames...) }
-func (b *hookBus) PostNames() []string { return append([]string(nil), b.postNames...) }
+func (b *hookBus) PreNames() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return append([]string(nil), b.preNames...)
+}
+
+func (b *hookBus) PostNames() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return append([]string(nil), b.postNames...)
+}

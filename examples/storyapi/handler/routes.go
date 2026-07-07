@@ -1,15 +1,22 @@
 package handler
 
-import "net/http"
+import (
+	"net/http"
+	"time"
+)
 
 // Routes registers all API routes and returns the root mux.
 // Uses Go 1.22 enhanced ServeMux patterns (method + path).
 func Routes(h *Handler) http.Handler {
 	mux := http.NewServeMux()
 
+	// Per-IP throttle on the unauthenticated auth endpoints to blunt
+	// brute-force / credential-stuffing / enumeration.
+	authLimit := newRateLimiter(10, time.Minute)
+
 	// Auth
-	mux.HandleFunc("POST /api/auth/register", h.Register)
-	mux.HandleFunc("POST /api/auth/login", h.Login)
+	mux.HandleFunc("POST /api/auth/register", authLimit.middleware(h, h.Register))
+	mux.HandleFunc("POST /api/auth/login", authLimit.middleware(h, h.Login))
 	mux.HandleFunc("GET /api/auth/me", h.protected(h.Me))
 
 	// Topics

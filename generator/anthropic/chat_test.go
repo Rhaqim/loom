@@ -129,7 +129,7 @@ func TestPerRequestOverrides(t *testing.T) {
 
 	// Default base URL is unreachable; the request must still land via the
 	// base_url override, with the per-request key and model winning over defaults.
-	g := NewChatGenerator("default-key", "default-model").WithBaseURL("http://invalid.invalid")
+	g := NewChatGenerator("default-key", "default-model").WithBaseURL("http://invalid.invalid").WithAllowedBaseURLs(srv.URL)
 	if _, err := g.Generate(context.Background(), loom.GenerateRequest{
 		UserPrompt: "hi",
 		Overrides:  map[string]any{"api_key": "override-key", "model": "override-model", "base_url": srv.URL},
@@ -168,7 +168,7 @@ func TestGenerateStreamWithOverrides(t *testing.T) {
 
 	// Streaming is the primary chat path: the per-request overrides must reach the
 	// wire there too (not just in the sync Generate).
-	g := NewChatGenerator("default-key", "default-model").WithBaseURL("http://invalid.invalid")
+	g := NewChatGenerator("default-key", "default-model").WithBaseURL("http://invalid.invalid").WithAllowedBaseURLs(srv.URL)
 	chunks, results, err := g.GenerateStream(context.Background(), loom.GenerateRequest{
 		UserPrompt: "hi",
 		Overrides:  map[string]any{"api_key": "override-key", "model": "override-model", "base_url": srv.URL},
@@ -194,5 +194,29 @@ func TestGenerateStreamWithOverrides(t *testing.T) {
 	<-results2
 	if gotKey != "default-key" || gotModel != "default-model" {
 		t.Fatalf("override leaked into the streaming generator: key=%q model=%q", gotKey, gotModel)
+	}
+}
+
+// A base_url override that is neither the configured URL nor allowlisted must be
+// rejected, and no request (carrying the real API key) may be sent to it. This
+// guards against SSRF / API-key exfiltration via a caller-controlled base_url.
+func TestBaseURLOverrideRejectedUnlessAllowlisted(t *testing.T) {
+	var reached bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		io.WriteString(w, `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{}}`)
+	}))
+	defer srv.Close()
+
+	g := NewChatGenerator("secret-key", "m") // no WithAllowedBaseURLs
+	_, err := g.Generate(context.Background(), loom.GenerateRequest{
+		UserPrompt: "hi",
+		Overrides:  map[string]any{"base_url": srv.URL},
+	})
+	if err == nil {
+		t.Fatal("expected base_url override to be rejected, got nil error")
+	}
+	if reached {
+		t.Fatal("request reached the un-allowlisted host — API key would have leaked")
 	}
 }

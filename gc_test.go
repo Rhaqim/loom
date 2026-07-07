@@ -234,6 +234,15 @@ func TestGC_T4_ScopesToBranchesAndHonorsPin(t *testing.T) {
 	gcAge(t, db, e.prefix, rootTagged.ID, 2*time.Hour)
 	gcTagTest(t, db, e.prefix, rootTagged.ID)
 
+	// Branch tagged "latest:true" -> preserved. Regression for the substring
+	// bug: LIKE '%test:true%' matched "latest:true" and wrongly hard-deleted it.
+	// The array-membership predicate must NOT match this branch.
+	lookalike := gcSession(t, ctx, e)
+	gcMakeBranch(t, db, e.prefix, lookalike.ID, parent.ID)
+	gcAge(t, db, e.prefix, lookalike.ID, 2*time.Hour)
+	gcAddStep(t, db, e.prefix, lookalike.ID, 0)
+	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET tags=$2 WHERE id=$1`, e.prefix), lookalike.ID, `["latest:true"]`)
+
 	report, err := NewBranchGCWorker(e, gcTestConfig(false)).Sweep(ctx)
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
@@ -244,7 +253,7 @@ func TestGC_T4_ScopesToBranchesAndHonorsPin(t *testing.T) {
 	if gcExists(t, db, e.prefix, branch.ID) {
 		t.Error("test-tagged branch should have been deleted")
 	}
-	for name, id := range map[string]uuid.UUID{"pinnedBranch": pinnedBranch.ID, "rootTagged": rootTagged.ID, "parent": parent.ID} {
+	for name, id := range map[string]uuid.UUID{"pinnedBranch": pinnedBranch.ID, "rootTagged": rootTagged.ID, "parent": parent.ID, "lookalike(latest:true)": lookalike.ID} {
 		if !gcExists(t, db, e.prefix, id) {
 			t.Errorf("%s was wrongly deleted by T4", name)
 		}

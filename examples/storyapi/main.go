@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/rhaqim/story-api/db"
@@ -29,10 +30,15 @@ func main() {
 
 	dsn := getenv("API_DSN", "postgres://loom:loom@localhost:5432/loom?sslmode=disable")
 	port := getenv("PORT", "8080")
-	secret := getenv("TOKEN_SECRET", "change-me-in-production")
 
-	if secret == "change-me-in-production" {
-		log.Warn("TOKEN_SECRET is using the default insecure value — set TOKEN_SECRET in production")
+	// The token secret must be set explicitly and be long enough to resist
+	// forgery. Refuse to boot on a missing/default/weak secret rather than serve
+	// traffic with a publicly-known HMAC key (which would let anyone forge a
+	// token for any user).
+	secret := os.Getenv("TOKEN_SECRET")
+	if secret == "" || secret == "change-me-in-production" || len(secret) < 32 {
+		log.Error("TOKEN_SECRET must be set to a strong value (>= 32 bytes); refusing to start")
+		os.Exit(1)
 	}
 
 	conn, err := db.Open(dsn)
@@ -75,7 +81,18 @@ func main() {
 		"generator", game.BestGeneratorSlug(),
 	)
 
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	// Explicit timeouts prevent slow-client (Slowloris) connection exhaustion.
+	// WriteTimeout is intentionally omitted because the /turns/stream endpoint
+	// streams a long-lived SSE response; ReadHeaderTimeout + IdleTimeout still
+	// bound how long an idle or header-dribbling client can hold a connection.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Error("server", "err", err)
 		os.Exit(1)
 	}

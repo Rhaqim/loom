@@ -24,6 +24,12 @@ type ChatGenerator struct {
 	model   string
 	baseURL string
 	client  *http.Client
+	// allowedBaseURLs is the opt-in allowlist of base URLs a per-request
+	// "base_url" override may select. It is empty by default, which disables
+	// the override entirely — a per-request base_url is otherwise a SSRF and
+	// API-key-exfiltration primitive, since the request still carries this
+	// generator's real credential.
+	allowedBaseURLs map[string]struct{}
 }
 
 // NewChatGenerator creates an OpenAI chat generator.
@@ -36,19 +42,51 @@ func NewChatGenerator(apiKey, model string) *ChatGenerator {
 	}
 }
 
-// WithBaseURL overrides the API base URL (useful for testing / Azure).
+// WithBaseURL overrides the API base URL (useful for testing / Azure). The URL
+// set here is also implicitly trusted as a per-request "base_url" override.
 func (g *ChatGenerator) WithBaseURL(url string) *ChatGenerator {
 	g.baseURL = url
 	return g
 }
 
+// WithAllowedBaseURLs opts into honoring the per-request "base_url" override,
+// restricted to the given exact URLs. Anything not listed here (and not equal to
+// the configured base URL) is rejected, so a caller-supplied base_url can never
+// redirect the request — and this generator's API key — to an arbitrary host.
+func (g *ChatGenerator) WithAllowedBaseURLs(urls ...string) *ChatGenerator {
+	if g.allowedBaseURLs == nil {
+		g.allowedBaseURLs = make(map[string]struct{}, len(urls))
+	}
+	for _, u := range urls {
+		g.allowedBaseURLs[strings.TrimRight(u, "/")] = struct{}{}
+	}
+	return g
+}
+
+// baseURLAllowed reports whether v is a permitted per-request base URL. The
+// configured base URL is always allowed; any other value must be explicitly
+// allowlisted via WithAllowedBaseURLs. The allowlist is the operator's trust
+// decision, so an attacker-supplied base_url that is neither the configured URL
+// nor allowlisted is rejected — the API key is never sent to it.
+func (g *ChatGenerator) baseURLAllowed(v string) bool {
+	norm := strings.TrimRight(v, "/")
+	if norm == strings.TrimRight(g.baseURL, "/") {
+		return true
+	}
+	_, ok := g.allowedBaseURLs[norm]
+	return ok
+}
+
 // withOverrides returns a per-request copy of the generator honoring
 // req.Overrides ("api_key", "model", "base_url"), so callers can route a single
 // call to a different model or tenant key. Returns the receiver unchanged when
-// no overrides apply. The shallow copy shares the (concurrency-safe) http.Client.
-func (g *ChatGenerator) withOverrides(req loom.GenerateRequest) *ChatGenerator {
+// no overrides apply. A "base_url" override is honored only when it passes
+// baseURLAllowed; otherwise withOverrides returns an error rather than fall back
+// to the default endpoint (fail-closed). The shallow copy shares the
+// (concurrency-safe) http.Client.
+func (g *ChatGenerator) withOverrides(req loom.GenerateRequest) (*ChatGenerator, error) {
 	if len(req.Overrides) == 0 {
-		return g
+		return g, nil
 	}
 	cp := *g
 	if v, ok := req.Overrides["api_key"].(string); ok && v != "" {
@@ -58,16 +96,22 @@ func (g *ChatGenerator) withOverrides(req loom.GenerateRequest) *ChatGenerator {
 		cp.model = v
 	}
 	if v, ok := req.Overrides["base_url"].(string); ok && v != "" {
+		if !g.baseURLAllowed(v) {
+			return nil, fmt.Errorf("openai: base_url override %q is not permitted (allowlist it via WithAllowedBaseURLs)", v)
+		}
 		cp.baseURL = v
 	}
-	return &cp
+	return &cp, nil
 }
 
 func (g *ChatGenerator) Modality() loom.Modality { return loom.ModalityText }
 
 // Generate calls the OpenAI Chat Completions API synchronously.
 func (g *ChatGenerator) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error) {
-	g = g.withOverrides(req)
+	g, err := g.withOverrides(req)
+	if err != nil {
+		return nil, err
+	}
 	body, err := g.buildBody(req, false)
 	if err != nil {
 		return nil, err
@@ -82,7 +126,10 @@ func (g *ChatGenerator) Generate(ctx context.Context, req loom.GenerateRequest) 
 // GenerateStream calls the OpenAI streaming API and delivers chunks on the
 // first returned channel; the fully assembled Result arrives on the second.
 func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateRequest) (<-chan loom.Chunk, <-chan loom.Result, error) {
-	g = g.withOverrides(req)
+	g, err := g.withOverrides(req)
+	if err != nil {
+		return nil, nil, err
+	}
 	body, err := g.buildBody(req, true)
 	if err != nil {
 		return nil, nil, err
