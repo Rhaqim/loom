@@ -14,6 +14,11 @@ func Routes(h *Handler) http.Handler {
 	// brute-force / credential-stuffing / enumeration.
 	authLimit := newRateLimiter(10, time.Minute)
 
+	// Per-IP throttle on the play endpoints: each turn triggers a paid LLM call,
+	// so cap the rate to blunt cost-amplification abuse. (loom budgets are the
+	// per-user hard cap; this is a coarse first line of defence.)
+	playLimit := newRateLimiter(30, time.Minute)
+
 	// Auth
 	mux.HandleFunc("POST /api/auth/register", authLimit.middleware(h, h.Register))
 	mux.HandleFunc("POST /api/auth/login", authLimit.middleware(h, h.Login))
@@ -31,8 +36,8 @@ func Routes(h *Handler) http.Handler {
 	mux.HandleFunc("DELETE /api/stories/{id}", h.protected(h.AbandonStory))
 
 	// Play
-	mux.HandleFunc("POST /api/stories/{id}/turns", h.protected(h.Play))
-	mux.HandleFunc("POST /api/stories/{id}/turns/stream", h.protected(h.PlayStream))
+	mux.HandleFunc("POST /api/stories/{id}/turns", playLimit.middleware(h, h.protected(h.Play)))
+	mux.HandleFunc("POST /api/stories/{id}/turns/stream", playLimit.middleware(h, h.protected(h.PlayStream)))
 	mux.HandleFunc("GET /api/stories/{id}/turns", h.protected(h.ListTurns))
 
 	// Health

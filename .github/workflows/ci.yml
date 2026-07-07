@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Facade sync, vet, build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      # Fail if aliases.go was not regenerated after changing the public surface
+      # of internal/engine. Catches "forgot to run `go generate`" in review.
+      - name: Check facade is up to date
+        run: make check-facade
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # No LOOM_DSN is set, so the Postgres-backed integration tests in
+      # internal/enginetest and internal/clitest skip themselves. The SQLite and
+      # in-memory tests (including the facade drift guard) still run under -race.
+      # For full integration coverage, run `make test-all` against a local
+      # Postgres (see `make up`).
+      - name: Test (race)
+        run: go test -race -count=1 ./...

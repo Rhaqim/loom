@@ -60,6 +60,51 @@ func migrations() []Migration {
 				return addColumnIfMissing(ctx, tx, d, p+"sessions", "version", "INT NOT NULL DEFAULT 0")
 			},
 		},
+		{
+			// The reusable-response-format feature added the response_formats table
+			// and the agents.response_format_id / response_format columns. Databases
+			// created before it never got them (CREATE TABLE IF NOT EXISTS does not
+			// alter an existing agents table). Ensure the referenced table exists,
+			// then backfill the columns — a no-op on fresh DBs that already have them.
+			Version: 4,
+			Name:    "agent-response-format",
+			Up: func(ctx context.Context, tx *sql.Tx, p string, d Dialect) error {
+				var createRF, idType, jsonType string
+				if d == DialectSQLite {
+					createRF = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sresponse_formats (
+						id TEXT PRIMARY KEY,
+						slug TEXT NOT NULL,
+						owner TEXT NOT NULL DEFAULT '',
+						version INTEGER NOT NULL,
+						schema TEXT NOT NULL DEFAULT '{}',
+						strict INTEGER NOT NULL DEFAULT 0,
+						created_at DATETIME NOT NULL,
+						UNIQUE (slug, version)
+					)`, p)
+					idType, jsonType = "TEXT", "TEXT"
+				} else {
+					createRF = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sresponse_formats (
+						id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+						slug          TEXT NOT NULL,
+						owner         TEXT NOT NULL DEFAULT '',
+						version       INT NOT NULL,
+						schema        JSONB NOT NULL DEFAULT '{}',
+						strict        BOOL NOT NULL DEFAULT false,
+						created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+						UNIQUE (slug, version)
+					)`, p)
+					idType, jsonType = "UUID", "JSONB"
+				}
+				if _, err := tx.ExecContext(ctx, createRF); err != nil {
+					return err
+				}
+				fkDef := fmt.Sprintf("%s REFERENCES %sresponse_formats(id) ON DELETE RESTRICT", idType, p)
+				if err := addColumnIfMissing(ctx, tx, d, p+"agents", "response_format_id", fkDef); err != nil {
+					return err
+				}
+				return addColumnIfMissing(ctx, tx, d, p+"agents", "response_format", jsonType)
+			},
+		},
 	}
 }
 
