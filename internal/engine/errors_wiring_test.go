@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 )
@@ -12,6 +13,14 @@ type syncErrGen struct{}
 func (syncErrGen) Modality() Modality { return ModalityText }
 func (syncErrGen) Generate(context.Context, GenerateRequest) (Result, error) {
 	return nil, errors.New("dial tcp: connection refused")
+}
+
+// nilGen is a misbehaving adapter that returns (nil, nil) on success.
+type nilGen struct{}
+
+func (nilGen) Modality() Modality { return ModalityText }
+func (nilGen) Generate(context.Context, GenerateRequest) (Result, error) {
+	return nil, nil
 }
 
 func mkSession(t *testing.T, e *Engine) *Session {
@@ -29,6 +38,34 @@ func TestErrInvalidConfig(t *testing.T) {
 	}
 	if _, err := New(Config{Dialect: DialectSQLite}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("New(no DB) err = %v, want Is(ErrInvalidConfig)", err)
+	}
+}
+
+func TestInvalidSchemaPrefixRejected(t *testing.T) {
+	// A prefix that is not a safe identifier must be rejected, not interpolated
+	// into SQL.
+	db, err := sql.Open("sqlite", "file:prefixtest?mode=memory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := New(Config{DB: db, Dialect: DialectSQLite, SchemaPrefix: "loom\"; DROP TABLE x;--"}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("New(bad prefix) err = %v, want Is(ErrInvalidConfig)", err)
+	}
+}
+
+func TestGeneratorReturningNilResultDegradesToError(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "nilres", map[string]Generator{"g": nilGen{}}, PollerConfig{})
+	if err := e.Agents().Create(ctx, &Agent{Slug: "a", Version: 1, Modal: ModalityText, GeneratorSlug: "g"}); err != nil {
+		t.Fatal(err)
+	}
+	sess := mkSession(t, e)
+	// Must return a GenerationError, not panic on a nil-result dereference.
+	_, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a"})
+	var ge *GenerationError
+	if !errors.As(err, &ge) || ge.Kind != GenerationEmpty {
+		t.Fatalf("RunStep err = %v, want GenerationError{Empty}", err)
 	}
 }
 

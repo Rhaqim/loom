@@ -214,12 +214,12 @@ func main() {
 	b.WriteString("package loom\n\n")
 	b.WriteString("import engine \"github.com/rhaqim/loom/internal/engine\"\n\n")
 
+	const rule = "////////////////////////////////////////////////////////////////////////////////"
 	for _, file := range ordered {
 		es := groups[file]
 		sort.SliceStable(es, func(i, j int) bool { return es[i].line < es[j].line })
 		title := titleFor(file)
-		bar := strings.Repeat("-", len(title))
-		fmt.Fprintf(&b, "// %s\n// %s\n\n", title, bar)
+		fmt.Fprintf(&b, "%s\n// %s\n%s\n\n", rule, title, rule)
 		for _, e := range es {
 			if e.doc != "" {
 				for _, line := range strings.Split(e.doc, "\n") {

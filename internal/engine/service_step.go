@@ -188,6 +188,18 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 			}
 		}
 
+		// A generator must return a non-nil result on success. The streaming path
+		// guards this above; guard the sync path too so a misbehaving adapter that
+		// returns (nil, nil) degrades to an error here instead of a nil deref when
+		// the result is used below.
+		if result == nil {
+			if keepBest && haveBest {
+				diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = "no result"
+				break
+			}
+			return nil, &GenerationError{Kind: GenerationEmpty, Provider: genSlug, Message: "generator returned no result"}
+		}
+
 		// Run post-hooks. Expose the attempt index so a hook can self-cap retries.
 		req.attempt = attempt
 		var hookErr error

@@ -23,7 +23,13 @@ func (p *asyncPollerService) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sem <- struct{}{}
+			// Acquire a worker slot, but stay responsive to cancellation: if all
+			// workers are busy on slow polls, don't block here past shutdown.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			go func() {
 				defer func() { <-sem }()
 				p.pollPending(ctx)

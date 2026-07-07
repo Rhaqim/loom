@@ -120,7 +120,9 @@ func (h *Handler) parseStoryID(w http.ResponseWriter, r *http.Request) (*domain.
 	}
 	user := currentUser(r)
 	if story.UserID != user.ID {
-		h.fail(w, http.StatusForbidden, "story belongs to another user")
+		// Return 404 (not 403) for a story owned by someone else, so the response
+		// does not reveal whether a given story id exists — no existence oracle.
+		h.fail(w, http.StatusNotFound, "story not found")
 		return nil, false
 	}
 	return story, true

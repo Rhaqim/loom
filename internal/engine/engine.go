@@ -124,6 +124,13 @@ func New(cfg Config) (*Engine, error) {
 	if prefix == "" {
 		prefix = "loom_"
 	}
+	// SchemaPrefix is interpolated directly into table names in every query, so
+	// it must be a safe SQL identifier. It is a config value (never request
+	// data), but validate it as defense-in-depth so it can never become an
+	// injection vector if an embedder ever sources it from untrusted input.
+	if !validSchemaPrefix(prefix) {
+		return nil, fmt.Errorf("%w: SchemaPrefix %q must match [A-Za-z0-9_]*", ErrInvalidConfig, prefix)
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = noopLogger{}
@@ -163,6 +170,17 @@ func New(cfg Config) (*Engine, error) {
 	}
 
 	return e, nil
+}
+
+// validSchemaPrefix reports whether s is a safe table-name prefix — letters,
+// digits, and underscores only (the empty string is allowed and defaulted).
+func validSchemaPrefix(s string) bool {
+	for _, r := range s {
+		if r != '_' && !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // Hooks returns the engine's hook bus for registering pre/post processors.

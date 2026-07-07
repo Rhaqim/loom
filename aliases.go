@@ -11,8 +11,9 @@ package loom
 
 import engine "github.com/rhaqim/loom/internal/engine"
 
+////////////////////////////////////////////////////////////////////////////////
 // Engine, configuration & core types
-// ----------------------------------
+////////////////////////////////////////////////////////////////////////////////
 
 // Dialect identifies the database flavour for the schema loader.
 type Dialect = engine.Dialect
@@ -46,8 +47,9 @@ type GCService = engine.GCService
 // MarshalResult serialises a Result to JSON for storage.
 var MarshalResult = engine.MarshalResult
 
+////////////////////////////////////////////////////////////////////////////////
 // Sessions & state
-// ----------------
+////////////////////////////////////////////////////////////////////////////////
 
 // Session is a running conversation. It holds state, action log, result history,
 // and any custom data the platform attaches.
@@ -62,8 +64,9 @@ type BranchNode = engine.BranchNode
 // SessionRegistry manages session persistence and branching.
 type SessionRegistry = engine.SessionRegistry
 
+////////////////////////////////////////////////////////////////////////////////
 // Agents
-// ------
+////////////////////////////////////////////////////////////////////////////////
 
 // Agent is a configuration bundling a Generator, system prompt, user template,
 // response format, and generation params. It is the unit the platform spawns.
@@ -72,8 +75,9 @@ type Agent = engine.Agent
 // AgentRegistry resolves and manages agents.
 type AgentRegistry = engine.AgentRegistry
 
+////////////////////////////////////////////////////////////////////////////////
 // Prompts
-// -------
+////////////////////////////////////////////////////////////////////////////////
 
 // Prompt is a versioned, categorized text template stored in the database.
 type Prompt = engine.Prompt
@@ -110,8 +114,9 @@ var PromptFromFile = engine.PromptFromFile
 // PromptRegistry resolves and manages prompts.
 type PromptRegistry = engine.PromptRegistry
 
+////////////////////////////////////////////////////////////////////////////////
 // Response formats
-// ----------------
+////////////////////////////////////////////////////////////////////////////////
 
 // ResponseFormatRecord is a stored, versioned response format.
 type ResponseFormatRecord = engine.ResponseFormatRecord
@@ -119,8 +124,9 @@ type ResponseFormatRecord = engine.ResponseFormatRecord
 // ResponseFormatRegistry resolves and manages reusable response formats.
 type ResponseFormatRegistry = engine.ResponseFormatRegistry
 
+////////////////////////////////////////////////////////////////////////////////
 // Actions
-// -------
+////////////////////////////////////////////////////////////////////////////////
 
 // ActionKind discriminates the shape of an Action's payload.
 type ActionKind = engine.ActionKind
@@ -165,8 +171,9 @@ type RawInput = engine.RawInput
 // The platform supplies this; the engine uses it internally during RunStep.
 type ActionInterpreter = engine.ActionInterpreter
 
+////////////////////////////////////////////////////////////////////////////////
 // Steps
-// -----
+////////////////////////////////////////////////////////////////////////////////
 
 // StoredRequest is a serialized GenerateRequest persisted alongside the step.
 type StoredRequest = engine.StoredRequest
@@ -201,8 +208,9 @@ type StepRunner = engine.StepRunner
 // The full type lives in the cost sub-package; this alias avoids an import cycle.
 type CostRecord = engine.CostRecord
 
+////////////////////////////////////////////////////////////////////////////////
 // Results
-// -------
+////////////////////////////////////////////////////////////////////////////////
 
 // ResultStatus indicates whether a Result is ready, pending, or failed.
 type ResultStatus = engine.ResultStatus
@@ -267,8 +275,9 @@ var NewWorldResult = engine.NewWorldResult
 // NewStructuredResult creates a ready StructuredResult.
 var NewStructuredResult = engine.NewStructuredResult
 
+////////////////////////////////////////////////////////////////////////////////
 // Generators
-// ----------
+////////////////////////////////////////////////////////////////////////////////
 
 // TaskHandle references an in-flight async provider job.
 type TaskHandle = engine.TaskHandle
@@ -295,8 +304,9 @@ type StreamingGenerator = engine.StreamingGenerator
 // PollerConfig configures the background async result poller.
 type PollerConfig = engine.PollerConfig
 
+////////////////////////////////////////////////////////////////////////////////
 // Modality
-// --------
+////////////////////////////////////////////////////////////////////////////////
 
 // Modality is the output kind a generator produces.
 type Modality = engine.Modality
@@ -313,8 +323,9 @@ const ModalityWorld = engine.ModalityWorld
 
 const ModalityStructured = engine.ModalityStructured
 
+////////////////////////////////////////////////////////////////////////////////
 // Flows & turns
-// -------------
+////////////////////////////////////////////////////////////////////////////////
 
 // FlowAgent is one agent participating in a turn.
 type FlowAgent = engine.FlowAgent
@@ -333,8 +344,9 @@ type Turn = engine.Turn
 // injection, returning "" for modalities without a natural text form.
 var ResultText = engine.ResultText
 
+////////////////////////////////////////////////////////////////////////////////
 // Flow persistence
-// ----------------
+////////////////////////////////////////////////////////////////////////////////
 
 // FlowRecord is a persisted, versioned agent map.
 type FlowRecord = engine.FlowRecord
@@ -348,8 +360,9 @@ type FlowAgentEntry = engine.FlowAgentEntry
 // new version (like agents/prompts); Delete removes a specific version.
 type FlowRegistry = engine.FlowRegistry
 
+////////////////////////////////////////////////////////////////////////////////
 // Hooks
-// -----
+////////////////////////////////////////////////////////////////////////////////
 
 // PreHook runs before the agent. It may modify the request, cancel the step
 // (return ErrSkip), or annotate the state. Hooks run in registration order.
@@ -362,8 +375,9 @@ type PostHook = engine.PostHook
 // HookBus manages pre- and post-hook registration.
 type HookBus = engine.HookBus
 
+////////////////////////////////////////////////////////////////////////////////
 // Schema validation
-// -----------------
+////////////////////////////////////////////////////////////////////////////////
 
 // SchemaValidationPostHook returns a PostHook that validates a structured/text
 // result against the resolved ResponseFormat schema. On any violation it returns
@@ -376,8 +390,9 @@ var SchemaValidationPostHook = engine.SchemaValidationPostHook
 // subset) and returns a list of human-readable violations ("" path = root).
 var ValidateJSONSchema = engine.ValidateJSONSchema
 
+////////////////////////////////////////////////////////////////////////////////
 // Judges
-// ------
+////////////////////////////////////////////////////////////////////////////////
 
 // RubricJudge scores a single output on multiple dimensions.
 type RubricJudge = engine.RubricJudge
@@ -425,8 +440,9 @@ var NewLLMPairwiseJudge = engine.NewLLMPairwiseJudge
 // generators can back real judges. The generator must return a TextResult.
 var GeneratorCompleter = engine.GeneratorCompleter
 
+////////////////////////////////////////////////////////////////////////////////
 // Cost tracking
-// -------------
+////////////////////////////////////////////////////////////////////////////////
 
 // CostManager is the public interface returned by Engine.Cost().
 type CostManager = engine.CostManager
@@ -449,8 +465,9 @@ type EstimateRequest = engine.EstimateRequest
 // CostEstimate is the output of Cost().Estimate().
 type CostEstimate = engine.CostEstimate
 
+////////////////////////////////////////////////////////////////////////////////
 // Budgets
-// -------
+////////////////////////////////////////////////////////////////////////////////
 
 // BudgetManager is the public interface returned by Engine.Budgets().
 type BudgetManager = engine.BudgetManager
@@ -490,8 +507,9 @@ const BudgetNotify = engine.BudgetNotify
 // TargetPlatformID is the BudgetTarget.Kind for per-user budgets.
 const TargetPlatformID = engine.TargetPlatformID
 
+////////////////////////////////////////////////////////////////////////////////
 // Caching
-// -------
+////////////////////////////////////////////////////////////////////////////////
 
 // Cache is a read-through cache for immutable engine objects (agents, prompts).
 //
@@ -521,8 +539,9 @@ type InProcessCache = engine.InProcessCache
 // NewInProcessCache returns a ready-to-use InProcessCache.
 var NewInProcessCache = engine.NewInProcessCache
 
+////////////////////////////////////////////////////////////////////////////////
 // Event bus
-// ---------
+////////////////////////////////////////////////////////////////////////////////
 
 // Message is one item published on a turn topic.
 type Message = engine.Message
@@ -533,8 +552,9 @@ type Bus = engine.Bus
 // TopicAll subscribes to every topic.
 const TopicAll = engine.TopicAll
 
+////////////////////////////////////////////////////////////////////////////////
 // Pricing
-// -------
+////////////////////////////////////////////////////////////////////////////////
 
 // ModelPrice is the USD price per one million tokens for a model.
 type ModelPrice = engine.ModelPrice
@@ -543,8 +563,9 @@ type ModelPrice = engine.ModelPrice
 // or "" if none.
 var ResultModel = engine.ResultModel
 
+////////////////////////////////////////////////////////////////////////////////
 // Garbage collection
-// ------------------
+////////////////////////////////////////////////////////////////////////////////
 
 // BranchGCConfig is a re-export of gc.Config for callers who import only loom.
 type BranchGCConfig = engine.BranchGCConfig
@@ -560,8 +581,9 @@ var NewBranchGCWorker = engine.NewBranchGCWorker
 // SweepReport is returned by GC.DryRun.
 type SweepReport = engine.SweepReport
 
+////////////////////////////////////////////////////////////////////////////////
 // Errors & control-flow sentinels
-// -------------------------------
+////////////////////////////////////////////////////////////////////////////////
 
 // ErrSkip cancels the current step when returned from a pre-hook.
 var ErrSkip = engine.ErrSkip

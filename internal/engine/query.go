@@ -9,12 +9,13 @@ import (
 )
 
 // -----------------------------------------------------------------------
-// Stub persistence functions — implemented fully in internal/store/postgres
+// Persistence wrappers
 // -----------------------------------------------------------------------
 
-// These thin wrappers delegate to the SQL functions defined in persist.go.
-// They are kept here to keep engine.go self-contained; the actual SQL lives
-// in persist.go so this file stays readable.
+// These thin wrappers delegate to the SQL functions in the store_*.go files.
+// They centralise cross-cutting concerns — currently translating a bare
+// ErrNotFound into a keyed *NotFoundError — so the services and engine stay
+// decoupled from the raw SQL layer.
 
 func queryAgent(ctx context.Context, db *sql.DB, prefix, slug string, version int) (*Agent, error) {
 	a, err := sqlQueryAgent(ctx, db, prefix, slug, version)
