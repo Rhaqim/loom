@@ -13,8 +13,8 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	"github.com/rhaqim/conexus-refactor/domain"
-	"github.com/rhaqim/conexus-refactor/ports"
+	"github.com/rhaqim/conexus-loom/domain"
+	"github.com/rhaqim/conexus-loom/ports"
 	loom "github.com/rhaqim/loom"
 )
 

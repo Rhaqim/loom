@@ -59,6 +59,20 @@ type GenerateRequest struct {
 }
 
 // Generator produces a Result from a GenerateRequest. One per modality+provider.
+//
+// A generator comes in one of three flavors — implement the interface(s) that
+// fit your provider; the engine detects the optional ones at runtime:
+//
+//   - Sync (this interface): Generate returns the finished Result. This is the
+//     minimum; every generator implements it. Register with Config.Generators or
+//     Engine.RegisterGenerator and point an agent at it by slug.
+//   - Streaming (also implement StreamingGenerator): the engine streams chunks
+//     to StepRequest.OnChunk when a caller asks for streaming, and falls back to
+//     Generate otherwise.
+//   - Async (also implement AsyncGenerator): Generate returns a pending Result
+//     (NewPendingResult) referencing an external job; the engine's background
+//     poller then calls Poll until the job resolves. Used for slow image/video
+//     providers (see generator/replicate and generator/runway).
 type Generator interface {
 	Modality() Modality
 	Generate(ctx context.Context, req GenerateRequest) (Result, error)
@@ -77,6 +91,18 @@ type StreamingGenerator interface {
 	// GenerateStream streams chunks on the first channel.
 	// The final assembled Result arrives on the second channel after streaming completes.
 	GenerateStream(ctx context.Context, req GenerateRequest) (<-chan Chunk, <-chan Result, error)
+}
+
+// AsyncGenerator extends Generator for providers whose jobs complete out of band
+// (typically image/video). Generate should submit the job and return a pending
+// Result (see NewPendingResult) carrying the external handle; the engine's
+// background poller then calls Poll on an interval until it returns a terminal
+// (ready or failed) Result. Return a still-pending Result to be polled again, or
+// an error to have the attempt counted toward the poll cap. Enable the poller
+// via Config.AsyncPoller.
+type AsyncGenerator interface {
+	Generator
+	Poll(ctx context.Context, handle TaskHandle) (Result, error)
 }
 
 // PollerConfig configures the background async result poller.

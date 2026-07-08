@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/rhaqim/conexus-refactor/domain"
-	"github.com/rhaqim/conexus-refactor/ports"
+	"github.com/rhaqim/conexus-loom/domain"
+	"github.com/rhaqim/conexus-loom/ports"
 )
 
 type recQueue struct{ tasks []ports.MediaTask }

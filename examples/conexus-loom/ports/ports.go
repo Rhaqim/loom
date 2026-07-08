@@ -9,7 +9,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
-	"github.com/rhaqim/conexus-refactor/domain"
+	"github.com/rhaqim/conexus-loom/domain"
 )
 
 // Logger is the telemetry seam (monorepo: backend/pkg/telemetry).

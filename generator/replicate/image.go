@@ -38,6 +38,9 @@ func truncErr(b []byte) []byte {
 // ImageGenerator implements loom.Generator for Replicate image models.
 // Generation is asynchronous: Generate returns a PendingResult and Poll
 // resolves it once the prediction completes.
+// ImageGenerator is an async generator: Generate submits the job, Poll resolves it.
+var _ loom.AsyncGenerator = (*ImageGenerator)(nil)
+
 type ImageGenerator struct {
 	apiKey  string
 	model   string // e.g. "stability-ai/sdxl:39ed52f2..."

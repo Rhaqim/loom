@@ -292,6 +292,20 @@ type ResponseFormat = engine.ResponseFormat
 type GenerateRequest = engine.GenerateRequest
 
 // Generator produces a Result from a GenerateRequest. One per modality+provider.
+//
+// A generator comes in one of three flavors — implement the interface(s) that
+// fit your provider; the engine detects the optional ones at runtime:
+//
+//   - Sync (this interface): Generate returns the finished Result. This is the
+//     minimum; every generator implements it. Register with Config.Generators or
+//     Engine.RegisterGenerator and point an agent at it by slug.
+//   - Streaming (also implement StreamingGenerator): the engine streams chunks
+//     to StepRequest.OnChunk when a caller asks for streaming, and falls back to
+//     Generate otherwise.
+//   - Async (also implement AsyncGenerator): Generate returns a pending Result
+//     (NewPendingResult) referencing an external job; the engine's background
+//     poller then calls Poll until the job resolves. Used for slow image/video
+//     providers (see generator/replicate and generator/runway).
 type Generator = engine.Generator
 
 // Chunk carries a partial text fragment from a streaming generator.
@@ -300,6 +314,15 @@ type Chunk = engine.Chunk
 // StreamingGenerator extends Generator with incremental chunk delivery.
 // Only text-modality generators need to implement this interface.
 type StreamingGenerator = engine.StreamingGenerator
+
+// AsyncGenerator extends Generator for providers whose jobs complete out of band
+// (typically image/video). Generate should submit the job and return a pending
+// Result (see NewPendingResult) carrying the external handle; the engine's
+// background poller then calls Poll on an interval until it returns a terminal
+// (ready or failed) Result. Return a still-pending Result to be polled again, or
+// an error to have the attempt counted toward the poll cap. Enable the poller
+// via Config.AsyncPoller.
+type AsyncGenerator = engine.AsyncGenerator
 
 // PollerConfig configures the background async result poller.
 type PollerConfig = engine.PollerConfig

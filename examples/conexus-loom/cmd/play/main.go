@@ -19,9 +19,9 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/rhaqim/conexus-refactor/adapters"
-	"github.com/rhaqim/conexus-refactor/engine"
-	"github.com/rhaqim/conexus-refactor/narrative"
+	"github.com/rhaqim/conexus-loom/adapters"
+	"github.com/rhaqim/conexus-loom/engine"
+	"github.com/rhaqim/conexus-loom/narrative"
 	loom "github.com/rhaqim/loom"
 	"github.com/rhaqim/loom/generator/echo"
 	"github.com/rhaqim/loom/generator/openai"

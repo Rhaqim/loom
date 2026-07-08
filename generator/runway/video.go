@@ -36,6 +36,9 @@ func truncErr(b []byte) []byte {
 }
 
 // VideoGenerator implements loom.Generator for RunwayML Gen-3 video models.
+// VideoGenerator is an async generator: Generate submits the job, Poll resolves it.
+var _ loom.AsyncGenerator = (*VideoGenerator)(nil)
+
 type VideoGenerator struct {
 	apiKey  string
 	model   string // e.g. "gen3a_turbo"

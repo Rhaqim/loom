@@ -49,9 +49,7 @@ func (p *asyncPollerService) pollPending(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		poller, ok := gen.(interface {
-			Poll(ctx context.Context, handle TaskHandle) (Result, error)
-		})
+		poller, ok := gen.(AsyncGenerator)
 		if !ok {
 			continue
 		}

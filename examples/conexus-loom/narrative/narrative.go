@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/rhaqim/conexus-refactor/domain"
+	"github.com/rhaqim/conexus-loom/domain"
 	loom "github.com/rhaqim/loom"
 )
 

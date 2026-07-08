@@ -12,10 +12,10 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/rhaqim/conexus-refactor/domain"
-	"github.com/rhaqim/conexus-refactor/migration"
-	"github.com/rhaqim/conexus-refactor/narrative"
-	"github.com/rhaqim/conexus-refactor/ports"
+	"github.com/rhaqim/conexus-loom/domain"
+	"github.com/rhaqim/conexus-loom/migration"
+	"github.com/rhaqim/conexus-loom/narrative"
+	"github.com/rhaqim/conexus-loom/ports"
 	loom "github.com/rhaqim/loom"
 )
 
