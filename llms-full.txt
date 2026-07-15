@@ -1,0 +1,2443 @@
+# loom
+
+> loom is a Go library for orchestrating multi-agent AI applications. It handles the
+> infrastructure — Postgres/SQLite persistence, versioned agents & prompts, session
+> branching/replay, a hook pipeline, cost tracking & budgets, LLM-as-judge scoring, and
+> multi-agent "turns" — so an application focuses on its product, not the plumbing.
+> Modality-agnostic: text, image, video, and structured JSON output flow through one pipeline.
+
+This file is an AI-oriented guide (an "llms.txt"): read it before writing code that uses loom.
+It is accurate to the current public API. Everything shown is importable from the single
+package `github.com/rhaqim/loom` (the "facade"). Do NOT import anything under
+`github.com/rhaqim/loom/internal/...` — it is not importable from other modules by design.
+
+- Module path: `github.com/rhaqim/loom`
+- Requires: Go 1.24+ (module targets Go 1.25 per go.mod), and a Postgres or SQLite database.
+- Install: `go get github.com/rhaqim/loom`
+- Full docs: the repo `README.md`, runnable `examples/` (story, dnd, storyapi, conexus-loom),
+  and `go doc github.com/rhaqim/loom`. The public API is also listed with docs in `aliases.go`.
+
+## Mental model (read this first)
+
+- **Engine** (`loom.Engine`): the central object, built once via `loom.New(loom.Config{...})`.
+  It exposes registries: `Agents()`, `Prompts()`, `Sessions()`, `ResponseFormats()`,
+  `Flows()`, `Cost()`, `Budgets()`, `Judges()`, `GC()`.
+- **Generator** (`loom.Generator`): an adapter to an AI provider (OpenAI, Anthropic, a custom
+  one, …). Registered under a slug. This is the pluggable "AI client" — see "Custom generators".
+- **Prompt** (`loom.Prompt`): a versioned, immutable text record. Two kinds: a system prompt
+  (`PromptKindSystem`) used verbatim, and a user template (`PromptKindUserTemplate`) rendered
+  as a Go `text/template`.
+- **Agent** (`loom.Agent`): binds a generator slug + a system prompt + a user template
+  (+ optional params / response format). Versioned by slug+version.
+- **Session** (`loom.Session`): one conversation. Holds state (`State.Vars`), history, and tags.
+- **Step**: one agent invocation against a session. `e.RunStep(...)` runs one agent.
+- **Turn / Flow**: a multi-agent step. `e.RunTurn(...)` runs a lead agent, then fan-outs to
+  follower agents concurrently, injecting the lead's output into the followers.
+- **Hooks**: pre/post interceptors for validation, retries, content filtering.
+
+Golden rules for AI writing loom code:
+1. Import only `github.com/rhaqim/loom` (+ `.../schema` and `.../generator/<x>` subpackages).
+   Never `.../internal/...`.
+2. Apply the schema BEFORE using the engine (see Setup). Re-running it is safe and runs
+   migrations for existing databases.
+3. `loom.Dialect` (for `Config.Dialect`) and `schema.Dialect` (for the loader) are two
+   different types; both have `DialectPostgres` / `DialectSQLite` constants. Use the matching one.
+4. Handle errors with `errors.Is` / `errors.As` against the typed errors below — do not string-match.
+
+## Setup (schema + engine)
+
+```go
+import (
+    "context"
+    "database/sql"
+
+    loom "github.com/rhaqim/loom"
+    "github.com/rhaqim/loom/schema"
+    "github.com/rhaqim/loom/generator/openai"
+
+    _ "modernc.org/sqlite" // pure-Go SQLite driver (no cgo); or _ "github.com/lib/pq" for Postgres
+    "os"
+)
+
+ctx := context.Background()
+
+// SQLite (zero-setup, great for local dev / tests):
+db, _ := sql.Open("sqlite", "file:app.db?_pragma=foreign_keys(1)")
+// Postgres: db, _ := sql.Open("postgres", os.Getenv("DATABASE_URL"))
+
+// 1. Apply the schema FIRST (idempotent; also runs migrations on an existing DB).
+if err := schema.NewLoader(schema.DialectSQLite).Apply(ctx, db); err != nil { panic(err) }
+
+// 2. Build the engine with your generators.
+e, err := loom.New(loom.Config{
+    DB:      db,
+    Dialect: loom.DialectSQLite,
+    Generators: map[string]loom.Generator{
+        "openai": openai.NewChatGenerator(os.Getenv("OPENAI_API_KEY"), "gpt-4o"),
+        // For a keyless stub (examples/tests): import generator/echo and use echo.New("").
+    },
+})
+if err != nil { panic(err) } // errors.Is(err, loom.ErrInvalidConfig) on bad config
+```
+
+## Quickstart (single agent, end to end)
+
+```go
+// Seed a system prompt and a user template (versioned, immutable).
+sys, _ := seedPrompt(ctx, e, "assistant-sys", loom.PromptKindSystem,
+    "You are a concise, helpful assistant.")
+usr, _ := seedPrompt(ctx, e, "assistant-usr", loom.PromptKindUserTemplate,
+    "User says: {{.Action.Payload.text}}")
+
+// Seed an agent binding a generator + the two prompts.
+e.Agents().Create(ctx, &loom.Agent{
+    Slug: "assistant", Version: 1, Modal: loom.ModalityText,
+    GeneratorSlug: "openai", SystemPromptID: sys.ID, UserTemplateID: usr.ID,
+})
+
+// Open a session.
+sess := &loom.Session{PlatformID: "user-123", State: loom.State{Modality: loom.ModalityText}}
+e.Sessions().Create(ctx, sess)
+
+// Run one step.
+step, err := e.RunStep(ctx, sess, loom.StepRequest{
+    AgentSlug: "assistant", // Version 0 => latest
+    Action: &loom.Action{Kind: loom.ActionFreeText, Payload: map[string]any{"text": "Hi!"}},
+    // Optional streaming: OnChunk: func(c loom.Chunk) { fmt.Print(c.Content) },
+})
+if err != nil { /* handle: see Errors section */ }
+
+fmt.Println(loom.ResultText(step.Result)) // helper; or step.Result.(*loom.TextResult).Content
+
+// helper used above:
+// func seedPrompt(ctx, e, slug string, kind loom.PromptKind, body string) (*loom.Prompt, error) {
+//     p := &loom.Prompt{Slug: slug, Version: 1, Kind: kind, Body: body}
+//     err := e.Prompts().Create(ctx, p); return p, err
+// }
+```
+
+User templates are Go `text/template`. Data available: `{{.Action.Payload.text}}` (free-text
+input), `{{.Vars.x}}` (session `State.Vars`), `{{.Inputs.x}}` (per-step inputs / a turn's
+lead output), `{{.Params.x}}` (tuning knobs), and a minimal `{{.Session}}` view
+(ID/PlatformID/Tags/State — NOT Metadata or History). `{{template}}`/`{{define}}` are rejected.
+
+## Actions (user input into a step)
+
+`loom.Action{Kind, Payload, Metadata}`. Kinds and typical payloads:
+- `loom.ActionFreeText` → `map[string]any{"text": "..."}`
+- `loom.ActionSelect`   → `map[string]any{"option_index": 0, "option_id": "..."}`
+- `loom.ActionSpatial`  → `map[string]any{"direction": "north"}`
+- `loom.ActionInventory`, `loom.ActionGesture`, `loom.ActionCustom` → app-defined
+The opening step of a session uses a nil Action.
+
+## Multi-agent turns (Flow + RunTurn)
+
+A turn runs a lead agent, then followers concurrently, feeding the lead's output to followers
+via `{{.Inputs.<OutputKey>}}`. Every step is persisted and tagged with one turn ID.
+
+```go
+flow := loom.Flow{
+    Slug: "chat-turn",
+    Lead: loom.FlowAgent{AgentSlug: "author", Stream: true, OutputKey: "Prose"},
+    Followers: []loom.FlowAgent{
+        {AgentSlug: "logician"}, // sees the lead via {{.Inputs.Prose}}
+        {AgentSlug: "sensory"},
+    },
+}
+turn, err := e.RunTurn(ctx, sess, loom.TurnRequest{
+    Flow:   flow,
+    Action: &loom.Action{Kind: loom.ActionFreeText, Payload: map[string]any{"text": "I open the door."}},
+    OnChunk: func(c loom.Chunk) { fmt.Print(c.Content) }, // streams the lead only
+})
+// err != nil means the LEAD failed. Follower results/failures:
+prose := loom.ResultText(turn.Lead.Result)
+logician := turn.Followers["logician"] // *Step, present only on success
+for slug, ferr := range turn.Errors {  // follower failures (never returned as err)
+    log.Printf("follower %s failed: %v", slug, ferr)
+}
+```
+
+## Generators (built-in + bring-your-own)
+
+Built-in adapters (each `New...` takes an API key + model unless noted):
+- `generator/openai`    → `openai.NewChatGenerator(key, model)`      — text, streaming
+- `generator/anthropic` → `anthropic.NewChatGenerator(key, model)`   — text, streaming
+- `generator/replicate` → `replicate.NewImageGenerator(key, model)`  — image, async
+- `generator/runway`    → `runway.NewVideoGenerator(key, model)`      — video, async
+- `generator/echo`      → `echo.New(prefix)`                          — text stub, no API key
+
+Register at construction (`Config.Generators`) or at runtime: `e.RegisterGenerator("slug", gen)`.
+An agent selects one by `Agent.GeneratorSlug`; a step can override with
+`StepRequest.GeneratorOverride`.
+
+### Custom generators — three flavors
+
+A generator is just an interface. Implement the flavor that fits your provider; the engine
+detects the optional ones at runtime.
+
+1) **Sync** (the minimum — implement `loom.Generator`):
+```go
+type MyGen struct{ client *myapi.Client }
+
+func (g *MyGen) Modality() loom.Modality { return loom.ModalityText }
+
+func (g *MyGen) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error) {
+    out, err := g.client.Complete(ctx, req.SystemPrompt, req.UserPrompt)
+    if err != nil { return nil, err } // engine wraps as *loom.GenerationError{Kind: Transport}
+    // NewTextResult(content, finishReason, inputTokens, outputTokens) — tokens feed cost tracking.
+    return loom.NewTextResult(out.Text, "stop", out.InTokens, out.OutTokens), nil
+}
+// Register: e.RegisterGenerator("my-llm", &MyGen{client: c})  // then Agent.GeneratorSlug = "my-llm"
+```
+`req` also exposes: `Params`/`ParamsMap` (tuning knobs), `Context` (prior results),
+`Overrides` (per-request routing e.g. per-user api_key/model), `ResponseFormat` (JSON schema
+when structured), `Bus` (cross-agent coordination inside a turn).
+
+2) **Streaming** (also implement `loom.StreamingGenerator`): add
+`GenerateStream(ctx, req) (<-chan loom.Chunk, <-chan loom.Result, error)`. The engine streams
+chunks to `StepRequest.OnChunk` and falls back to `Generate` when no streaming is requested.
+
+3) **Async** for slow image/video (also implement `loom.AsyncGenerator`):
+```go
+// Generate submits the job and returns a pending result; the engine's background poller
+// then calls Poll until it returns a terminal (ready/failed) result.
+var _ loom.AsyncGenerator = (*MyImageGen)(nil) // compile-time check you got the shape right
+
+func (g *MyImageGen) Modality() loom.Modality { return loom.ModalityImage }
+func (g *MyImageGen) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error) {
+    handle, _ := g.client.Submit(ctx, req.UserPrompt)
+    return loom.NewPendingResult(loom.ModalityImage, &loom.TaskHandle{Handle: handle}), nil
+}
+func (g *MyImageGen) Poll(ctx context.Context, h loom.TaskHandle) (loom.Result, error) {
+    // return a ready loom.NewImageResult(url, prompt, w, h), a failed result, or a still-pending
+    // loom.NewPendingResult(...) to be polled again.
+}
+```
+Enable polling via `Config.AsyncPoller` (Interval, Workers) and `e.StartPoller(ctx)`.
+
+## Error handling (typed — use errors.Is / errors.As)
+
+`RunStep` (and `RunTurn`'s lead) can return:
+- `loom.ErrSkip` — a pre-hook cancelled the step; check `loom.IsSkip(err)`. Not a failure.
+- `*loom.NotFoundError` — agent/prompt/session/etc. missing. Unwraps to `loom.ErrNotFound`, so
+  `errors.Is(err, loom.ErrNotFound)` works; `errors.As(err, &nf)` gives `nf.Kind` and `nf.Key`.
+- `loom.ErrGeneratorNotRegistered` — the agent's generator slug isn't registered.
+- `*loom.BudgetExceededError` — a configured budget blocked the step.
+- `*loom.GenerationError` — the provider failed; `errors.As(err, &ge)` then switch `ge.Kind`:
+  `loom.GenerationTransport` (network/stream — often retryable, `ge.Unwrap()` has the cause),
+  `loom.GenerationRejected` (provider refused, e.g. content policy — surface to user),
+  `loom.GenerationEmpty` (no result).
+- Other errors wrap the underlying hook/template/persistence failure.
+
+```go
+step, err := e.RunStep(ctx, sess, req)
+switch {
+case err == nil:
+    // ok
+case loom.IsSkip(err):
+    // step intentionally skipped
+case errors.Is(err, loom.ErrNotFound):
+    var nf *loom.NotFoundError; errors.As(err, &nf) // nf.Kind, nf.Key
+case errors.Is(err, loom.ErrGeneratorNotRegistered):
+    // config problem
+default:
+    var ge *loom.GenerationError
+    if errors.As(err, &ge) && ge.Kind == loom.GenerationTransport {
+        // safe to retry
+    }
+}
+```
+
+Config errors from `loom.New`: `errors.Is(err, loom.ErrInvalidConfig)`.
+
+## Hooks (validation / retries / filtering)
+
+```go
+// Pre-hook: skip a step under some condition.
+e.Hooks().RegisterPre("gate", func(ctx context.Context, req *loom.StepRequest) error {
+    if blocked { return loom.ErrSkip }
+    return nil
+})
+// Post-hook: ask the engine to retry with guidance.
+e.Hooks().RegisterPost("no-spoilers", func(ctx context.Context, req *loom.StepRequest, res loom.Result) (loom.Result, error) {
+    if strings.Contains(loom.ResultText(res), "THE KILLER IS") {
+        return nil, loom.ErrRetryWith(loom.RetryAnnotation{Reason: "do not reveal the killer"})
+    }
+    return res, nil
+})
+// Built-in: validate structured output against an agent's JSON schema and retry on violation.
+e.Hooks().RegisterPost("schema", loom.SchemaValidationPostHook())
+```
+On a retry error, `loom.RetryAnnotationFrom(err)` returns the annotation; schema failures
+populate `RetryAnnotation.Violations` (a structured `[]string`). Register hooks before running
+steps (registration is safe but do it at startup).
+
+## Cost tracking & budgets
+
+Every step records input/output tokens and USD (from a built-in pricing table). Query with
+`e.Cost().SessionUsage(ctx, sess.ID)`. Budgets enforce spend caps per platform key:
+
+```go
+e.Budgets().Create(ctx, &loom.Budget{
+    Name:     "user-daily",
+    Target:   loom.BudgetTarget{Kind: loom.TargetPlatformID, Key: "user-123"}, // only platform_id is enforced
+    Window:   loom.BudgetWindowDay,
+    Limit:    loom.BudgetLimit{USD: 0.50}, // USD/Tokens/Steps; 0 = no limit on that axis
+    OnExceed: loom.BudgetBlock,            // or BudgetDowngrade (to Agent.FallbackAgentID) / BudgetNotify
+    Active:   true,                        // required; an inactive budget is ignored
+})
+```
+Enforcement is best-effort (reads prior recorded spend, fails open on DB errors) — not a hard
+transactional ceiling. On block, `RunStep` returns `*loom.BudgetExceededError`.
+
+## Caching (optional, recommended for hot paths)
+
+Agents/prompts are immutable, so a read-through cache in front of the DB is safe:
+```go
+loom.New(loom.Config{ /* ... */ Cache: loom.NewInProcessCache(), CacheTTL: 24 * time.Hour })
+```
+`Cache` is an interface — back it with Redis/etc. `CacheTTL` 0 uses the 24h default. Nil Cache
+disables caching (every RunStep hits the DB).
+
+## Judges (LLM-as-judge scoring)
+
+`e.Judges()` provides rubric scoring, pairwise comparison, and binary constraints via an LLM.
+See `github.com/rhaqim/loom/judge` and the README for `ScoreRequest`/`PairwiseRequest`.
+
+## Sessions: branching & replay, GC
+
+- Fork at a step: `branch, _ := e.Sessions().Fork(ctx, sess.ID, stepIndex)` — parent untouched.
+- Inspect: `tree, _ := e.Sessions().BranchTree(ctx, rootID)`.
+- Stale/speculative/test branches are cleaned by the GC worker (`e.GC()`, configured via
+  `Config.BranchGC`; DryRun by default — nothing is deleted until you opt in).
+
+## Schema & migrations (IMPORTANT gotcha)
+
+`schema.NewLoader(dialect).Apply(ctx, db)` creates tables on a fresh DB and runs ordered
+migrations (recorded in a ledger) on an existing one. ALWAYS call it at startup; it is safe to
+re-run. If you upgrade loom and see an error like
+`column "..." of relation "loom_agents" does not exist`, your DB predates a migration — just
+run `Apply` again (or `loom-cli migrate`) to bring it up to date.
+
+CONTRIBUTOR NOTE (only if you modify loom's own `schema/loader.go`): a new baseline column MUST
+be paired with an `addColumnIfMissing` migration in `schema/migrations.go`, or existing
+databases break. `CREATE TABLE IF NOT EXISTS` never alters an existing table.
+
+## CLI (`loom-cli`)
+
+```
+loom-cli migrate                 # apply schema/migrations
+loom-cli seed seed.yaml          # seed prompts/agents from YAML
+loom-cli test plan.yaml          # run a YAML test plan (see harness package)
+```
+Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <string>`
+(the flag exposes credentials in `ps` — prefer the others).
+
+## Common tasks (recipes)
+
+- "Add a provider loom doesn't ship" → implement `loom.Generator` (see Custom generators), then
+  `e.RegisterGenerator("slug", gen)` and set `Agent.GeneratorSlug = "slug"`.
+- "Per-user API keys / model routing" → pass `StepRequest.Overrides{"api_key":..., "model":...}`
+  and read them in a custom generator; built-in openai/anthropic honor `Overrides["base_url"]`
+  ONLY if the URL is allowlisted via `WithAllowedBaseURLs(...)` (security: prevents key exfil).
+- "Force JSON output" → attach a `ResponseFormat` (via a reusable `ResponseFormatRecord` or an
+  inline schema on the agent) and register `loom.SchemaValidationPostHook()`.
+- "Stream to a client" → set `StepRequest.OnChunk` (or `TurnRequest.OnChunk` for a turn's lead).
+- "Test without API keys" → use `generator/echo`.
+
+## Things NOT to do
+
+- Do not import `github.com/rhaqim/loom/internal/...` (won't compile from your module).
+- Do not skip `schema.Apply` — you'll get missing-table/column errors.
+- Do not string-match error messages — use the typed errors above.
+- Do not mutate a returned Agent/Prompt and expect it to persist — create a new version instead.
+- Do not set `StepRequest.Overrides["base_url"]` expecting built-in openai/anthropic to honor it
+  unless the operator allowlisted that URL (security guard).
+
+## Where to look next
+
+- `README.md` — narrative docs and feature table.
+- `examples/story` (minimal), `examples/dnd` (full game), `examples/storyapi` (HTTP API with
+  auth), `examples/conexus-loom` (multi-agent multimodal, runs with no API keys).
+- `go doc github.com/rhaqim/loom` — full API with per-symbol docs; `aliases.go` lists the whole
+  public surface grouped by domain.
+
+################################################################################
+# COMPLETE API REFERENCE  (generated — do not edit; regenerate with: make llms-full)
+################################################################################
+
+The types below are shown from the implementation package `engine`. Each is
+re-exported under the SAME name in `github.com/rhaqim/loom` — e.g.
+`engine.Session` is `loom.Session`, `engine.RunStep` is a method on
+`loom.Engine`. In your code always use the `loom.` prefix and import only
+`github.com/rhaqim/loom` (plus the subpackages shown further below). Never
+import internal/engine directly.
+
+################################################################################
+# github.com/rhaqim/loom  (use these under the loom. prefix)
+################################################################################
+
+package engine // import "github.com/rhaqim/loom/internal/engine"
+
+Package engine is the internal implementation of the loom procgen engine:
+the Engine hub, its registry services, step/turn execution, hooks, cost and
+budget tracking, branch/replay, the async poller, and SQL persistence.
+
+It sits behind the module's internal/ boundary — external modules cannot import
+it. The public, stable surface is the root package github.com/rhaqim/loom,
+which re-exports the types and constructors here via type aliases. Application
+code should depend on that facade, never on this package directly.
+
+CONSTANTS
+
+const TargetPlatformID = "platform_id"
+    TargetPlatformID is the BudgetTarget.Kind for per-user budgets.
+
+const TopicAll = "*"
+    TopicAll subscribes to every topic.
+
+
+VARIABLES
+
+var ErrDuplicateSlug = errors.New("loom: duplicate slug+version")
+    ErrDuplicateSlug is returned when an agent or prompt slug+version already
+    exists.
+
+var ErrGeneratorNotRegistered = errors.New("loom: generator not registered")
+    ErrGeneratorNotRegistered is returned when a step references a generator
+    slug that was never registered with the engine. Wrapped errors name the
+    slug.
+
+var ErrInvalidConfig = errors.New("loom: invalid config")
+    ErrInvalidConfig is returned by New when the Config is missing a required
+    field or is otherwise unusable. Wrapped errors carry the specific reason.
+
+var ErrNotFound = errors.New("loom: not found")
+    ErrNotFound is returned when a requested entity does not exist. Errors from
+    the registries (Agents/Prompts/Sessions/Budgets/ResponseFormats) unwrap to
+    it, so errors.Is(err, ErrNotFound) is the portable "does not exist" check;
+    use errors.As with *NotFoundError to learn which entity and key were
+    missing.
+
+var ErrSessionConflict = errors.New("loom: session update conflict")
+    ErrSessionConflict is returned by Session update when the row's version
+    no longer matches the in-memory copy — another writer updated it first,
+    so this write would clobber theirs (optimistic-concurrency conflict).
+
+var ErrSkip = skipError{reason: "step cancelled by pre-hook"}
+    ErrSkip cancels the current step when returned from a pre-hook.
+
+
+FUNCTIONS
+
+func ErrRetryScored(ann RetryAnnotation, score int, draft Result) error
+    ErrRetryScored is ErrRetryWith plus a score for the rejected draft and the
+    draft itself, for RetryKeepBest steps: the engine keeps the lowest-scoring
+    draft across attempts rather than failing on exhaustion. A non-positive
+    score with a non-nil draft signals acceptance (keep it and stop retrying).
+
+func ErrRetryWith(ann RetryAnnotation) error
+    ErrRetryWith constructs a RetryError with the given annotation.
+
+func GeneratorCompleter(g Generator) judge.Completer
+    GeneratorCompleter adapts a text Generator to judge.Completer so engine
+    generators can back real judges. The generator must return a TextResult.
+
+func IsRetry(err error) bool
+    IsRetry reports whether err is a RetryError.
+
+func IsSkip(err error) bool
+    IsSkip reports whether err signals a skip.
+
+func MarshalResult(r Result) ([]byte, error)
+    MarshalResult serialises a Result to JSON for storage.
+
+func NewBranchGCWorker(e *Engine, cfg BranchGCConfig) *loomgc.Worker
+    NewBranchGCWorker creates a branch GC worker using the engine's DB
+    connection. The DB dialect is always sourced from the engine — it is a
+    property of the connection, not a caller choice.
+
+func NewLLMConstraintJudge(slug string, g Generator) *judge.LLMConstraintJudge
+    NewLLMConstraintJudge builds a constraint judge backed by a text generator.
+
+func NewLLMPairwiseJudge(slug string, g Generator) *judge.LLMPairwiseJudge
+    NewLLMPairwiseJudge builds a pairwise judge backed by a text generator.
+
+func NewLLMRubricJudge(slug string, g Generator) *judge.LLMRubricJudge
+    NewLLMRubricJudge builds a rubric judge backed by a text generator.
+
+func ResultModel(r Result) string
+    ResultModel returns the model id a generator reported on a result's
+    metadata, or "" if none.
+
+func ResultText(r Result) string
+    ResultText extracts the primary text payload from a Result for prompt
+    injection, returning "" for modalities without a natural text form.
+
+func ValidateJSONSchema(schema map[string]any, value any) []string
+    ValidateJSONSchema validates value against a JSON Schema (the common LLM
+    subset) and returns a list of human-readable violations ("" path = root).
+
+
+TYPES
+
+type Action struct {
+	ID       uuid.UUID
+	Kind     ActionKind
+	Payload  any // typed per Kind: Selection, FreeText, Spatial, etc.
+	Metadata map[string]any
+}
+    Action is the discriminator's structured human-guidance input for a step.
+
+type ActionInterpreter interface {
+	Interpret(ctx context.Context, raw RawInput, session *Session) (Action, error)
+}
+    ActionInterpreter converts raw platform input to a structured Action.
+    The platform supplies this; the engine uses it internally during RunStep.
+
+type ActionKind string
+    ActionKind discriminates the shape of an Action's payload.
+
+const (
+	ActionSelect    ActionKind = "select"
+	ActionFreeText  ActionKind = "free_text"
+	ActionSpatial   ActionKind = "spatial"
+	ActionInventory ActionKind = "inventory"
+	ActionGesture   ActionKind = "gesture"
+	ActionCustom    ActionKind = "custom"
+)
+type ActionTemplate struct {
+	ID          uuid.UUID
+	Kind        ActionKind
+	Label       string // user-facing wording
+	Detail      string // longer description
+	Payload     any    // pre-filled fields
+	Constraints any    // e.g. "must be a direction in {N, E, S, W}"
+	Ordering    int
+}
+    ActionTemplate describes an action the engine offers back to the platform.
+
+type Agent struct {
+	ID             uuid.UUID
+	Slug           string    // human-readable identifier
+	Owner          string    // opaque app-owned scope ("" = global); reserved for future per-tenant use
+	Version        int       // monotonically increasing
+	Category       string    // platform-defined grouping
+	Modal          Modality  // the modality this agent produces
+	GeneratorSlug  string    // references a registered Generator
+	SystemPromptID uuid.UUID // FK → loom_prompts (system)
+	UserTemplateID uuid.UUID // FK → loom_prompts (user_template)
+	// ResponseFormatID references a reusable response-format record
+	// (loom_response_formats). When set it is the agent's output contract and is
+	// shared across agents/versions. A nil ID falls back to the inline
+	// ResponseFormat below (ad-hoc, copied per agent).
+	ResponseFormatID *uuid.UUID
+	ResponseFormat   *ResponseFormat
+	Params           GenerateParams
+	FallbackAgentID  *uuid.UUID // used when budget action = downgrade
+	CreatedAt        time.Time
+}
+    Agent is a configuration bundling a Generator, system prompt, user template,
+    response format, and generation params. It is the unit the platform spawns.
+
+type AgentCostStats struct {
+	USDMean   float64
+	USDP50    float64
+	USDP95    float64
+	TokensP50 int
+	TokensP95 int
+}
+    AgentCostStats holds statistical cost data for an agent.
+
+type AgentRegistry interface {
+	// Get retrieves a specific version. Version 0 resolves to LATEST. A missing
+	// agent returns *NotFoundError (which unwraps to ErrNotFound).
+	Get(ctx context.Context, slug string, version int) (*Agent, error)
+	// Latest resolves the highest version of slug.
+	Latest(ctx context.Context, slug string) (*Agent, error)
+	// Create persists a new agent version.
+	Create(ctx context.Context, a *Agent) error
+	// List returns all agents matching optional category filter.
+	List(ctx context.Context, category string) ([]*Agent, error)
+	// Delete removes a specific agent version (>= 1). On Postgres it fails if the
+	// version is still referenced (e.g. by persisted steps, ON DELETE RESTRICT).
+	Delete(ctx context.Context, slug string, version int) error
+}
+    AgentRegistry resolves and manages agents.
+
+type AgentUsage struct {
+	AgentSlug    string
+	AgentVersion int
+	RunCount     int
+	USDTotal     float64
+}
+    AgentUsage is a per-agent cost breakdown entry.
+
+type AsyncGenerator interface {
+	Generator
+	Poll(ctx context.Context, handle TaskHandle) (Result, error)
+}
+    AsyncGenerator extends Generator for providers whose jobs complete out of
+    band (typically image/video). Generate should submit the job and return
+    a pending Result (see NewPendingResult) carrying the external handle; the
+    engine's background poller then calls Poll on an interval until it returns
+    a terminal (ready or failed) Result. Return a still-pending Result to be
+    polled again, or an error to have the attempt counted toward the poll cap.
+    Enable the poller via Config.AsyncPoller.
+
+type AudioResult struct {
+	URL         string
+	DurationSec float64
+	Format      string
+	// Has unexported fields.
+}
+    AudioResult is the output from an audio-modality generator.
+
+func NewAudioResult(url, format string, durationSec float64) *AudioResult
+    NewAudioResult creates a ready AudioResult. url is the remote URL or
+    data URI of the audio file. format is the MIME type or extension (e.g.
+    "audio/mpeg", "mp3"). durationSec is the audio length in seconds.
+
+func (r *AudioResult) Metadata() map[string]any
+
+func (r *AudioResult) Modality() Modality
+
+func (r *AudioResult) ResultID() uuid.UUID
+
+func (r *AudioResult) Status() ResultStatus
+
+func (r *AudioResult) TaskHandle() *TaskHandle
+
+type BranchGCConfig = loomgc.Config
+    BranchGCConfig is a re-export of gc.Config for callers who import only loom.
+
+func DefaultBranchGCConfig() BranchGCConfig
+    DefaultBranchGCConfig returns sensible production GC defaults.
+
+type BranchNode struct {
+	Session  *Session
+	Children []*BranchNode
+}
+    BranchNode represents a node in the session branch tree.
+
+type Budget struct {
+	ID          uuid.UUID
+	Name        string
+	Target      BudgetTarget
+	Window      BudgetWindow
+	Limit       BudgetLimit
+	OnExceed    BudgetAction
+	TagsInclude []string
+	TagsExclude []string
+	Active      bool
+	CreatedAt   time.Time
+}
+    Budget defines a (target, window, limit) spending triple.
+
+type BudgetAction string
+    BudgetAction is what happens when a budget is exceeded.
+
+const (
+	BudgetBlock     BudgetAction = "block"
+	BudgetDowngrade BudgetAction = "downgrade"
+	BudgetNotify    BudgetAction = "notify"
+)
+type BudgetExceededError struct {
+	BudgetName  string
+	Window      string
+	UsedUSD     float64
+	LimitUSD    float64
+	UsedTokens  int
+	LimitTokens int
+	ResetsAt    time.Time
+	Suggestion  string
+}
+    BudgetExceededError is returned when a step would exceed a configured
+    budget.
+
+func (e *BudgetExceededError) Error() string
+
+type BudgetLimit struct {
+	USD    float64 // 0 = no USD limit
+	Tokens int     // 0 = no token limit
+	Steps  int     // 0 = no step limit
+}
+    BudgetLimit constrains usage by USD, tokens, and/or step count.
+
+type BudgetManager interface {
+	// Create persists a new budget.
+	Create(ctx context.Context, b *Budget) error
+	// Get retrieves a budget by ID.
+	Get(ctx context.Context, id uuid.UUID) (*Budget, error)
+	// List returns all budgets matching the given target.
+	List(ctx context.Context, targetKind, targetKey string) ([]*Budget, error)
+	// Delete removes a budget.
+	Delete(ctx context.Context, id uuid.UUID) error
+}
+    BudgetManager is the public interface returned by Engine.Budgets().
+
+type BudgetTarget struct {
+	Kind string // currently only "platform_id" is enforced
+	Key  string
+}
+    BudgetTarget identifies the entity a budget applies to. Only Kind ==
+    TargetPlatformID is currently enforced; Create rejects other kinds.
+
+type BudgetWindow string
+    BudgetWindow is the rolling time window for a budget.
+
+const (
+	BudgetWindowHour     BudgetWindow = "hour"
+	BudgetWindowDay      BudgetWindow = "day"
+	BudgetWindowWeek     BudgetWindow = "week"
+	BudgetWindowMonth    BudgetWindow = "month"
+	BudgetWindowLifetime BudgetWindow = "lifetime"
+)
+type Bus interface {
+	// Publish sends data on a topic to all current and future subscribers.
+	Publish(from, topic string, data any)
+	// Subscribe returns a channel delivering every message on topic — first the
+	// replay backlog (in order), then live messages — until the turn ends, when
+	// the channel is closed. Pass "*" (TopicAll) to receive every topic.
+	Subscribe(topic string) <-chan Message
+	// Messages returns a snapshot of everything published so far.
+	Messages() []Message
+}
+    Bus is the cross-agent channel fabric for a single turn.
+
+type Cache interface {
+	// Get retrieves a cached value. The second return is false on a cache miss.
+	Get(ctx context.Context, key string) ([]byte, bool)
+	// Set stores a value. Implementations may ignore ttl if not supported.
+	Set(ctx context.Context, key string, value []byte, ttl time.Duration)
+	// Delete removes a key. Used when an entry is explicitly evicted.
+	Delete(ctx context.Context, key string)
+}
+    Cache is a read-through cache for immutable engine objects (agents,
+    prompts).
+
+    Agents and prompts are addressed by slug+version and never mutated after
+    creation, so they are safe to cache indefinitely. The cache sits in front of
+    the database on every RunStep hot-path.
+
+    Implement this interface with any backend you already use:
+      - In-process: use NewInProcessCache() (built-in, no dependencies)
+      - Redis: wrap go-redis or redigo
+      - Memcached: wrap gomemcache
+      - Ristretto / BigCache: wrap the client
+
+    A nil Cache in Config disables caching (the default).
+
+type CheckRequest = judge.CheckRequest
+    CheckRequest is the input to ConstraintJudge.Check.
+
+type Chunk struct {
+	Content string
+	Tokens  int // tokens in this chunk (provider-dependent, may be 0)
+}
+    Chunk carries a partial text fragment from a streaming generator.
+
+type CompareRequest = judge.CompareRequest
+    CompareRequest is the input to PairwiseJudge.Compare.
+
+type Completer = judge.Completer
+    Completer is the narrow text-generation capability the LLM-backed judges
+    need.
+
+type Config struct {
+	// DB is a configured *sql.DB connection. Required.
+	DB *sql.DB
+	// Dialect of the DB. Required.
+	Dialect Dialect
+	// SchemaPrefix is prepended to every engine table name (default: "loom_").
+	SchemaPrefix string
+	// Generators maps slug → Generator. Populated at startup.
+	Generators map[string]Generator
+	// AsyncPoller configures the background task-poller for video/image providers.
+	AsyncPoller PollerConfig
+	// Logger receives structured log lines from the engine (optional).
+	Logger Logger
+	// MaxRetries is the default retry cap for post-hooks (default: 3).
+	MaxRetries int
+	// Cache is an optional read-through cache for immutable engine objects
+	// (agents, prompts). Use NewInProcessCache() for a zero-dependency in-process
+	// cache, or supply any implementation of the Cache interface (Redis, etc.).
+	// A nil Cache disables caching — every RunStep hits the database directly.
+	Cache Cache
+	// CacheTTL is how long cached immutable objects (agents, prompts) live.
+	// Zero uses the default (24h). Since these records are versioned and never
+	// mutated, a long TTL is safe; set a shorter one only if your cache backend
+	// requires eviction.
+	CacheTTL time.Duration
+	// Pricing maps model id → per-million-token price for accurate cost tracking.
+	// Generators report their model on Result metadata ("model"); a model not in
+	// the table falls back to DefaultPrice. Nil disables per-model pricing (the
+	// flat default applies).
+	Pricing map[string]ModelPrice
+	// DefaultPrice is used for models absent from Pricing (default: $1/$3 per 1M).
+	DefaultPrice *ModelPrice
+	// BranchGC configures the branch garbage collector used by Engine.GC().
+	// Nil uses safe defaults (DryRun=true, so nothing is deleted); set an explicit
+	// config with DryRun=false to actually sweep. The Dialect is filled in from
+	// Config.Dialect automatically.
+	BranchGC *BranchGCConfig
+	// PromptFileRoot enables file-backed prompts (PromptRef.File / PromptFromFile),
+	// confined to this directory. It is empty by default, which DISABLES file
+	// loading entirely: an unconfined os.ReadFile of a caller-supplied path is an
+	// arbitrary-file-read primitive that exfiltrates the file's contents to the
+	// LLM. When set, a PromptRef.File must resolve (after symlink evaluation) to a
+	// path inside this root, or the read is rejected.
+	PromptFileRoot string
+}
+    Config is the top-level engine configuration.
+
+type ConstraintJudge = judge.ConstraintJudge
+    ConstraintJudge checks whether an output satisfies a stated rule.
+
+type ConstraintVerdict = judge.ConstraintVerdict
+    ConstraintVerdict is the output of ConstraintJudge.Check.
+
+type CostEstimate struct {
+	USDLow                float64
+	USDHigh               float64
+	InputTokens           int
+	OutputTokensEstimated int
+}
+    CostEstimate is the output of Cost().Estimate().
+
+type CostManager interface {
+	// SessionUsage returns aggregated cost for a single session.
+	SessionUsage(ctx context.Context, sessionID uuid.UUID) (*UsageSummary, error)
+	// Usage returns aggregated cost for a target over a time window.
+	Usage(ctx context.Context, q UsageQuery) (*UsageSummary, error)
+	// ByAgent returns per-agent cost breakdown.
+	ByAgent(ctx context.Context, q UsageQuery) ([]AgentUsage, error)
+	// AgentStats returns p50/p95 cost stats for a single agent.
+	AgentStats(ctx context.Context, agentID uuid.UUID, window time.Duration) (*AgentCostStats, error)
+	// Estimate returns a pre-flight cost estimate for a step request.
+	Estimate(ctx context.Context, req EstimateRequest) (*CostEstimate, error)
+	// Record persists a cost record.
+	Record(ctx context.Context, rec CostRecord) error
+}
+    CostManager is the public interface returned by Engine.Cost().
+
+type CostRecord struct {
+	Provider     string
+	Model        string
+	Modal        Modality
+	InputTokens  int
+	OutputTokens int
+	Images       int
+	DurationSec  float64
+	USDCost      float64
+	Estimated    bool
+	StepID       uuid.UUID
+	AgentID      uuid.UUID
+	SessionID    uuid.UUID
+	PlatformID   string
+	Tags         []string
+	Timestamp    time.Time
+}
+    CostRecord is a lightweight view of a cost entry used in callbacks. The full
+    type lives in the cost sub-package; this alias avoids an import cycle.
+
+type Dialect string
+    Dialect identifies the database flavour for the schema loader.
+
+const (
+	DialectPostgres Dialect = "postgres"
+	DialectSQLite   Dialect = "sqlite"
+)
+type Engine struct {
+	// Has unexported fields.
+}
+    Engine is the central object applications interact with.
+
+func New(cfg Config) (*Engine, error)
+    New creates and initialises a Loom engine from the given Config. It does NOT
+    run schema migrations — call NewSchemaLoader(dialect).Apply(ctx, db) first.
+
+func (e *Engine) Agents() AgentRegistry
+    Agents returns the agent registry.
+
+func (e *Engine) Budgets() BudgetManager
+    Budgets returns the budget manager.
+
+func (e *Engine) Cost() CostManager
+    Cost returns the cost manager.
+
+func (e *Engine) Flows() FlowRegistry
+    Flows returns the persisted-flow (agent map) registry.
+
+func (e *Engine) GC() GCService
+    GC returns the branch garbage collection service.
+
+func (e *Engine) Hooks() HookBus
+    Hooks returns the engine's hook bus for registering pre/post processors.
+
+func (e *Engine) Judges() JudgeRegistry
+    Judges returns the judge registry.
+
+func (e *Engine) OnTaskResolved(fn func(context.Context, TaskResolution))
+    OnTaskResolved registers a callback fired when an async task resolves —
+    ready or terminally failed. It runs in the poller goroutine, so it must
+    be fast and non-blocking; offload real work. Only one callback is held;
+    a later call replaces it. Embedders use this to write a resolved asset into
+    their own tables without reaching into loom's internal task tables.
+
+func (e *Engine) PriceResult(model string, inputTokens, outputTokens int) float64
+    PriceResult returns the USD cost for a result's token usage under the
+    model's configured pricing. model is the generator's reported model id (""
+    uses the default price). Exposed so applications can compute per-turn spend
+    consistently with what the engine records.
+
+func (e *Engine) Prompts() PromptRegistry
+    Prompts returns the prompt registry.
+
+func (e *Engine) RegisterGenerator(slug string, g Generator)
+    RegisterGenerator adds or replaces a generator under a slug at runtime.
+    This is how a platform extends into a new modality — register a video or
+    world (3-D/AR) generator and reference it from an agent; no other engine
+    change is needed.
+
+func (e *Engine) ResponseFormats() ResponseFormatRegistry
+    ResponseFormats returns the response-format registry.
+
+func (e *Engine) RunStep(ctx context.Context, session *Session, req StepRequest) (*Step, error)
+    RunStep executes one step of the generation loop against session.
+    It resolves the agent, renders the user template, runs pre-hooks, calls the
+    generator, runs post-hooks, persists the step, and returns it.
+
+    Errors (match with errors.Is / errors.As):
+      - ErrSkip — a pre-hook cancelled the step (use IsSkip); not a failure.
+      - *NotFoundError (unwraps to ErrNotFound) — the agent slug/version,
+        or a referenced prompt/response-format, does not exist.
+      - ErrGeneratorNotRegistered — the agent's generator slug is not
+        registered.
+      - *BudgetExceededError — a configured budget blocked the step.
+      - *GenerationError — the generator failed; switch on Kind (transport /
+        rejected / empty).
+      - otherwise, a wrapped error from a hook, template render, or persistence.
+
+func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest) (*Turn, error)
+    RunTurn executes a Flow against a session: it runs the lead agent
+    (optionally streaming), injects the lead's text output into the shared
+    Inputs, then runs all follower agents concurrently. Every resulting step
+    is persisted and tagged with the same turn ID. A follower failure does
+    not abort the turn — its error is recorded on the Turn but siblings still
+    complete.
+
+    A non-nil error means the lead step failed; it is the lead's RunStep error
+    (see RunStep for the error contract) wrapped with the turn and agent slug.
+    Follower failures are never returned here — inspect Turn.Errors (keyed by
+    agent slug) for those.
+
+func (e *Engine) RunTurnBySlug(ctx context.Context, session *Session, owner, slug string, version int, req TurnRequest) (*Turn, error)
+    RunTurnBySlug loads a persisted flow (owner/slug/version; version 0 =
+    latest) and executes it as a turn, exactly like RunTurn on an in-code Flow.
+    The caller's TurnRequest fields (Action, OnChunk, Inputs, Overrides, Params)
+    are honoured; req.Flow is replaced by the loaded flow.
+
+func (e *Engine) Sessions() SessionRegistry
+    Sessions returns the session registry.
+
+func (e *Engine) StartPoller(ctx context.Context)
+    StartPoller starts the background async-result poller. It is a no-op if
+    AsyncPoller.Workers == 0 in the config.
+
+func (e *Engine) TaskStatus(ctx context.Context, taskID uuid.UUID) (string, Result, error)
+    TaskStatus reports a task's status ("pending", "ready", or "failed") and,
+    when ready, its resolved result. It lets an embedder check on an async job
+    without querying loom's internal tables. Returns ErrNotFound when no such
+    task exists.
+
+type EstimateRequest struct {
+	AgentID uuid.UUID
+	Input   string
+	Modal   Modality
+}
+    EstimateRequest is the input to Cost().Estimate().
+
+type Flow struct {
+	Slug      string
+	Lead      FlowAgent
+	Followers []FlowAgent
+}
+    Flow declares a turn as a lead agent plus parallel followers.
+
+type FlowAgent struct {
+	// AgentSlug + AgentVersion address a registered agent (version 0 = latest).
+	AgentSlug    string
+	AgentVersion int
+	// Stream, on the lead agent only, routes streaming chunks to TurnRequest.OnChunk.
+	Stream bool
+	// OutputKey is the key under which this agent's text output is exposed to
+	// later agents in the same turn via {{.Inputs.<OutputKey>}}. For the lead it
+	// defaults to "Lead"; for followers it is optional.
+	OutputKey string
+	// Overrides is opaque per-call data forwarded to the generator (e.g. a
+	// per-user api key / model). Optional.
+	Overrides map[string]any
+	// GeneratorOverride routes this agent's call to a different registered
+	// generator for this turn only. Optional.
+	GeneratorOverride string
+	// Params are this agent's tuning knobs (model + domain), merged over the
+	// turn's Params. See StepRequest.Params.
+	Params map[string]any
+	// RetryMode and MaxRetries override the engine retry defaults for this
+	// agent's step (e.g. a keep-best lead, a discard follower). Zero values
+	// inherit the engine default.
+	RetryMode  RetryMode
+	MaxRetries int
+	// SystemPrompt, when non-zero, is this agent's per-turn system prompt
+	// override (typically PromptRef{Literal: ...} assembled by the embedder).
+	// The zero value leaves the agent's registered system prompt in place.
+	SystemPrompt PromptRef
+	// Inputs are merged over the turn's shared Inputs for this agent only, so
+	// each agent can receive its own user_prompt / values while still seeing the
+	// lead's output. Nil leaves the shared Inputs untouched.
+	Inputs map[string]any
+}
+    FlowAgent is one agent participating in a turn.
+
+type FlowAgentEntry struct {
+	Position          int
+	AgentSlug         string
+	AgentVersion      int
+	OutputKey         string
+	Stream            bool
+	GeneratorOverride string
+	Params            map[string]any
+}
+    FlowAgentEntry is one agent's slot in a persisted flow.
+
+type FlowRecord struct {
+	ID        uuid.UUID
+	Owner     string // opaque app-owned scope; "" = global
+	Slug      string
+	Version   int
+	Category  string
+	IsActive  bool
+	Agents    []FlowAgentEntry // ordered; index 0 is the lead
+	CreatedAt time.Time
+}
+    FlowRecord is a persisted, versioned agent map.
+
+func (r *FlowRecord) Flow() Flow
+    Flow builds the runtime Flow from the record: the first entry is the lead,
+    the rest are followers, preserving order.
+
+type FlowRegistry interface {
+	Create(ctx context.Context, r *FlowRecord) error
+	Get(ctx context.Context, owner, slug string, version int) (*FlowRecord, error)
+	Latest(ctx context.Context, owner, slug string) (*FlowRecord, error)
+	// List returns flows for an owner (optional category filter) WITHOUT their
+	// agent entries — a lightweight index for an editor.
+	List(ctx context.Context, owner, category string) ([]*FlowRecord, error)
+	Delete(ctx context.Context, owner, slug string, version int) error
+}
+    FlowRegistry resolves and manages persisted flows (agent maps). owner is an
+    opaque scope ("" = global). On Get/Latest, version 0 resolves to the latest
+    version; Create and Delete require an explicit version >= 1. Edits create a
+    new version (like agents/prompts); Delete removes a specific version.
+
+type FreeText struct {
+	Body string
+}
+    FreeText is the payload for ActionFreeText — a user-typed string.
+
+type GCService interface {
+	// Run starts the periodic GC sweep. Blocking; run in a goroutine.
+	Run(ctx context.Context)
+	// DryRun returns what the next sweep would delete without acting.
+	DryRun(ctx context.Context) (*SweepReport, error)
+}
+    GCService is the public interface returned by Engine.GC().
+
+type GenerateParams struct {
+	Temperature      float64
+	MaxTokens        int
+	TopP             float64
+	FrequencyPenalty float64
+	PresencePenalty  float64
+	Seed             int
+	// Image / video specific
+	Width       int
+	Height      int
+	DurationSec float64
+	// Extra provider-specific params (merged last)
+	Extra map[string]any
+}
+    GenerateParams holds per-call tuning knobs for the generator.
+
+type GenerateRequest struct {
+	SystemPrompt   string
+	UserPrompt     string
+	Params         GenerateParams
+	ResponseFormat *ResponseFormat // nil unless ModalityStructured
+	Context        []Result        // prior modality results for continuity
+	SessionID      uuid.UUID
+	AgentID        uuid.UUID
+	Annotations    []RetryAnnotation // retry hints from post-hooks
+	Inputs         map[string]any    // per-step inputs (e.g. a turn's lead-agent output)
+	Overrides      map[string]any    // per-request provider overrides (api key, model, …)
+	// ParamsMap carries free-form tuning knobs as a map — both model params
+	// (temperature, max_tokens, top_p, seed, …, which the engine also folds into
+	// the typed Params above) and domain params (e.g. tension). Generators read
+	// whatever keys they understand.
+	ParamsMap map[string]any
+	// Bus is the per-turn cross-agent communication fabric (nil outside a turn).
+	// Generators may Publish/Subscribe to coordinate with sibling agents.
+	Bus Bus
+}
+    GenerateRequest is the input to a Generator.
+
+type GenerationError struct {
+	Kind     GenerationErrorKind
+	Provider string // generator slug, when known
+	Message  string // provider-supplied detail, when any
+	Err      error  // underlying transport error, when any
+}
+    GenerationError is returned when a generator fails to produce a usable
+    result. Inspect it with errors.As(err, &loom.GenerationError{}) and switch
+    on Kind.
+
+func (e *GenerationError) Error() string
+
+func (e *GenerationError) Unwrap() error
+
+type GenerationErrorKind string
+    GenerationErrorKind classifies why a generator failed to produce a result,
+    so applications can react differently (e.g. retry transport failures but
+    surface provider rejections to the user).
+
+const (
+	// GenerationTransport is a network, stream, or context failure reaching or
+	// reading from the provider. The underlying error is available via Unwrap.
+	GenerationTransport GenerationErrorKind = "transport"
+	// GenerationRejected means the provider ran but returned a failed result
+	// (content policy, safety refusal, provider-side error).
+	GenerationRejected GenerationErrorKind = "rejected"
+	// GenerationEmpty means the provider returned no usable result.
+	GenerationEmpty GenerationErrorKind = "empty"
+)
+type Generator interface {
+	Modality() Modality
+	Generate(ctx context.Context, req GenerateRequest) (Result, error)
+}
+    Generator produces a Result from a GenerateRequest. One per
+    modality+provider.
+
+    A generator comes in one of three flavors — implement the interface(s) that
+    fit your provider; the engine detects the optional ones at runtime:
+
+      - Sync (this interface): Generate returns the finished Result. This is the
+        minimum; every generator implements it. Register with Config.Generators
+        or Engine.RegisterGenerator and point an agent at it by slug.
+      - Streaming (also implement StreamingGenerator): the engine streams chunks
+        to StepRequest.OnChunk when a caller asks for streaming, and falls back
+        to Generate otherwise.
+      - Async (also implement AsyncGenerator): Generate returns a pending Result
+        (NewPendingResult) referencing an external job; the engine's background
+        poller then calls Poll until the job resolves. Used for slow image/video
+        providers (see generator/replicate and generator/runway).
+
+type Gesture struct {
+	Kind string  // "click", "tap", "drag"
+	X    float64 // start or absolute x
+	Y    float64 // start or absolute y
+	DX   float64 // delta x (drag only)
+	DY   float64 // delta y (drag only)
+}
+    Gesture is the payload for ActionGesture — pointer or touch input.
+
+type HookBus interface {
+	// RegisterPre adds a named pre-hook. Hooks run in registration order.
+	RegisterPre(name string, h PreHook)
+	// RegisterPost adds a named post-hook. Hooks run in registration order.
+	RegisterPost(name string, h PostHook)
+	// RunPre executes all registered pre-hooks in order.
+	// Returns the first non-nil error; ErrSkip propagates as-is.
+	RunPre(ctx context.Context, req *StepRequest) error
+	// RunPost executes all registered post-hooks in order.
+	// A RetryError from any hook propagates immediately; the result at that
+	// point is discarded and the step runner retries the agent call.
+	RunPost(ctx context.Context, req *StepRequest, res Result) (Result, error)
+	// Names returns registered hook names in order, separated by kind.
+	PreNames() []string
+	PostNames() []string
+}
+    HookBus manages pre- and post-hook registration.
+
+type ImageResult struct {
+	URL    string // remote URL, data URI, or blob reference
+	Width  int
+	Height int
+	Prompt string
+	// Has unexported fields.
+}
+    ImageResult is the output from an image-modality generator.
+
+func NewImageResult(url, prompt string, width, height int) *ImageResult
+    NewImageResult creates a ready ImageResult.
+
+func (r *ImageResult) Metadata() map[string]any
+
+func (r *ImageResult) Modality() Modality
+
+func (r *ImageResult) ResultID() uuid.UUID
+
+func (r *ImageResult) Status() ResultStatus
+
+func (r *ImageResult) TaskHandle() *TaskHandle
+
+type InProcessCache struct {
+	// Has unexported fields.
+}
+    InProcessCache is a lightweight in-process cache backed by a sync.Map.
+    It supports optional TTL-based expiry, checked lazily on Get. Suitable for
+    single-instance deployments or integration testing.
+
+func NewInProcessCache() *InProcessCache
+    NewInProcessCache returns a ready-to-use InProcessCache.
+
+func (c *InProcessCache) Delete(_ context.Context, key string)
+
+func (c *InProcessCache) Get(_ context.Context, key string) ([]byte, bool)
+
+func (c *InProcessCache) Set(_ context.Context, key string, value []byte, ttl time.Duration)
+
+type InventoryChoice struct {
+	ItemID   string
+	ItemName string
+}
+    InventoryChoice is the payload for ActionInventory — selecting an item.
+
+type Judge = judge.Judge
+    Judge is the base interface all judges implement.
+
+type JudgeRegistry interface {
+	// Rubric returns a RubricJudge by slug.
+	Rubric(slug string) RubricJudge
+	// Pairwise returns a PairwiseJudge by slug.
+	Pairwise(slug string) PairwiseJudge
+	// Constraint returns a ConstraintJudge by slug.
+	Constraint(slug string) ConstraintJudge
+	// Register registers a judge under a slug.
+	Register(slug string, j Judge)
+}
+
+type Logger interface {
+	Info(msg string, kv ...any)
+	Error(msg string, kv ...any)
+}
+    Logger is the minimal logging interface the engine uses.
+
+type Message struct {
+	From  string // agent slug that published it ("" for engine-published)
+	Topic string
+	Data  any
+	Seq   int // monotonic per-bus sequence number
+}
+    Message is one item published on a turn topic.
+
+type Modality string
+    Modality is the output kind a generator produces.
+
+const (
+	ModalityText       Modality = "text"
+	ModalityImage      Modality = "image"
+	ModalityVideo      Modality = "video"
+	ModalityAudio      Modality = "audio"
+	ModalityWorld      Modality = "world"
+	ModalityStructured Modality = "structured"
+)
+type ModelPrice struct {
+	InputPer1M  float64
+	OutputPer1M float64
+}
+    ModelPrice is the USD price per one million tokens for a model.
+
+func (p ModelPrice) Cost(inputTokens, outputTokens int) float64
+    Cost returns the USD cost for the given token counts.
+
+type NotFoundError struct {
+	Kind string // "agent", "prompt", "session", "budget", "response_format"
+	Key  string // the lookup key: slug, "slug@vN", or a UUID
+}
+    NotFoundError identifies which entity was missing and by what key.
+    It unwraps to ErrNotFound, so both errors.Is(err, ErrNotFound) and
+    errors.As(err, &loom.NotFoundError{}) work.
+
+func (e *NotFoundError) Error() string
+
+func (e *NotFoundError) Unwrap() error
+
+type PairwiseJudge = judge.PairwiseJudge
+    PairwiseJudge compares two outputs and picks the stronger one.
+
+type PairwiseVerdict = judge.PairwiseVerdict
+    PairwiseVerdict is the output of PairwiseJudge.Compare.
+
+type PollerConfig struct {
+	Interval time.Duration // how often to poll pending tasks
+	Workers  int           // number of concurrent poll goroutines
+	// MaxAttempts caps how many times a task is polled before it is terminally
+	// failed, so neither an erroring nor a perpetually-pending job is polled
+	// forever. Zero uses defaultMaxPollAttempts.
+	MaxAttempts int
+}
+    PollerConfig configures the background async result poller.
+
+type PostHook func(ctx context.Context, req *StepRequest, res Result) (Result, error)
+    PostHook runs after the agent, before the result is persisted.
+    It may validate, annotate, transform, or request a retry (return
+    ErrRetryWith(...)).
+
+func SchemaValidationPostHook() PostHook
+    SchemaValidationPostHook returns a PostHook that validates a structured/text
+    result against the resolved ResponseFormat schema. On any violation it
+    returns ErrRetryWith so the engine re-runs the agent with the violations as
+    the reason. Steps without a schema (empty Schema) pass through untouched,
+    so it is safe to register globally.
+
+type PreHook func(ctx context.Context, req *StepRequest) error
+    PreHook runs before the agent. It may modify the request, cancel the step
+    (return ErrSkip), or annotate the state. Hooks run in registration order.
+
+type Prompt struct {
+	ID        uuid.UUID
+	Slug      string // human-readable identifier, e.g. "opening-author"
+	Owner     string // opaque app-owned scope ("" = global); reserved for future per-tenant use
+	Version   int    // monotonically increasing; editing creates a new version
+	Kind      PromptKind
+	Category  string   // platform-defined grouping
+	Body      string   // raw template text
+	Variables []string // documented input variable names
+	Metadata  map[string]any
+	CreatedAt time.Time
+	Notes     string // design rationale, change notes
+}
+    Prompt is a versioned, categorized text template stored in the database.
+
+type PromptKind string
+    PromptKind discriminates between system and user template prompts.
+
+const (
+	PromptKindSystem       PromptKind = "system"
+	PromptKindUserTemplate PromptKind = "user_template"
+)
+type PromptRef struct {
+	Slug    string
+	Version int    // 0 = LATEST
+	File    string // non-empty → load from file instead of DB
+	// Literal, when non-empty, is used verbatim and takes precedence over Slug
+	// and File. It is the seam for embedders that assemble a system prompt per
+	// turn (from world state, memory, etc.) rather than storing it in the DB.
+	Literal string
+}
+    PromptRef is a lightweight pointer to a specific prompt version.
+
+func PromptByName(slug string, version int) PromptRef
+    PromptByName constructs a PromptRef for a specific slug+version.
+
+func PromptFromFile(path string) PromptRef
+    PromptFromFile constructs a PromptRef loaded from a file path.
+
+type PromptRegistry interface {
+	// Get retrieves a specific version. Version 0 resolves to LATEST. A missing
+	// prompt returns *NotFoundError (which unwraps to ErrNotFound).
+	Get(ctx context.Context, slug string, version int) (*Prompt, error)
+	// Latest resolves the highest version of slug.
+	Latest(ctx context.Context, slug string) (*Prompt, error)
+	// Create persists a new prompt version.
+	Create(ctx context.Context, p *Prompt) error
+	// List returns all prompts matching kind and optional category filter.
+	List(ctx context.Context, kind PromptKind, category string) ([]*Prompt, error)
+	// Delete removes a specific prompt version (>= 1). On Postgres it fails if the
+	// version is still referenced by an agent (ON DELETE RESTRICT).
+	Delete(ctx context.Context, slug string, version int) error
+}
+    PromptRegistry resolves and manages prompts.
+
+type RawInput struct {
+	Kind    string
+	Payload map[string]any
+}
+    RawInput is opaque user input the platform passes to an ActionInterpreter.
+
+type ResponseFormat struct {
+	Schema     map[string]any // JSON Schema
+	StrictMode bool
+}
+    ResponseFormat describes the expected JSON schema for structured output.
+
+func MustResponseFormatJSON(rawSchema string, strict bool) *ResponseFormat
+    MustResponseFormatJSON is ResponseFormatJSON that panics on invalid JSON —
+    convenient for static schemas defined in code.
+
+func ResponseFormatJSON(rawSchema string, strict bool) (*ResponseFormat, error)
+    ResponseFormatJSON builds a ResponseFormat from a raw JSON Schema string
+    — the easy path for attaching an output schema to an agent (paste a
+    client-authored schema straight in). An empty/blank raw yields a non-nil
+    ResponseFormat with no schema, which generators treat as portable JSON mode.
+    Response formats are independent of prompts: the same one can be reused
+    across many agents, and an agent's system prompt, user template, and
+    response format are each versioned and referenced independently.
+
+type ResponseFormatRecord struct {
+	ID         uuid.UUID
+	Slug       string // human-readable identifier, e.g. "logician-schema"
+	Owner      string // opaque app-owned scope ("" = global); reserved for future per-tenant use
+	Version    int    // monotonically increasing; editing creates a new version
+	Schema     map[string]any
+	StrictMode bool
+	CreatedAt  time.Time
+}
+    ResponseFormatRecord is a stored, versioned response format.
+
+func (r *ResponseFormatRecord) Format() *ResponseFormat
+    Format returns the value form used in a GenerateRequest.
+
+type ResponseFormatRegistry interface {
+	// Create persists a new response-format version.
+	Create(ctx context.Context, rf *ResponseFormatRecord) error
+	// Get retrieves a specific version. Version 0 resolves to LATEST.
+	Get(ctx context.Context, slug string, version int) (*ResponseFormatRecord, error)
+	// Latest resolves the highest version of slug.
+	Latest(ctx context.Context, slug string) (*ResponseFormatRecord, error)
+	// GetByID retrieves a response format by ID.
+	GetByID(ctx context.Context, id uuid.UUID) (*ResponseFormatRecord, error)
+	// Delete removes a specific response-format version (>= 1). On Postgres it
+	// fails if the version is still referenced by an agent (ON DELETE RESTRICT).
+	Delete(ctx context.Context, slug string, version int) error
+}
+    ResponseFormatRegistry resolves and manages reusable response formats.
+
+type Result interface {
+	ResultID() uuid.UUID
+	Modality() Modality
+	Status() ResultStatus
+	TaskHandle() *TaskHandle // non-nil for pending async results
+	Metadata() map[string]any
+}
+    Result is the typed output produced by a Generator.
+
+func NewFailedResult(modality Modality, err error) Result
+    NewFailedResult creates a failed Result carrying the error message in
+    metadata under "error". Streaming generators send this on the result channel
+    to signal a provider failure so the engine surfaces it instead of persisting
+    an empty successful turn.
+
+func NewPendingResult(modality Modality, handle *TaskHandle) Result
+    NewPendingResult creates a pending Result for async generators.
+
+type ResultStatus string
+    ResultStatus indicates whether a Result is ready, pending, or failed.
+
+const (
+	ResultStatusReady   ResultStatus = "ready"
+	ResultStatusPending ResultStatus = "pending"
+	ResultStatusFailed  ResultStatus = "failed"
+)
+type RetryAnnotation struct {
+	Reason    string   // human-readable reason
+	Forbidden []string // phrases/patterns the next attempt must avoid
+	// Violations lists structured schema-validation failures when the retry was
+	// triggered by SchemaValidationPostHook (each entry is a "path: reason").
+	// Empty for retries requested for other reasons. Read it via
+	// RetryAnnotationFrom to react to validation failures programmatically.
+	Violations []string
+}
+    RetryAnnotation carries metadata about why a retry was requested.
+
+func RetryAnnotationFrom(err error) (RetryAnnotation, bool)
+    RetryAnnotationFrom extracts the RetryAnnotation if err is a RetryError.
+
+type RetryError struct {
+	Annotation RetryAnnotation
+	// Score rates the rejected draft; lower is better. Used only under
+	// RetryKeepBest to decide which attempt to keep. Zero when unused.
+	Score int
+	// Draft is the (hook-transformed) result eligible to be kept under
+	// RetryKeepBest when every attempt is rejected. Nil means not keepable.
+	Draft Result
+}
+    RetryError signals a post-hook wants the step re-executed with updated
+    hints.
+
+func (e *RetryError) Error() string
+
+type RetryMode int
+    RetryMode selects how the engine treats post-hook retries.
+
+const (
+	// RetryDiscard re-runs on a post-hook retry and discards the rejected
+	// attempt; exhausting the retry budget fails the step. This is the default.
+	RetryDiscard RetryMode = iota
+	// RetryKeepBest scores every attempt (post-hooks return ErrRetryScored) and
+	// persists the lowest-scoring draft. Exhausting the budget keeps the best
+	// draft instead of failing, a generator failure after attempt 0 keeps the
+	// best draft so far, and only attempt 0 streams (retries run silently).
+	RetryKeepBest
+)
+type RubricJudge = judge.RubricJudge
+    RubricJudge scores a single output on multiple dimensions.
+
+type RubricVerdict = judge.RubricVerdict
+    RubricVerdict is the output of RubricJudge.Score.
+
+type ScoreRequest = judge.ScoreRequest
+    ScoreRequest is the input to RubricJudge.Score.
+
+type Selection struct {
+	OptionIndex int
+	OptionID    string
+}
+    Selection is the payload for ActionSelect — choosing one of N presented
+    options.
+
+type Session struct {
+	ID              uuid.UUID
+	PlatformID      string     // opaque — set by the platform (user ID, tenant ID, etc.)
+	ParentSessionID *uuid.UUID // non-nil for branch sessions
+	BranchPoint     *int       // step index the branch forks from
+	// Version is the optimistic-concurrency revision. Update writes are guarded
+	// by it (compare-and-set) so a stale writer cannot silently clobber a newer
+	// one; it is bumped on each successful Update.
+	Version   int
+	State     State
+	History   []Step
+	Tags      []string
+	Pinned    bool
+	DeletedAt *time.Time
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Metadata  map[string]any // platform-controlled custom data
+}
+    Session is a running conversation. It holds state, action log, result
+    history, and any custom data the platform attaches.
+
+type SessionRegistry interface {
+	// Create persists a new session.
+	Create(ctx context.Context, s *Session) error
+	// Get retrieves a session by ID. A missing session returns *NotFoundError
+	// (which unwraps to ErrNotFound).
+	Get(ctx context.Context, id uuid.UUID) (*Session, error)
+	// Update persists state changes to an existing session.
+	Update(ctx context.Context, s *Session) error
+	// Fork creates a branch session from parentID at the given step index.
+	// The branch session sees parent steps 0..stepIndex; subsequent steps diverge.
+	Fork(ctx context.Context, parentID uuid.UUID, stepIndex int) (*Session, error)
+	// BranchTree returns the full descendant tree rooted at sessionID.
+	BranchTree(ctx context.Context, rootID uuid.UUID) (*BranchNode, error)
+	// Pin marks a session as exempt from garbage collection.
+	Pin(ctx context.Context, id uuid.UUID) error
+	// Unpin removes the GC exemption.
+	Unpin(ctx context.Context, id uuid.UUID) error
+	// Discard soft-deletes a session immediately (bypasses T1/T2 GC tiers).
+	Discard(ctx context.Context, id uuid.UUID) error
+	// Purge performs an immediate hard delete (irreversible).
+	Purge(ctx context.Context, id uuid.UUID) error
+	// List returns sessions for a platform ID.
+	List(ctx context.Context, platformID string, limit, offset int) ([]*Session, error)
+}
+    SessionRegistry manages session persistence and branching.
+
+type Spatial struct {
+	Direction  string     // "forward", "north", "left", or custom
+	Coordinate [3]float64 // x, y, z for 3-D worlds; ignored otherwise
+}
+    Spatial is the payload for ActionSpatial — a direction or coordinate input.
+
+type State struct {
+	Modality         Modality       // current dominant modality (the latest result kind)
+	Snapshot         []byte         // serialized application state (opaque to engine)
+	Vars             map[string]any // engine-tracked typed variables
+	AvailableActions []ActionTemplate
+}
+    State is the live state of a session between steps.
+
+type Step struct {
+	ID          uuid.UUID
+	SessionID   uuid.UUID
+	Index       int
+	AgentID     uuid.UUID
+	Request     StoredRequest
+	Result      Result
+	Action      *Action        // the discriminator's action that triggered this step (nil for step 0)
+	Diagnostics map[string]any // anything pre/post processors logged
+	DurationMs  int
+	CreatedAt   time.Time
+}
+    Step is one iteration of the engine loop: build request → call agent →
+    result → actions. Steps are append-only; they form the complete timeline of
+    a session.
+
+type StepRequest struct {
+	// Agent is the agent to run. Exactly one of Agent or AgentSlug must be set.
+	Agent        *Agent
+	AgentSlug    string // resolved to LATEST if Version is 0
+	AgentVersion int
+
+	// Action is the discriminator's input; nil for the opening step.
+	Action *Action
+
+	// Callbacks (all optional)
+	OnChunk      func(Chunk)      // receives streaming text fragments
+	OnCostUpdate func(CostRecord) // receives incremental cost updates during streaming
+	// OnStreamEnd fires when a streaming attempt's chunk channel closes, before
+	// post-hooks run, carrying the 0-based attempt index. It lets a caller close
+	// its chunk sink the moment the streamed draft is complete, even when a
+	// silent RetryKeepBest retry follows.
+	OnStreamEnd func(attempt int)
+
+	// MaxRetries caps the number of post-hook retry attempts (default 3).
+	MaxRetries int
+	// RetryMode selects retry semantics (default RetryDiscard). See RetryMode.
+	RetryMode RetryMode
+
+	// Session is the session this step runs against. The engine populates it
+	// before pre-hooks run so hooks can read and mutate session state — e.g. a
+	// memory-recall pre-hook can inject facts into State.Vars *before* the user
+	// template is rendered. It is set automatically by RunStep; callers may
+	// leave it nil.
+	Session *Session
+
+	// Inputs are arbitrary values made available to the user template as
+	// {{.Inputs.<key>}} and forwarded to the generator. RunTurn uses this to
+	// hand a lead agent's output to follower agents within the same turn.
+	Inputs map[string]any
+
+	// GeneratorOverride, when non-empty, replaces the agent's GeneratorSlug for
+	// this call only — a per-request provider override (e.g. a user-selected
+	// model routed to a different registered generator).
+	GeneratorOverride string
+
+	// ParamOverride, when non-nil, replaces the agent's generation params for
+	// this call only.
+	ParamOverride *GenerateParams
+
+	// SystemPromptOverride, when non-nil, replaces the agent's system prompt for
+	// this call only — resolved from the registry (Slug+Version) or a file
+	// (File). Used by the test harness to compare system-prompt variants.
+	SystemPromptOverride *PromptRef
+
+	// Overrides is opaque per-request data passed through to the generator on
+	// GenerateRequest.Overrides — e.g. {"api_key": "...", "model": "..."} for
+	// per-user key routing in a custom generator.
+	Overrides map[string]any
+
+	// ResponseFormat is the output contract resolved for this step (from the
+	// agent or its system prompt). The engine sets it before hooks run so a
+	// post-hook can validate the result against the schema.
+	ResponseFormat *ResponseFormat
+
+	// Params is a free-form map of tuning knobs for this call: model params
+	// (temperature, max_tokens, top_p, seed, frequency_penalty, presence_penalty,
+	// width, height, duration_sec) are folded into the typed generation params,
+	// and the whole map is forwarded to the generator (GenerateRequest.ParamsMap)
+	// and template ({{.Params.x}}) so domain knobs like "tension" flow through.
+	Params map[string]any
+
+	// Has unexported fields.
+}
+    StepRequest is the input to RunStep.
+
+func (r *StepRequest) Attempt() int
+    Attempt returns the 0-based index of the current generation attempt.
+    A post-hook reads it to self-cap how many times it re-requests its own
+    correction before accepting a draft.
+
+func (r *StepRequest) Bus() Bus
+    Bus returns the per-turn cross-agent communication fabric for this step,
+    or nil if the step is not part of a RunTurn. Hooks and plugins use it to
+    publish or subscribe alongside the turn's agents.
+
+func (r *StepRequest) RetryAnnotations() []RetryAnnotation
+    RetryAnnotations returns a copy of the retry hints accumulated across prior
+    attempts of this step, so a hook can count how often its own annotation Kind
+    has already fired.
+
+func (r *StepRequest) TurnRole() string
+    TurnRole is "lead" or "follower:<slug>" when the step runs inside a RunTurn,
+    and "" for a standalone RunStep. Hooks use it to behave differently for the
+    streaming lead versus a parallel follower.
+
+type StepRunner interface {
+	RunStep(ctx context.Context, session *Session, req StepRequest) (*Step, error)
+}
+    StepRunner executes a step request against a session.
+
+type StoredRequest struct {
+	SystemPrompt   string          `json:"system_prompt"`
+	UserPrompt     string          `json:"user_prompt"`
+	Params         GenerateParams  `json:"params"`
+	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
+}
+    StoredRequest is a serialized GenerateRequest persisted alongside the step.
+
+type StoredResult struct {
+	Modality Modality        `json:"modality"`
+	Status   ResultStatus    `json:"status"`
+	Payload  json.RawMessage `json:"payload"`
+	TaskID   *uuid.UUID      `json:"task_id,omitempty"`
+}
+    StoredResult is a modality-typed result payload persisted in loom_results.
+
+type StreamingGenerator interface {
+	Generator
+	// GenerateStream streams chunks on the first channel.
+	// The final assembled Result arrives on the second channel after streaming completes.
+	GenerateStream(ctx context.Context, req GenerateRequest) (<-chan Chunk, <-chan Result, error)
+}
+    StreamingGenerator extends Generator with incremental chunk delivery.
+    Only text-modality generators need to implement this interface.
+
+type StructuredResult struct {
+	Data         map[string]any
+	InputTokens  int
+	OutputTokens int
+	// Has unexported fields.
+}
+    StructuredResult carries arbitrary typed JSON output.
+
+func NewStructuredResult(data map[string]any, inputTokens, outputTokens int) *StructuredResult
+    NewStructuredResult creates a ready StructuredResult.
+
+func (r *StructuredResult) Metadata() map[string]any
+
+func (r *StructuredResult) Modality() Modality
+
+func (r *StructuredResult) ResultID() uuid.UUID
+
+func (r *StructuredResult) Status() ResultStatus
+
+func (r *StructuredResult) TaskHandle() *TaskHandle
+
+type SweepReport struct {
+	SpeculativeDeleted  int
+	StaleSoftDeleted    int
+	GraceHardDeleted    int
+	TestBranchesDeleted int
+}
+    SweepReport is returned by GC.DryRun.
+
+type TaskHandle struct {
+	ID       uuid.UUID
+	Provider string
+	Handle   string // external job ID (e.g. Runway run ID)
+}
+    TaskHandle references an in-flight async provider job.
+
+type TaskResolution struct {
+	TaskID    uuid.UUID
+	SessionID uuid.UUID
+	AgentID   uuid.UUID
+	Provider  string
+	Status    ResultStatus // ResultStatusReady or ResultStatusFailed
+	Result    Result       // the resolved asset on success; nil on failure
+	Err       string       // failure reason when Status is failed
+}
+    TaskResolution describes the terminal outcome of an async provider job,
+    delivered to the callback registered with OnTaskResolved.
+
+type TextResult struct {
+	Content      string
+	FinishReason string
+	InputTokens  int
+	OutputTokens int
+	// Has unexported fields.
+}
+    TextResult is the output from a text-modality generator.
+
+func NewTextResult(content, finishReason string, inputTokens, outputTokens int) *TextResult
+    NewTextResult creates a ready TextResult.
+
+func (r *TextResult) Metadata() map[string]any
+
+func (r *TextResult) Modality() Modality
+
+func (r *TextResult) ResultID() uuid.UUID
+
+func (r *TextResult) Status() ResultStatus
+
+func (r *TextResult) TaskHandle() *TaskHandle
+
+type Turn struct {
+	ID        uuid.UUID
+	Lead      *Step
+	Followers map[string]*Step // keyed by follower AgentSlug (successes only)
+	Errors    map[string]error // keyed by follower AgentSlug (failures only)
+	Steps     []*Step          // lead first, then followers (completion order)
+	Messages  []Message        // everything published on the turn's Bus
+}
+    Turn is the result of RunTurn: the lead step plus follower steps, all
+    sharing a single turn ID (recorded on each Step's Diagnostics as "turn_id").
+
+type TurnRequest struct {
+	Flow Flow
+	// Action is the user input that drives the turn (nil for an opening).
+	Action *Action
+	// OnChunk receives streaming fragments from the lead agent (if Lead.Stream).
+	OnChunk func(Chunk)
+	// Inputs seeds values available to every agent in the turn via
+	// {{.Inputs.<key>}}. The lead's output is added under its OutputKey before
+	// followers run.
+	Inputs map[string]any
+	// Overrides is opaque per-turn data forwarded to every agent's generator
+	// unless an individual FlowAgent specifies its own Overrides.
+	Overrides map[string]any
+	// Params are turn-wide tuning knobs (model + domain, e.g. temperature,
+	// tension) merged under each FlowAgent's own Params.
+	Params map[string]any
+	// OnStreamEnd fires when the lead's streamed draft is complete, before the
+	// lead's post-hooks run, carrying the attempt index. It lets the caller close
+	// its chunk sink the moment attempt 0 finishes even if a silent keep-best
+	// retry follows. See StepRequest.OnStreamEnd.
+	OnStreamEnd func(attempt int)
+	// OnStep fires as each agent's step settles: once for the lead (role "lead",
+	// err nil) guaranteed before any follower goroutine starts, then once per
+	// follower (role "follower:<slug>") on success (step set, err nil) or failure
+	// (step nil, err set), from the follower's own goroutine and outside the
+	// turn's mutex. The callback MUST NOT block — a slow OnStep would stall the
+	// turn. It lets an embedder build follower inputs from the lead and react to
+	// each follower in completion order.
+	OnStep func(role string, step *Step, err error)
+}
+    TurnRequest is the input to RunTurn.
+
+type UsageQuery struct {
+	Target BudgetTarget
+	From   time.Time
+	To     time.Time
+	Tags   []string // prefix "!" to exclude a tag
+}
+    UsageQuery is the input to cost queries.
+
+type UsageSummary struct {
+	TotalUSD    float64
+	TotalTokens int
+	StepCount   int
+	ByModel     map[string]float64
+}
+    UsageSummary aggregates cost metrics.
+
+type VideoResult struct {
+	URL          string
+	DurationSec  float64
+	Width        int
+	Height       int
+	PreviewImage string
+	// Has unexported fields.
+}
+    VideoResult is the output from a video-modality generator.
+
+func NewVideoResult(url, previewImage string, durationSec float64, width, height int) *VideoResult
+    NewVideoResult creates a ready VideoResult.
+
+func (r *VideoResult) Metadata() map[string]any
+
+func (r *VideoResult) Modality() Modality
+
+func (r *VideoResult) ResultID() uuid.UUID
+
+func (r *VideoResult) Status() ResultStatus
+
+func (r *VideoResult) TaskHandle() *TaskHandle
+
+type WorldDelta struct {
+	Op       string         `json:"op"`             // "add_entity", "remove_entity", "set_lighting", …
+	Type     string         `json:"type,omitempty"` // entity type for add_entity
+	EntityID string         `json:"entity_id,omitempty"`
+	Pos      [3]float64     `json:"pos,omitempty"`
+	Data     map[string]any `json:"data,omitempty"`
+}
+    WorldDelta is a single structured operation applied to a procedural world.
+
+type WorldResult struct {
+	Deltas []WorldDelta
+	// Has unexported fields.
+}
+    WorldResult is the output from a world-modality generator.
+
+func NewWorldResult(deltas []WorldDelta) *WorldResult
+    NewWorldResult creates a ready WorldResult.
+
+func (r *WorldResult) Metadata() map[string]any
+
+func (r *WorldResult) Modality() Modality
+
+func (r *WorldResult) ResultID() uuid.UUID
+
+func (r *WorldResult) Status() ResultStatus
+
+func (r *WorldResult) TaskHandle() *TaskHandle
+
+
+################################################################################
+# github.com/rhaqim/loom/schema
+################################################################################
+
+package schema // import "github.com/rhaqim/loom/schema"
+
+Package schema provides the versioned migration runner for the Loom engine.
+Apply migrations with:
+
+    loader := schema.NewLoader(schema.DialectPostgres)
+    err := loader.Apply(ctx, db)
+
+Migrations live in migrations.go as a dense, ordered list. Each runs exactly
+once and is recorded in the <prefix>schema_migrations ledger.
+
+TYPES
+
+type Dialect string
+    Dialect identifies the database flavour.
+
+const (
+	DialectPostgres Dialect = "postgres"
+	DialectSQLite   Dialect = "sqlite"
+)
+type Loader struct {
+	// Has unexported fields.
+}
+    Loader applies the Loom DDL idempotently to a database.
+
+func NewLoader(dialect Dialect, prefix ...string) *Loader
+    NewLoader creates a Loader for the given dialect. prefix is the table-name
+    prefix (default: "loom_").
+
+func (l *Loader) Apply(ctx context.Context, db *sql.DB) error
+    Apply brings db up to the latest schema version. It is safe to call on
+    every startup: already-applied migrations are skipped via the ledger,
+    and the baseline uses CREATE TABLE IF NOT EXISTS so adopting a pre-migration
+    database is a no-op for tables that already exist.
+
+    Migrations run sequentially; concurrent callers on a fresh database can race
+    on the ledger insert (one fails with a duplicate version). Single-instance
+    startup is unaffected; multi-instance coordination is a production concern.
+
+type Migration struct {
+	Version int
+	Name    string
+	Up      func(ctx context.Context, tx *sql.Tx, prefix string, d Dialect) error
+}
+    Migration is a single ordered, versioned change to the Loom schema. Version
+    numbers are dense and start at 1. Up runs inside a transaction together with
+    the ledger insert, so a failed migration rolls back cleanly and its version
+    is never recorded.
+
+
+################################################################################
+# github.com/rhaqim/loom/generator/openai
+################################################################################
+
+package openai // import "github.com/rhaqim/loom/generator/openai"
+
+Package openai provides a Loom generator adapter for OpenAI chat models.
+
+TYPES
+
+type ChatGenerator struct {
+	// Has unexported fields.
+}
+    ChatGenerator implements loom.Generator and loom.StreamingGenerator for
+    OpenAI chat-completion models (gpt-4o, gpt-4o-mini, o1, etc.).
+
+func NewChatGenerator(apiKey, model string) *ChatGenerator
+    NewChatGenerator creates an OpenAI chat generator.
+
+func (g *ChatGenerator) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error)
+    Generate calls the OpenAI Chat Completions API synchronously.
+
+func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateRequest) (<-chan loom.Chunk, <-chan loom.Result, error)
+    GenerateStream calls the OpenAI streaming API and delivers chunks on the
+    first returned channel; the fully assembled Result arrives on the second.
+
+func (g *ChatGenerator) Modality() loom.Modality
+
+func (g *ChatGenerator) WithAllowedBaseURLs(urls ...string) *ChatGenerator
+    WithAllowedBaseURLs opts into honoring the per-request "base_url" override,
+    restricted to the given exact URLs. Anything not listed here (and not equal
+    to the configured base URL) is rejected, so a caller-supplied base_url can
+    never redirect the request — and this generator's API key — to an arbitrary
+    host.
+
+func (g *ChatGenerator) WithBaseURL(url string) *ChatGenerator
+    WithBaseURL overrides the API base URL (useful for testing / Azure). The URL
+    set here is also implicitly trusted as a per-request "base_url" override.
+
+
+################################################################################
+# github.com/rhaqim/loom/generator/anthropic
+################################################################################
+
+package anthropic // import "github.com/rhaqim/loom/generator/anthropic"
+
+Package anthropic provides a Loom generator adapter for Anthropic Claude models.
+
+TYPES
+
+type ChatGenerator struct {
+	// Has unexported fields.
+}
+    ChatGenerator implements loom.Generator and loom.StreamingGenerator for
+    Anthropic Claude models (claude-opus-4, claude-sonnet-4, claude-haiku-4-5,
+    etc.).
+
+func NewChatGenerator(apiKey, model string) *ChatGenerator
+    NewChatGenerator creates an Anthropic chat generator.
+
+func (g *ChatGenerator) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error)
+    Generate calls the Anthropic Messages API synchronously.
+
+func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateRequest) (<-chan loom.Chunk, <-chan loom.Result, error)
+    GenerateStream calls the Anthropic streaming API.
+
+func (g *ChatGenerator) Modality() loom.Modality
+
+func (g *ChatGenerator) WithAllowedBaseURLs(urls ...string) *ChatGenerator
+    WithAllowedBaseURLs opts into honoring the per-request "base_url" override,
+    restricted to the given exact URLs. Anything not listed here (and not equal
+    to the configured base URL) is rejected, so a caller-supplied base_url can
+    never redirect the request — and this generator's API key — to an arbitrary
+    host.
+
+func (g *ChatGenerator) WithBaseURL(url string) *ChatGenerator
+    WithBaseURL overrides the API base URL (useful for testing / proxies).
+    The URL set here is also implicitly trusted as a per-request "base_url"
+    override.
+
+
+################################################################################
+# github.com/rhaqim/loom/generator/replicate
+################################################################################
+
+package replicate // import "github.com/rhaqim/loom/generator/replicate"
+
+Package replicate provides a Loom generator adapter for Replicate image models.
+It uses the async prediction pattern: Generate submits the job and returns a
+PendingResult; the engine's async poller calls Poll to resolve it.
+
+TYPES
+
+type ImageGenerator struct {
+	// Has unexported fields.
+}
+
+func NewImageGenerator(apiKey, model string) *ImageGenerator
+    NewImageGenerator creates a Replicate image generator.
+
+func (g *ImageGenerator) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error)
+    Generate submits an image prediction to Replicate and returns a
+    PendingResult. The task handle ID is the Replicate prediction ID.
+
+func (g *ImageGenerator) Modality() loom.Modality
+
+func (g *ImageGenerator) Poll(ctx context.Context, handle loom.TaskHandle) (loom.Result, error)
+    Poll fetches the prediction status from Replicate and returns the final
+    ImageResult once it succeeds (or an error on failure/timeout).
+
+
+################################################################################
+# github.com/rhaqim/loom/generator/runway
+################################################################################
+
+package runway // import "github.com/rhaqim/loom/generator/runway"
+
+Package runway provides a Loom generator adapter for RunwayML video models.
+Generation is asynchronous: Generate submits the task and returns a
+PendingResult; Poll resolves it when the video is ready.
+
+TYPES
+
+type VideoGenerator struct {
+	// Has unexported fields.
+}
+
+func NewVideoGenerator(apiKey, model string) *VideoGenerator
+    NewVideoGenerator creates a RunwayML video generator.
+
+func (g *VideoGenerator) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error)
+    Generate submits a video generation task to RunwayML and returns a
+    PendingResult.
+
+func (g *VideoGenerator) Modality() loom.Modality
+
+func (g *VideoGenerator) Poll(ctx context.Context, handle loom.TaskHandle) (loom.Result, error)
+    Poll checks the RunwayML task status and returns the final VideoResult once
+    the video is ready.
+
+
+################################################################################
+# github.com/rhaqim/loom/generator/echo
+################################################################################
+
+package echo // import "github.com/rhaqim/loom/generator/echo"
+
+Package echo provides a deterministic stub generator for testing and examples.
+It echoes the user prompt back as a TextResult, making it useful for exercising
+the full engine pipeline (sessions, steps, hooks, cost tracking) without
+requiring a real LLM API key.
+
+TYPES
+
+type Generator struct {
+	// Prefix is prepended to every response (optional).
+	Prefix string
+}
+    Generator implements loom.Generator and loom.StreamingGenerator. It always
+    succeeds, returning the user prompt as the generated content.
+
+func New(prefix string) *Generator
+    New creates an echo generator with an optional response prefix.
+
+func (g *Generator) Generate(_ context.Context, req loom.GenerateRequest) (loom.Result, error)
+    Generate immediately returns the user prompt as a TextResult.
+
+func (g *Generator) GenerateStream(_ context.Context, req loom.GenerateRequest) (<-chan loom.Chunk, <-chan loom.Result, error)
+    GenerateStream streams the response word-by-word for demonstration purposes.
+
+func (g *Generator) Modality() loom.Modality
+
+
+################################################################################
+# github.com/rhaqim/loom/judge
+################################################################################
+
+package judge // import "github.com/rhaqim/loom/judge"
+
+Package judge provides LLM-based scoring as a reusable abstraction. Judges
+evaluate generator outputs along rubric dimensions, compare pairs, or enforce
+binary constraints. They are caller-driven: register a judge and invoke it from
+a test, a post-hook, or agent-selection code. Nothing in the engine registers or
+invokes judges automatically yet.
+
+TYPES
+
+type CheckRequest struct {
+	Input      string
+	Output     string
+	Constraint string // human-readable rule, e.g. "must not contradict state.Facts"
+	Context    []any  // additional context the judge may inspect
+}
+    CheckRequest is the input to ConstraintJudge.Check.
+
+type CompareRequest struct {
+	Input      string
+	OutputA    string
+	OutputB    string
+	Dimensions []string
+}
+    CompareRequest is the input to PairwiseJudge.Compare.
+
+type Completer interface {
+	Complete(ctx context.Context, system, user string) (string, error)
+}
+    Completer is the minimal text-generation capability a judge needs. It is
+    kept deliberately narrow so the judge package carries no engine or provider
+    dependency; adapt a concrete generator to it at the call site.
+
+type ConstraintJudge interface {
+	Judge
+	Check(ctx context.Context, req CheckRequest) (ConstraintVerdict, error)
+}
+    ConstraintJudge checks whether an output satisfies a stated rule.
+
+type ConstraintVerdict struct {
+	Passed     bool
+	Constraint string
+	Violations []string
+	Confidence float64
+}
+    ConstraintVerdict is the output of ConstraintJudge.Check.
+
+type Judge interface {
+	Mode() Mode
+	Slug() string
+}
+    Judge is the base interface all judges implement.
+
+type LLMConstraintJudge struct {
+	// Has unexported fields.
+}
+    LLMConstraintJudge enforces a single binary rule by prompting a model.
+
+func NewLLMConstraintJudge(slug string, c Completer) *LLMConstraintJudge
+    NewLLMConstraintJudge builds a constraint judge backed by the given
+    completer.
+
+func (j *LLMConstraintJudge) Check(ctx context.Context, req CheckRequest) (ConstraintVerdict, error)
+    Check asks the model whether the output satisfies the constraint. A reply
+    that omits the "passed" verdict is an error rather than a synthesized
+    failure.
+
+func (j *LLMConstraintJudge) Mode() Mode
+
+func (j *LLMConstraintJudge) Slug() string
+
+type LLMPairwiseJudge struct {
+	// Has unexported fields.
+}
+    LLMPairwiseJudge compares two outputs by prompting a model.
+
+func NewLLMPairwiseJudge(slug string, c Completer) *LLMPairwiseJudge
+    NewLLMPairwiseJudge builds a pairwise judge backed by the given completer.
+
+func (j *LLMPairwiseJudge) Compare(ctx context.Context, req CompareRequest) (PairwiseVerdict, error)
+    Compare asks the model which output is stronger overall and per dimension.
+
+func (j *LLMPairwiseJudge) Mode() Mode
+
+func (j *LLMPairwiseJudge) Slug() string
+
+type LLMRubricJudge struct {
+	// Has unexported fields.
+}
+    LLMRubricJudge scores a single output across dimensions by prompting a
+    model.
+
+func NewLLMRubricJudge(slug string, c Completer) *LLMRubricJudge
+    NewLLMRubricJudge builds a rubric judge backed by the given completer.
+
+func (j *LLMRubricJudge) Mode() Mode
+
+func (j *LLMRubricJudge) Score(ctx context.Context, req ScoreRequest) (RubricVerdict, error)
+    Score asks the model to rate the output on each requested dimension.
+    It errors if the reply carries no score for any requested dimension (a
+    wrong-shaped reply must not masquerade as a neutral verdict). Dimensions
+    present but individually unparseable, or genuinely omitted while others were
+    scored, default to a neutral 5.0; out-of-range scores are clamped to 0..10.
+    The aggregate is the mean over the requested dimensions.
+
+func (j *LLMRubricJudge) Slug() string
+
+type Mode string
+    Mode identifies the evaluation shape of a Judge.
+
+const (
+	ModeRubric     Mode = "rubric"
+	ModePairwise   Mode = "pairwise"
+	ModeConstraint Mode = "constraint"
+)
+type PairwiseJudge interface {
+	Judge
+	Compare(ctx context.Context, req CompareRequest) (PairwiseVerdict, error)
+}
+    PairwiseJudge compares two outputs and picks the stronger one.
+
+type PairwiseVerdict struct {
+	Winner       string            // "A" | "B" | "tie"
+	PerDimension map[string]string // dimension → "A" | "B" | "tie"
+	Margin       float64           // 0..1 confidence
+	Explanation  string
+}
+    PairwiseVerdict is the output of PairwiseJudge.Compare.
+
+type Registry struct {
+	// Has unexported fields.
+}
+    Registry holds all registered judges keyed by slug.
+
+func NewRegistry() *Registry
+    NewRegistry creates an empty Registry.
+
+func (r *Registry) Constraint(slug string) ConstraintJudge
+    Constraint returns the ConstraintJudge registered under slug, or a no-op
+    judge.
+
+func (r *Registry) Pairwise(slug string) PairwiseJudge
+    Pairwise returns the PairwiseJudge registered under slug, or a no-op judge.
+
+func (r *Registry) Register(j Judge)
+    Register adds a judge under its intrinsic Slug().
+
+func (r *Registry) RegisterAs(slug string, j Judge)
+    RegisterAs adds a judge under an explicit slug, which may differ from the
+    judge's intrinsic Slug(). Lookups use this key.
+
+func (r *Registry) Rubric(slug string) RubricJudge
+    Rubric returns the RubricJudge registered under slug, or a no-op judge.
+
+type RubricJudge interface {
+	Judge
+	Score(ctx context.Context, req ScoreRequest) (RubricVerdict, error)
+}
+    RubricJudge scores a single output on multiple dimensions.
+
+type RubricVerdict struct {
+	Scores       map[string]float64 // dimension → 0..10
+	Aggregate    float64            // unweighted mean of all dimension scores
+	Explanations map[string]string  // per-dimension one-sentence justification
+}
+    RubricVerdict is the output of RubricJudge.Score.
+
+type ScoreRequest struct {
+	Input      string   // the prompt the agent received
+	Output     string   // the output the agent produced
+	Context    []string // optional prior outputs for continuity scoring
+	Dimensions []string // e.g. ["coherence","novelty","faithfulness"]
+}
+    ScoreRequest is the input to RubricJudge.Score.
+
+
+################################################################################
+# github.com/rhaqim/loom/harness
+################################################################################
+
+package harness // import "github.com/rhaqim/loom/harness"
+
+Package harness provides a test harness for Loom procgen pipelines.
+
+A TestPlan defines a scripted session, a VariantMatrix of providers/prompts/
+parameters to cross-product, and a set of Assertions that are evaluated against
+every generated Result. The harness runs all variants in parallel and returns a
+TestReport with per-variant pass/fail outcomes.
+
+Example:
+
+    plan := &harness.TestPlan{
+        Name: "chat-v1",
+        Session: harness.SessionScript{
+            PlatformID: "test-user",
+            Steps: []harness.ScriptedStep{
+                {AgentSlug: "assistant", ActionPayload: "Begin"},
+            },
+        },
+        Variants: harness.VariantMatrix{
+            Providers: []string{"openai-gpt4o", "anthropic-claude"},
+        },
+        Assertions: []harness.Assertion{
+            harness.MinLength(100),
+            harness.NoKeyword("ERROR"),
+        },
+    }
+    report, err := harness.Run(ctx, engine, plan)
+
+TYPES
+
+type Assertion func(step *loom.Step, result loom.Result) error
+    Assertion is a function that checks a Result and returns an error if it
+    fails.
+
+func Custom(name string, fn func(step *loom.Step, result loom.Result) error) Assertion
+    Custom wraps a user-defined assertion function.
+
+func HasStatus(want loom.ResultStatus) Assertion
+    HasStatus asserts the result has the expected status.
+
+func MaxLength(n int) Assertion
+    MaxLength asserts the text content of a TextResult has at most n characters.
+
+func MinLength(n int) Assertion
+    MinLength asserts the text content of a TextResult has at least n
+    characters.
+
+func NoKeyword(keywords ...string) Assertion
+    NoKeyword fails if the text content contains any of the given keywords
+    (case-insensitive).
+
+type ScriptedStep struct {
+	// AgentSlug is the agent to invoke.
+	AgentSlug string `yaml:"agent_slug" json:"agent_slug"`
+	// AgentVersion pins a specific agent version (0 = latest).
+	AgentVersion int `yaml:"agent_version,omitempty" json:"agent_version,omitempty"`
+	// ActionPayload is serialised as a free-text action if non-empty.
+	ActionPayload string `yaml:"action_payload,omitempty" json:"action_payload,omitempty"`
+}
+    ScriptedStep is a single step in the test script.
+
+type SessionScript struct {
+	// PlatformID is the user/tenant identifier.
+	PlatformID string `yaml:"platform_id" json:"platform_id"`
+	// Tags are applied to the test session so it can be GC'd by the test-branch rule.
+	Tags []string `yaml:"tags" json:"tags"`
+	// Steps are the ordered generation steps to run.
+	Steps []ScriptedStep `yaml:"steps" json:"steps"`
+}
+    SessionScript describes the session lifecycle for a test.
+
+type StepReport struct {
+	StepIndex  int
+	AgentSlug  string
+	ResultID   string
+	Failures   []string
+	DurationMs int
+}
+    StepReport holds assertion results for a single step within a variant.
+
+type TestPlan struct {
+	// Name is a human-readable identifier for the plan.
+	Name string `yaml:"name" json:"name"`
+	// Session defines the scripted session to run for each variant.
+	Session SessionScript `yaml:"session" json:"session"`
+	// Variants is the cross-product of providers/prompts/params to test.
+	Variants VariantMatrix `yaml:"variants" json:"variants"`
+	// Assertions are checked against every step Result.
+	Assertions []Assertion `yaml:"-" json:"-"`
+	// MaxParallel bounds how many variants run concurrently. 0 uses a safe
+	// default (see defaultMaxParallel); negative or excessive values are clamped.
+	MaxParallel int `yaml:"max_parallel,omitempty" json:"max_parallel,omitempty"`
+}
+    TestPlan describes a complete test scenario.
+
+type TestReport struct {
+	PlanName   string
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Variants   []*VariantReport
+}
+    TestReport contains the aggregate outcome of a test run.
+
+func Run(ctx context.Context, e *loom.Engine, plan *TestPlan) (*TestReport, error)
+    Run executes the TestPlan against all variants and returns a TestReport.
+    Each variant runs its own ephemeral session.
+
+func (r *TestReport) Passed() bool
+    Passed returns true if all variants passed.
+
+type VariantMatrix struct {
+	// Providers are generator slugs to substitute into agent.GeneratorSlug.
+	// Empty means "use the agent's default generator".
+	Providers []string `yaml:"providers" json:"providers"`
+	// SystemPrompts override the agent's system prompt per variant (optional).
+	SystemPrompts []loom.PromptRef `yaml:"system_prompts" json:"system_prompts"`
+	// Params overrides the agent's GenerateParams per variant (optional).
+	Params []loom.GenerateParams `yaml:"params" json:"params"`
+}
+    VariantMatrix is the cross-product of configuration axes to test. Each
+    combination of (Provider × SystemPrompt × Param) produces one variant.
+
+type VariantReport struct {
+	Index    int
+	Provider string
+	Passed   bool
+	Steps    []*StepReport
+	Duration time.Duration
+	Err      error
+}
+    VariantReport holds the outcome for a single cross-product variant.
+
+
+################################################################################
+# github.com/rhaqim/loom/cmd/loom-cli
+################################################################################
+
+loom-cli is the command-line interface for the Loom procgen engine.
+
+Commands:
+
+    migrate   Apply the Loom database schema
+    seed      Seed agents, prompts, and generators from a YAML file
+    test      Run a YAML test plan against the engine
+
+TYPES
+
+type TestReport struct {
+	*harness.TestReport
+	Passed bool
+}
+    TestReport extends harness.TestReport with a top-level Passed field so the
+    CLI can exit non-zero on failure.
+

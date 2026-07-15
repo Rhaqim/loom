@@ -4,6 +4,9 @@ A modality-agnostic engine for orchestrating multi-agent AI applications.
 
 Loom handles the infrastructure — session management, versioned agents and prompts, hook pipelines, cost tracking, branch/replay, LLM-as-judge scoring, and a first-class test harness — so you can focus on your product, not the plumbing.
 
+> **Using an AI assistant (Claude, Copilot, Cursor, …) to build with loom?** Point it at
+> [`llms.txt`](llms.txt) — a self-contained, task-oriented guide to loom's API written for LLMs.
+
 ---
 
 ## Features

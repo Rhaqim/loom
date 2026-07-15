@@ -1,0 +1,363 @@
+# loom
+
+> loom is a Go library for orchestrating multi-agent AI applications. It handles the
+> infrastructure — Postgres/SQLite persistence, versioned agents & prompts, session
+> branching/replay, a hook pipeline, cost tracking & budgets, LLM-as-judge scoring, and
+> multi-agent "turns" — so an application focuses on its product, not the plumbing.
+> Modality-agnostic: text, image, video, and structured JSON output flow through one pipeline.
+
+This file is an AI-oriented guide (an "llms.txt"): read it before writing code that uses loom.
+It is accurate to the current public API. Everything shown is importable from the single
+package `github.com/rhaqim/loom` (the "facade"). Do NOT import anything under
+`github.com/rhaqim/loom/internal/...` — it is not importable from other modules by design.
+
+- Module path: `github.com/rhaqim/loom`
+- Requires: Go 1.24+ (module targets Go 1.25 per go.mod), and a Postgres or SQLite database.
+- Install: `go get github.com/rhaqim/loom`
+- Full docs: the repo `README.md`, runnable `examples/` (story, dnd, storyapi, conexus-loom),
+  and `go doc github.com/rhaqim/loom`. The public API is also listed with docs in `aliases.go`.
+
+## Mental model (read this first)
+
+- **Engine** (`loom.Engine`): the central object, built once via `loom.New(loom.Config{...})`.
+  It exposes registries: `Agents()`, `Prompts()`, `Sessions()`, `ResponseFormats()`,
+  `Flows()`, `Cost()`, `Budgets()`, `Judges()`, `GC()`.
+- **Generator** (`loom.Generator`): an adapter to an AI provider (OpenAI, Anthropic, a custom
+  one, …). Registered under a slug. This is the pluggable "AI client" — see "Custom generators".
+- **Prompt** (`loom.Prompt`): a versioned, immutable text record. Two kinds: a system prompt
+  (`PromptKindSystem`) used verbatim, and a user template (`PromptKindUserTemplate`) rendered
+  as a Go `text/template`.
+- **Agent** (`loom.Agent`): binds a generator slug + a system prompt + a user template
+  (+ optional params / response format). Versioned by slug+version.
+- **Session** (`loom.Session`): one conversation. Holds state (`State.Vars`), history, and tags.
+- **Step**: one agent invocation against a session. `e.RunStep(...)` runs one agent.
+- **Turn / Flow**: a multi-agent step. `e.RunTurn(...)` runs a lead agent, then fan-outs to
+  follower agents concurrently, injecting the lead's output into the followers.
+- **Hooks**: pre/post interceptors for validation, retries, content filtering.
+
+Golden rules for AI writing loom code:
+1. Import only `github.com/rhaqim/loom` (+ `.../schema` and `.../generator/<x>` subpackages).
+   Never `.../internal/...`.
+2. Apply the schema BEFORE using the engine (see Setup). Re-running it is safe and runs
+   migrations for existing databases.
+3. `loom.Dialect` (for `Config.Dialect`) and `schema.Dialect` (for the loader) are two
+   different types; both have `DialectPostgres` / `DialectSQLite` constants. Use the matching one.
+4. Handle errors with `errors.Is` / `errors.As` against the typed errors below — do not string-match.
+
+## Setup (schema + engine)
+
+```go
+import (
+    "context"
+    "database/sql"
+
+    loom "github.com/rhaqim/loom"
+    "github.com/rhaqim/loom/schema"
+    "github.com/rhaqim/loom/generator/openai"
+
+    _ "modernc.org/sqlite" // pure-Go SQLite driver (no cgo); or _ "github.com/lib/pq" for Postgres
+    "os"
+)
+
+ctx := context.Background()
+
+// SQLite (zero-setup, great for local dev / tests):
+db, _ := sql.Open("sqlite", "file:app.db?_pragma=foreign_keys(1)")
+// Postgres: db, _ := sql.Open("postgres", os.Getenv("DATABASE_URL"))
+
+// 1. Apply the schema FIRST (idempotent; also runs migrations on an existing DB).
+if err := schema.NewLoader(schema.DialectSQLite).Apply(ctx, db); err != nil { panic(err) }
+
+// 2. Build the engine with your generators.
+e, err := loom.New(loom.Config{
+    DB:      db,
+    Dialect: loom.DialectSQLite,
+    Generators: map[string]loom.Generator{
+        "openai": openai.NewChatGenerator(os.Getenv("OPENAI_API_KEY"), "gpt-4o"),
+        // For a keyless stub (examples/tests): import generator/echo and use echo.New("").
+    },
+})
+if err != nil { panic(err) } // errors.Is(err, loom.ErrInvalidConfig) on bad config
+```
+
+## Quickstart (single agent, end to end)
+
+```go
+// Seed a system prompt and a user template (versioned, immutable).
+sys, _ := seedPrompt(ctx, e, "assistant-sys", loom.PromptKindSystem,
+    "You are a concise, helpful assistant.")
+usr, _ := seedPrompt(ctx, e, "assistant-usr", loom.PromptKindUserTemplate,
+    "User says: {{.Action.Payload.text}}")
+
+// Seed an agent binding a generator + the two prompts.
+e.Agents().Create(ctx, &loom.Agent{
+    Slug: "assistant", Version: 1, Modal: loom.ModalityText,
+    GeneratorSlug: "openai", SystemPromptID: sys.ID, UserTemplateID: usr.ID,
+})
+
+// Open a session.
+sess := &loom.Session{PlatformID: "user-123", State: loom.State{Modality: loom.ModalityText}}
+e.Sessions().Create(ctx, sess)
+
+// Run one step.
+step, err := e.RunStep(ctx, sess, loom.StepRequest{
+    AgentSlug: "assistant", // Version 0 => latest
+    Action: &loom.Action{Kind: loom.ActionFreeText, Payload: map[string]any{"text": "Hi!"}},
+    // Optional streaming: OnChunk: func(c loom.Chunk) { fmt.Print(c.Content) },
+})
+if err != nil { /* handle: see Errors section */ }
+
+fmt.Println(loom.ResultText(step.Result)) // helper; or step.Result.(*loom.TextResult).Content
+
+// helper used above:
+// func seedPrompt(ctx, e, slug string, kind loom.PromptKind, body string) (*loom.Prompt, error) {
+//     p := &loom.Prompt{Slug: slug, Version: 1, Kind: kind, Body: body}
+//     err := e.Prompts().Create(ctx, p); return p, err
+// }
+```
+
+User templates are Go `text/template`. Data available: `{{.Action.Payload.text}}` (free-text
+input), `{{.Vars.x}}` (session `State.Vars`), `{{.Inputs.x}}` (per-step inputs / a turn's
+lead output), `{{.Params.x}}` (tuning knobs), and a minimal `{{.Session}}` view
+(ID/PlatformID/Tags/State — NOT Metadata or History). `{{template}}`/`{{define}}` are rejected.
+
+## Actions (user input into a step)
+
+`loom.Action{Kind, Payload, Metadata}`. Kinds and typical payloads:
+- `loom.ActionFreeText` → `map[string]any{"text": "..."}`
+- `loom.ActionSelect`   → `map[string]any{"option_index": 0, "option_id": "..."}`
+- `loom.ActionSpatial`  → `map[string]any{"direction": "north"}`
+- `loom.ActionInventory`, `loom.ActionGesture`, `loom.ActionCustom` → app-defined
+The opening step of a session uses a nil Action.
+
+## Multi-agent turns (Flow + RunTurn)
+
+A turn runs a lead agent, then followers concurrently, feeding the lead's output to followers
+via `{{.Inputs.<OutputKey>}}`. Every step is persisted and tagged with one turn ID.
+
+```go
+flow := loom.Flow{
+    Slug: "chat-turn",
+    Lead: loom.FlowAgent{AgentSlug: "author", Stream: true, OutputKey: "Prose"},
+    Followers: []loom.FlowAgent{
+        {AgentSlug: "logician"}, // sees the lead via {{.Inputs.Prose}}
+        {AgentSlug: "sensory"},
+    },
+}
+turn, err := e.RunTurn(ctx, sess, loom.TurnRequest{
+    Flow:   flow,
+    Action: &loom.Action{Kind: loom.ActionFreeText, Payload: map[string]any{"text": "I open the door."}},
+    OnChunk: func(c loom.Chunk) { fmt.Print(c.Content) }, // streams the lead only
+})
+// err != nil means the LEAD failed. Follower results/failures:
+prose := loom.ResultText(turn.Lead.Result)
+logician := turn.Followers["logician"] // *Step, present only on success
+for slug, ferr := range turn.Errors {  // follower failures (never returned as err)
+    log.Printf("follower %s failed: %v", slug, ferr)
+}
+```
+
+## Generators (built-in + bring-your-own)
+
+Built-in adapters (each `New...` takes an API key + model unless noted):
+- `generator/openai`    → `openai.NewChatGenerator(key, model)`      — text, streaming
+- `generator/anthropic` → `anthropic.NewChatGenerator(key, model)`   — text, streaming
+- `generator/replicate` → `replicate.NewImageGenerator(key, model)`  — image, async
+- `generator/runway`    → `runway.NewVideoGenerator(key, model)`      — video, async
+- `generator/echo`      → `echo.New(prefix)`                          — text stub, no API key
+
+Register at construction (`Config.Generators`) or at runtime: `e.RegisterGenerator("slug", gen)`.
+An agent selects one by `Agent.GeneratorSlug`; a step can override with
+`StepRequest.GeneratorOverride`.
+
+### Custom generators — three flavors
+
+A generator is just an interface. Implement the flavor that fits your provider; the engine
+detects the optional ones at runtime.
+
+1) **Sync** (the minimum — implement `loom.Generator`):
+```go
+type MyGen struct{ client *myapi.Client }
+
+func (g *MyGen) Modality() loom.Modality { return loom.ModalityText }
+
+func (g *MyGen) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error) {
+    out, err := g.client.Complete(ctx, req.SystemPrompt, req.UserPrompt)
+    if err != nil { return nil, err } // engine wraps as *loom.GenerationError{Kind: Transport}
+    // NewTextResult(content, finishReason, inputTokens, outputTokens) — tokens feed cost tracking.
+    return loom.NewTextResult(out.Text, "stop", out.InTokens, out.OutTokens), nil
+}
+// Register: e.RegisterGenerator("my-llm", &MyGen{client: c})  // then Agent.GeneratorSlug = "my-llm"
+```
+`req` also exposes: `Params`/`ParamsMap` (tuning knobs), `Context` (prior results),
+`Overrides` (per-request routing e.g. per-user api_key/model), `ResponseFormat` (JSON schema
+when structured), `Bus` (cross-agent coordination inside a turn).
+
+2) **Streaming** (also implement `loom.StreamingGenerator`): add
+`GenerateStream(ctx, req) (<-chan loom.Chunk, <-chan loom.Result, error)`. The engine streams
+chunks to `StepRequest.OnChunk` and falls back to `Generate` when no streaming is requested.
+
+3) **Async** for slow image/video (also implement `loom.AsyncGenerator`):
+```go
+// Generate submits the job and returns a pending result; the engine's background poller
+// then calls Poll until it returns a terminal (ready/failed) result.
+var _ loom.AsyncGenerator = (*MyImageGen)(nil) // compile-time check you got the shape right
+
+func (g *MyImageGen) Modality() loom.Modality { return loom.ModalityImage }
+func (g *MyImageGen) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error) {
+    handle, _ := g.client.Submit(ctx, req.UserPrompt)
+    return loom.NewPendingResult(loom.ModalityImage, &loom.TaskHandle{Handle: handle}), nil
+}
+func (g *MyImageGen) Poll(ctx context.Context, h loom.TaskHandle) (loom.Result, error) {
+    // return a ready loom.NewImageResult(url, prompt, w, h), a failed result, or a still-pending
+    // loom.NewPendingResult(...) to be polled again.
+}
+```
+Enable polling via `Config.AsyncPoller` (Interval, Workers) and `e.StartPoller(ctx)`.
+
+## Error handling (typed — use errors.Is / errors.As)
+
+`RunStep` (and `RunTurn`'s lead) can return:
+- `loom.ErrSkip` — a pre-hook cancelled the step; check `loom.IsSkip(err)`. Not a failure.
+- `*loom.NotFoundError` — agent/prompt/session/etc. missing. Unwraps to `loom.ErrNotFound`, so
+  `errors.Is(err, loom.ErrNotFound)` works; `errors.As(err, &nf)` gives `nf.Kind` and `nf.Key`.
+- `loom.ErrGeneratorNotRegistered` — the agent's generator slug isn't registered.
+- `*loom.BudgetExceededError` — a configured budget blocked the step.
+- `*loom.GenerationError` — the provider failed; `errors.As(err, &ge)` then switch `ge.Kind`:
+  `loom.GenerationTransport` (network/stream — often retryable, `ge.Unwrap()` has the cause),
+  `loom.GenerationRejected` (provider refused, e.g. content policy — surface to user),
+  `loom.GenerationEmpty` (no result).
+- Other errors wrap the underlying hook/template/persistence failure.
+
+```go
+step, err := e.RunStep(ctx, sess, req)
+switch {
+case err == nil:
+    // ok
+case loom.IsSkip(err):
+    // step intentionally skipped
+case errors.Is(err, loom.ErrNotFound):
+    var nf *loom.NotFoundError; errors.As(err, &nf) // nf.Kind, nf.Key
+case errors.Is(err, loom.ErrGeneratorNotRegistered):
+    // config problem
+default:
+    var ge *loom.GenerationError
+    if errors.As(err, &ge) && ge.Kind == loom.GenerationTransport {
+        // safe to retry
+    }
+}
+```
+
+Config errors from `loom.New`: `errors.Is(err, loom.ErrInvalidConfig)`.
+
+## Hooks (validation / retries / filtering)
+
+```go
+// Pre-hook: skip a step under some condition.
+e.Hooks().RegisterPre("gate", func(ctx context.Context, req *loom.StepRequest) error {
+    if blocked { return loom.ErrSkip }
+    return nil
+})
+// Post-hook: ask the engine to retry with guidance.
+e.Hooks().RegisterPost("no-spoilers", func(ctx context.Context, req *loom.StepRequest, res loom.Result) (loom.Result, error) {
+    if strings.Contains(loom.ResultText(res), "THE KILLER IS") {
+        return nil, loom.ErrRetryWith(loom.RetryAnnotation{Reason: "do not reveal the killer"})
+    }
+    return res, nil
+})
+// Built-in: validate structured output against an agent's JSON schema and retry on violation.
+e.Hooks().RegisterPost("schema", loom.SchemaValidationPostHook())
+```
+On a retry error, `loom.RetryAnnotationFrom(err)` returns the annotation; schema failures
+populate `RetryAnnotation.Violations` (a structured `[]string`). Register hooks before running
+steps (registration is safe but do it at startup).
+
+## Cost tracking & budgets
+
+Every step records input/output tokens and USD (from a built-in pricing table). Query with
+`e.Cost().SessionUsage(ctx, sess.ID)`. Budgets enforce spend caps per platform key:
+
+```go
+e.Budgets().Create(ctx, &loom.Budget{
+    Name:     "user-daily",
+    Target:   loom.BudgetTarget{Kind: loom.TargetPlatformID, Key: "user-123"}, // only platform_id is enforced
+    Window:   loom.BudgetWindowDay,
+    Limit:    loom.BudgetLimit{USD: 0.50}, // USD/Tokens/Steps; 0 = no limit on that axis
+    OnExceed: loom.BudgetBlock,            // or BudgetDowngrade (to Agent.FallbackAgentID) / BudgetNotify
+    Active:   true,                        // required; an inactive budget is ignored
+})
+```
+Enforcement is best-effort (reads prior recorded spend, fails open on DB errors) — not a hard
+transactional ceiling. On block, `RunStep` returns `*loom.BudgetExceededError`.
+
+## Caching (optional, recommended for hot paths)
+
+Agents/prompts are immutable, so a read-through cache in front of the DB is safe:
+```go
+loom.New(loom.Config{ /* ... */ Cache: loom.NewInProcessCache(), CacheTTL: 24 * time.Hour })
+```
+`Cache` is an interface — back it with Redis/etc. `CacheTTL` 0 uses the 24h default. Nil Cache
+disables caching (every RunStep hits the DB).
+
+## Judges (LLM-as-judge scoring)
+
+`e.Judges()` provides rubric scoring, pairwise comparison, and binary constraints via an LLM.
+See `github.com/rhaqim/loom/judge` and the README for `ScoreRequest`/`PairwiseRequest`.
+
+## Sessions: branching & replay, GC
+
+- Fork at a step: `branch, _ := e.Sessions().Fork(ctx, sess.ID, stepIndex)` — parent untouched.
+- Inspect: `tree, _ := e.Sessions().BranchTree(ctx, rootID)`.
+- Stale/speculative/test branches are cleaned by the GC worker (`e.GC()`, configured via
+  `Config.BranchGC`; DryRun by default — nothing is deleted until you opt in).
+
+## Schema & migrations (IMPORTANT gotcha)
+
+`schema.NewLoader(dialect).Apply(ctx, db)` creates tables on a fresh DB and runs ordered
+migrations (recorded in a ledger) on an existing one. ALWAYS call it at startup; it is safe to
+re-run. If you upgrade loom and see an error like
+`column "..." of relation "loom_agents" does not exist`, your DB predates a migration — just
+run `Apply` again (or `loom-cli migrate`) to bring it up to date.
+
+CONTRIBUTOR NOTE (only if you modify loom's own `schema/loader.go`): a new baseline column MUST
+be paired with an `addColumnIfMissing` migration in `schema/migrations.go`, or existing
+databases break. `CREATE TABLE IF NOT EXISTS` never alters an existing table.
+
+## CLI (`loom-cli`)
+
+```
+loom-cli migrate                 # apply schema/migrations
+loom-cli seed seed.yaml          # seed prompts/agents from YAML
+loom-cli test plan.yaml          # run a YAML test plan (see harness package)
+```
+Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <string>`
+(the flag exposes credentials in `ps` — prefer the others).
+
+## Common tasks (recipes)
+
+- "Add a provider loom doesn't ship" → implement `loom.Generator` (see Custom generators), then
+  `e.RegisterGenerator("slug", gen)` and set `Agent.GeneratorSlug = "slug"`.
+- "Per-user API keys / model routing" → pass `StepRequest.Overrides{"api_key":..., "model":...}`
+  and read them in a custom generator; built-in openai/anthropic honor `Overrides["base_url"]`
+  ONLY if the URL is allowlisted via `WithAllowedBaseURLs(...)` (security: prevents key exfil).
+- "Force JSON output" → attach a `ResponseFormat` (via a reusable `ResponseFormatRecord` or an
+  inline schema on the agent) and register `loom.SchemaValidationPostHook()`.
+- "Stream to a client" → set `StepRequest.OnChunk` (or `TurnRequest.OnChunk` for a turn's lead).
+- "Test without API keys" → use `generator/echo`.
+
+## Things NOT to do
+
+- Do not import `github.com/rhaqim/loom/internal/...` (won't compile from your module).
+- Do not skip `schema.Apply` — you'll get missing-table/column errors.
+- Do not string-match error messages — use the typed errors above.
+- Do not mutate a returned Agent/Prompt and expect it to persist — create a new version instead.
+- Do not set `StepRequest.Overrides["base_url"]` expecting built-in openai/anthropic to honor it
+  unless the operator allowlisted that URL (security guard).
+
+## Where to look next
+
+- `README.md` — narrative docs and feature table.
+- `examples/story` (minimal), `examples/dnd` (full game), `examples/storyapi` (HTTP API with
+  auth), `examples/conexus-loom` (multi-agent multimodal, runs with no API keys).
+- `go doc github.com/rhaqim/loom` — full API with per-symbol docs; `aliases.go` lists the whole
+  public surface grouped by domain.

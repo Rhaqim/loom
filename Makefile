@@ -1,7 +1,7 @@
 DSN ?= postgres://loom:loom@localhost:5432/loom?sslmode=disable
 export LOOM_DSN := $(DSN)
 
-.PHONY: help up down migrate seed example test-engine test-cli test-all build clean generate check-facade check
+.PHONY: help up down migrate seed example test-engine test-cli test-all build clean generate check-facade check llms-full
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -36,8 +36,11 @@ test-all: ## Run all tests (requires Postgres via docker compose up)
 		./internal/enginetest/... \
 		./internal/clitest/...
 
-generate: ## Regenerate the root facade (aliases.go) from internal/engine
+generate: llms-full ## Regenerate the facade (aliases.go) and llms-full.txt
 	go generate ./...
+
+llms-full: ## Regenerate llms-full.txt (curated guide + full go doc API reference)
+	./scripts/gen-llms-full.sh
 
 check-facade: ## Fail if aliases.go is stale (run `make generate` and commit)
 	go generate ./...
