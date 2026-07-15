@@ -31,7 +31,7 @@ Loom handles the infrastructure — session management, versioned agents and pro
 go get github.com/rhaqim/loom
 ```
 
-Requires Go 1.22+ and a Postgres or SQLite database.
+Requires Go 1.24+ (the module targets Go 1.25; see `go.mod`) and a Postgres or SQLite database.
 
 ---
 
@@ -42,11 +42,12 @@ package main
 
 import (
     "context"
+    "database/sql"
     "fmt"
     "log"
+    "os"
 
     _ "github.com/lib/pq"
-    "database/sql"
 
     loom "github.com/rhaqim/loom"
     "github.com/rhaqim/loom/generator/openai"
@@ -147,11 +148,17 @@ e.Agents().Create(ctx, &loom.Agent{
 User templates are Go `text/template` strings. The template data is:
 
 ```tmpl
-{{.Session}}         — the full Session object
 {{.Vars}}            — session.State.Vars (map[string]any)
 {{.Action}}          — the current Action
 {{.Action.Payload}}  — the action's payload (map[string]any for free-text)
+{{.Inputs}}          — per-step inputs (e.g. a turn's lead output; map[string]any)
+{{.Params}}          — per-call tuning knobs (map[string]any)
+{{.Session}}         — a minimal, whitelisted view: .ID, .PlatformID, .Tags, .State
 ```
+
+`{{.Session}}` deliberately excludes `Session.Metadata` and `History` so a template
+cannot exfiltrate secrets or cross-turn data. `{{define}}`/`{{template}}` actions are
+rejected (they enable unbounded recursion).
 
 ### Sessions & Steps
 
@@ -250,20 +257,37 @@ Register any number of generators under a slug. Built-in adapters:
 | `generator/runway` | `NewVideoGenerator(key, model)` | Video (async) |
 | `generator/echo` | `New(prefix)` | Text — echo stub for testing |
 
-Implement the `loom.Generator` interface to add your own:
+Bring your own by implementing one of three flavors — register it with
+`Config.Generators` or `e.RegisterGenerator("slug", gen)` and point an agent at it:
 
 ```go
+// Sync (the minimum):
 type Generator interface {
     Modality() Modality
     Generate(ctx context.Context, req GenerateRequest) (Result, error)
 }
 
-// Optional — for word-by-word streaming:
+// Streaming (optional — word-by-word):
 type StreamingGenerator interface {
     Generator
     GenerateStream(ctx context.Context, req GenerateRequest) (<-chan Chunk, <-chan Result, error)
 }
+
+// Async (optional — for slow image/video jobs): Generate returns a pending
+// Result (NewPendingResult); the engine's background poller calls Poll until it
+// resolves. Enable via Config.AsyncPoller + e.StartPoller(ctx).
+type AsyncGenerator interface {
+    Generator
+    Poll(ctx context.Context, handle TaskHandle) (Result, error)
+}
 ```
+
+> **Security note.** The built-in `openai`/`anthropic` generators accept a per-request
+> `Overrides["base_url"]` **only** if the URL is allowlisted via `WithAllowedBaseURLs(...)`.
+> This is deliberate: an un-allowlisted base URL would let a caller redirect the request —
+> and your API key — to an arbitrary host.
+
+See [`llms.txt`](llms.txt) for full, copy-pasteable custom-generator examples.
 
 ### Actions
 
@@ -295,7 +319,7 @@ e.Hooks().RegisterPre("check-hp", func(ctx context.Context, req *loom.StepReques
 e.Hooks().RegisterPost("no-spoilers", func(ctx context.Context, req *loom.StepRequest, res loom.Result) (loom.Result, error) {
     tr := res.(*loom.TextResult)
     if strings.Contains(tr.Content, "THE KILLER IS") {
-        return nil, loom.ErrRetryWith("forbidden spoiler detected", loom.RetryAnnotation{
+        return nil, loom.ErrRetryWith(loom.RetryAnnotation{
             Reason: "Do not reveal the killer's identity.",
         })
     }
@@ -303,23 +327,58 @@ e.Hooks().RegisterPost("no-spoilers", func(ctx context.Context, req *loom.StepRe
 })
 ```
 
+### Error handling
+
+`RunStep` returns typed errors — match them with `errors.Is` / `errors.As`, not
+string comparison:
+
+```go
+step, err := e.RunStep(ctx, sess, req)
+switch {
+case err == nil:
+    // ok
+case loom.IsSkip(err):
+    // a pre-hook skipped the step (not a failure)
+case errors.Is(err, loom.ErrNotFound):
+    var nf *loom.NotFoundError // nf.Kind ("agent"/"prompt"/…), nf.Key
+    errors.As(err, &nf)
+case errors.Is(err, loom.ErrGeneratorNotRegistered):
+    // misconfiguration
+default:
+    var ge *loom.GenerationError
+    if errors.As(err, &ge) && ge.Kind == loom.GenerationTransport {
+        // provider transport failure — safe to retry
+    }
+}
+```
+
+Other typed errors: `*loom.BudgetExceededError` (budget block), `*loom.RetryError`
+(via `loom.IsRetry` / `loom.RetryAnnotationFrom`), and `loom.ErrInvalidConfig` from
+`loom.New`. See [`llms.txt`](llms.txt) for the full contract.
+
 ### Cost tracking & budgets
 
-Every step records input/output tokens and USD cost (based on the built-in pricing table). Budgets enforce limits per platform, session, or tag.
+Every step records input/output tokens and USD cost (based on the built-in pricing
+table). Budgets enforce a spend cap per platform key (`Target.Kind` must be
+`loom.TargetPlatformID` — other kinds are rejected). Enforcement is best-effort
+(reads prior recorded spend; fails open on DB errors), not a hard transactional
+ceiling.
 
 ```go
 // Create a daily USD budget for a user.
 e.Budgets().Create(ctx, &loom.Budget{
     Name:     "user-daily-cap",
-    Target:   loom.BudgetTarget{Kind: "platform", Key: "user-123"},
+    Target:   loom.BudgetTarget{Kind: loom.TargetPlatformID, Key: "user-123"},
     Window:   loom.BudgetWindowDay,
-    Limit:    loom.BudgetLimit{USD: ptr(0.50)},
-    OnExceed: loom.BudgetBlock,
+    Limit:    loom.BudgetLimit{USD: 0.50}, // USD/Tokens/Steps; 0 = no cap on that axis
+    OnExceed: loom.BudgetBlock,            // or BudgetDowngrade (to Agent.FallbackAgentID) / BudgetNotify
+    Active:   true,                        // required; an inactive budget is ignored
 })
+// On block, RunStep returns *loom.BudgetExceededError.
 
 // Query cumulative usage.
 usage, _ := e.Cost().SessionUsage(ctx, sess.ID)
-fmt.Printf("Session cost: $%.4f (%d input tokens)\n", usage.TotalUSD, usage.InputTokens)
+fmt.Printf("Session cost: $%.4f (%d tokens)\n", usage.TotalUSD, usage.TotalTokens)
 ```
 
 ### Judge subsystem
@@ -350,7 +409,10 @@ result, _ := pair.Compare(ctx, judge.PairwiseRequest{
 Write test plans in code or YAML. The harness runs all variants in parallel:
 
 ```go
-import "github.com/rhaqim/loom/harness"
+import (
+    loom "github.com/rhaqim/loom"
+    "github.com/rhaqim/loom/harness"
+)
 
 plan := &harness.TestPlan{
     Name: "assistant-v2",
@@ -367,7 +429,7 @@ plan := &harness.TestPlan{
     Assertions: []harness.Assertion{
         harness.MinLength(80),
         harness.NoKeyword("ERROR"),
-        harness.HasStatus("stop"),
+        harness.HasStatus(loom.ResultStatusReady),
     },
 }
 
@@ -396,7 +458,8 @@ loom-cli seed seed.yaml
 loom-cli test plan.yaml
 ```
 
-Set `LOOM_DSN` to your Postgres connection string (or pass `--dsn`).
+Set the DSN via `LOOM_DSN` (preferred) or `--dsn-file <path>`; `--dsn <string>`
+also works but exposes credentials in `ps`, so prefer the others.
 
 **Seed file format:**
 
@@ -442,42 +505,49 @@ Requires `DND_DSN` / `LOOM_DSN` set, or the default `postgres://loom:loom@localh
 
 ## Project layout
 
+The public API is a thin **facade**: applications import only `github.com/rhaqim/loom`.
+The implementation lives under `internal/engine` (unimportable by other modules), so
+its layout can change without breaking you.
+
 ```sh
 loom/
-├── engine.go          # Engine, Config, RunStep, services
-├── action.go          # ActionKind constants and payload types
-├── agent.go           # Agent struct and AgentRegistry interface
-├── prompt.go          # Prompt struct and PromptRegistry interface
-├── session.go         # Session, Step, BranchNode, SessionRegistry
-├── step.go            # StepRequest, StepRunner
-├── flow.go            # Flow, FlowAgent, TurnRequest, RunTurn (multi-agent turns)
-├── result.go          # Result interface, TextResult, ImageResult, VideoResult
-├── generator.go       # Generator, StreamingGenerator, GenerateRequest
-├── hook.go            # HookBus, PreHook, PostHook
-├── modality.go        # Modality constants
-├── errors.go          # ErrSkip, ErrRetryWith, BudgetExceededError
-├── judges.go          # JudgeRegistry wiring
-├── gc_service.go      # GC service wiring
-├── persist.go         # All SQL persistence (unexported)
-├── schema/            # Idempotent DDL loader (Postgres + SQLite)
+├── aliases.go          # GENERATED public API — type aliases + re-exports of internal/engine
+├── doc.go              # package doc + go:generate directive for the facade
+├── llms.txt            # AI-oriented guide (point your AI assistant here)
+├── llms-full.txt       # GENERATED: llms.txt + full go doc API reference
+├── internal/
+│   ├── engine/         # the engine implementation (package engine), grouped by domain:
+│   │   ├── api_*.go     #   public types & interfaces (Agent, Prompt, Session, Result, …)
+│   │   ├── service_*.go #   registry/service implementations (agent, prompt, session, …)
+│   │   ├── store_*.go   #   SQL persistence
+│   │   ├── engine.go, flow.go, poller.go, hook.go, cache.go, template.go, …
+│   │   └── query.go     #   persistence wrappers (e.g. NotFoundError translation)
+│   ├── tools/facadegen/ # generator that emits aliases.go from internal/engine
+│   ├── enginetest/      # engine integration tests (skip without LOOM_DSN)
+│   └── clitest/         # CLI integration tests (skip without LOOM_DSN)
+├── schema/             # idempotent DDL loader + ordered migrations (Postgres + SQLite)
 ├── generator/
-│   ├── openai/        # OpenAI chat completions (sync + streaming)
-│   ├── anthropic/     # Anthropic Messages API (sync + streaming)
-│   ├── replicate/     # Async image generation
-│   ├── runway/        # Async video generation
-│   └── echo/          # Echo stub (testing, no API key needed)
-├── judge/             # RubricJudge, PairwiseJudge, ConstraintJudge
-├── gc/                # Background branch GC worker
-├── harness/           # TestPlan, VariantMatrix, Assertion DSL, parallel runner
-├── cmd/loom-cli/      # CLI: migrate, seed, test
-├── examples/
-│   ├── story/         # Minimal single-agent example
-│   ├── dnd/           # Full D&D solo experience (own go.mod)
-│   └── conexus-loom/  # Multi-agent, multimodal session via RunTurn (own go.mod, zero-setup)
-└── internal/
-    ├── enginetest/    # Engine integration tests
-    └── clitest/       # CLI integration tests
+│   ├── openai/         # OpenAI chat completions (sync + streaming)
+│   ├── anthropic/      # Anthropic Messages API (sync + streaming)
+│   ├── replicate/      # async image generation
+│   ├── runway/         # async video generation
+│   └── echo/           # echo stub (testing, no API key needed)
+├── judge/              # RubricJudge, PairwiseJudge, ConstraintJudge
+├── gc/                 # background branch GC worker
+├── harness/            # TestPlan, VariantMatrix, Assertion DSL, parallel runner
+├── cmd/loom-cli/       # CLI: migrate, seed, test
+├── scripts/            # gen-llms-full.sh
+├── docs/               # design/architecture notes
+└── examples/           # each has its own go.mod
+    ├── quickstart/     # smallest possible program
+    ├── story/          # minimal single-agent example
+    ├── dnd/            # full D&D solo experience
+    ├── storyapi/       # HTTP API with auth, sessions, streaming
+    └── conexus-loom/   # multi-agent, multimodal session via RunTurn (zero-setup)
 ```
+
+Contributors: `aliases.go` and `llms-full.txt` are generated — run `make generate`
+after changing the public surface (CI enforces the facade is in sync).
 
 ---
 
