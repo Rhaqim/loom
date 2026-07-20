@@ -81,8 +81,10 @@ func main() {
         Body: "The user says: {{.Action.Payload.text}}",
     })
 
-    sys, _  := e.Prompts().Get(ctx, "assistant-sys", 1)
-    user, _ := e.Prompts().Get(ctx, "assistant-user", 1)
+    // Registry reads are scoped by owner (an opaque tenant string).
+    // Single-tenant apps pass "" — the global scope.
+    sys, _  := e.Prompts().Get(ctx, "", "assistant-sys", 1)
+    user, _ := e.Prompts().Get(ctx, "", "assistant-user", 1)
 
     e.Agents().Create(ctx, &loom.Agent{
         Slug: "assistant", Version: 1, Modal: loom.ModalityText,
