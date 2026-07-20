@@ -99,7 +99,7 @@ func TestNotFoundError_KindAndKey(t *testing.T) {
 	ctx := context.Background()
 	e, _ := reproEngine(t, "nferr", map[string]Generator{"g": okGen{}}, PollerConfig{})
 
-	_, err := e.Agents().Get(ctx, "ghost", 3)
+	_, err := e.Agents().Get(ctx, "", "ghost", 3)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("agent get err = %v, want Is(ErrNotFound)", err)
 	}
@@ -111,7 +111,7 @@ func TestNotFoundError_KindAndKey(t *testing.T) {
 		t.Fatalf("NotFoundError = %+v, want {agent ghost@v3}", nf)
 	}
 
-	_, err = e.Prompts().Get(ctx, "missing", 1)
+	_, err = e.Prompts().Get(ctx, "", "missing", 1)
 	if !errors.As(err, &nf) || nf.Kind != "prompt" {
 		t.Fatalf("prompt get err = %v, want NotFoundError kind=prompt", err)
 	}

@@ -138,7 +138,7 @@ func Seed(ctx context.Context, e *loom.Engine, dir string) (map[string][]int, er
 }
 
 func seedPrompt(ctx context.Context, e *loom.Engine, slug string, ver int, kind loom.PromptKind, body string) (*loom.Prompt, error) {
-	if existing, err := e.Prompts().Get(ctx, slug, ver); err == nil && existing.Body == body {
+	if existing, err := e.Prompts().Get(ctx, "", slug, ver); err == nil && existing.Body == body {
 		return existing, nil // unchanged → reuse (lets you re-run the same version)
 	}
 	p := &loom.Prompt{Slug: slug, Version: ver, Kind: kind, Category: "conexus", Body: body}
@@ -157,7 +157,7 @@ var jsonAgents = map[string]bool{AgentLogician: true, AgentSensory: true, AgentM
 // "<agent>-schema" at version ver and returns its id.
 func seedResponseFormat(ctx context.Context, e *loom.Engine, agent string, ver int, raw string) (uuid.UUID, error) {
 	slug := agent + "-schema"
-	if existing, err := e.ResponseFormats().Get(ctx, slug, ver); err == nil {
+	if existing, err := e.ResponseFormats().Get(ctx, "", slug, ver); err == nil {
 		return existing.ID, nil
 	}
 	rf, err := loom.ResponseFormatJSON(raw, true)
@@ -187,7 +187,7 @@ func composeResponseFormat(agent string, schema map[int]uuid.UUID, n int) (*uuid
 // seedAgent creates an agent that composes specific system/user prompt versions
 // and a response format — each an independent reference.
 func seedAgent(ctx context.Context, e *loom.Engine, slug string, ver int, sysID, userID uuid.UUID, rfID *uuid.UUID, rfInline *loom.ResponseFormat) error {
-	if _, err := e.Agents().Get(ctx, slug, ver); err == nil {
+	if _, err := e.Agents().Get(ctx, "", slug, ver); err == nil {
 		return nil
 	}
 	return e.Agents().Create(ctx, &loom.Agent{

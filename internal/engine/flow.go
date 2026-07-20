@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"sync"
@@ -67,6 +68,11 @@ type Flow struct {
 // TurnRequest is the input to RunTurn.
 type TurnRequest struct {
 	Flow Flow
+	// Owner scopes registry resolution for every agent in the turn — the lead
+	// and all followers — exactly as StepRequest.Owner does for a single step.
+	// "" is the global scope. RunTurnBySlug sets this from the flow's own owner
+	// so a persisted flow always resolves its agents within its own tenant.
+	Owner string
 	// Action is the user input that drives the turn (nil for an opening).
 	Action *Action
 	// OnChunk receives streaming fragments from the lead agent (if Lead.Stream).
@@ -117,6 +123,13 @@ type Turn struct {
 // (see RunStep for the error contract) wrapped with the turn and agent slug.
 // Follower failures are never returned here — inspect Turn.Errors (keyed by
 // agent slug) for those.
+//
+// ErrSessionNotPersisted is the exception: it means the step itself ran and
+// committed and only the session row is stale, so the turn is NOT aborted. The
+// step appears in Turn.Steps (and Turn.Followers) as normal and the error is
+// recorded in Turn.Errors under "lead" or the follower's agent slug. A turn can
+// therefore return a nil error while carrying entries in Turn.Errors — check it
+// before treating Session.State as authoritative.
 func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest) (*Turn, error) {
 	turnID := uuid.New()
 
@@ -155,6 +168,7 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 	leadStep, err := e.steps.run(ctx, session, StepRequest{
 		AgentSlug:            req.Flow.Lead.AgentSlug,
 		AgentVersion:         req.Flow.Lead.AgentVersion,
+		Owner:                req.Owner,
 		Action:               req.Action,
 		OnChunk:              onChunk,
 		OnStreamEnd:          req.OnStreamEnd,
@@ -169,6 +183,14 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		turnRole:             "lead",
 		bus:                  bus,
 	})
+	// ErrSessionNotPersisted means the lead step itself ran and committed — only
+	// the session row is stale. The step is valid, so the turn proceeds and the
+	// error is surfaced on Turn.Errors rather than aborting siblings that would
+	// otherwise have succeeded.
+	var leadNotPersisted error
+	if errors.Is(err, ErrSessionNotPersisted) {
+		leadNotPersisted, err = err, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("loom: turn %q lead %q: %w", req.Flow.Slug, req.Flow.Lead.AgentSlug, err)
 	}
@@ -181,6 +203,13 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		Followers: map[string]*Step{},
 		Errors:    map[string]error{},
 		Steps:     []*Step{leadStep},
+	}
+	// The lead ran, but its session row write did not land. The step stands; the
+	// caller is told under the "lead" key so it can reconcile before trusting
+	// Session.State.
+	if leadNotPersisted != nil {
+		turn.Errors["lead"] = leadNotPersisted
+		e.log.Error("turn lead session row not persisted", "turn_id", turnID, "agent", leadSlug, "err", leadNotPersisted)
 	}
 	// Fire the lead callback synchronously, before any follower goroutine starts,
 	// so an embedder can build the follower inputs from the lead's output without
@@ -226,6 +255,7 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 			step, ferr := e.steps.run(ctx, session, StepRequest{
 				AgentSlug:    f.AgentSlug,
 				AgentVersion: f.AgentVersion,
+				Owner:        req.Owner,
 				// The turn's Action is recorded once, on the lead step. Followers
 				// analyse the lead's output and read the action via Inputs, so they
 				// carry no Action (sharing the lead's would duplicate its ID).
@@ -241,7 +271,12 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 				turnRole:             role,
 				bus:                  bus,
 			})
-			if ferr == nil {
+			// ErrSessionNotPersisted leaves a valid, committed step behind — only
+			// the session row is stale. Treat the step as a success (publish it,
+			// record it) while still reporting the error, so a stale row does not
+			// silently drop a follower's output from the turn.
+			notPersisted := errors.Is(ferr, ErrSessionNotPersisted)
+			if ferr == nil || notPersisted {
 				// Publish the follower's output so concurrent siblings can react.
 				bus.Publish(f.AgentSlug, f.AgentSlug, ResultText(step.Result))
 			}
@@ -250,7 +285,8 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 			if ferr != nil {
 				turn.Errors[f.AgentSlug] = ferr
 				e.log.Error("turn follower failed", "turn_id", turnID, "agent", f.AgentSlug, "err", ferr)
-			} else {
+			}
+			if ferr == nil || notPersisted {
 				turn.Followers[f.AgentSlug] = step
 				turn.Steps = append(turn.Steps, step)
 			}
@@ -259,9 +295,13 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 			// follower cannot serialize the others.
 			if req.OnStep != nil {
 				fired = true
-				if ferr != nil {
+				switch {
+				case notPersisted:
+					// Valid step, stale session row — hand back both.
+					req.OnStep(role, step, ferr)
+				case ferr != nil:
 					req.OnStep(role, nil, ferr)
-				} else {
+				default:
 					req.OnStep(role, step, nil)
 				}
 			}

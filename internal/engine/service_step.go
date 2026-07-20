@@ -25,7 +25,7 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	agent := req.Agent
 	if agent == nil {
 		var err error
-		agent, err = s.e.agents.Get(ctx, req.AgentSlug, req.AgentVersion)
+		agent, err = s.e.agents.Get(ctx, req.Owner, req.AgentSlug, req.AgentVersion)
 		if err != nil {
 			return nil, fmt.Errorf("loom: resolve agent %q: %w", req.AgentSlug, err)
 		}
@@ -286,30 +286,41 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		CreatedAt:   time.Now(),
 	}
 	// Finalize the post-step state before persisting so the step and its
-	// checkpoint commit in one transaction. Reconcile any Vars the hooks wrote on
-	// the per-step copy back onto the shared session (last writer wins).
+	// checkpoint commit in one transaction. Reconcile everything the hooks wrote
+	// on the per-step copy — Vars, Snapshot and AvailableActions — back onto the
+	// shared session (last writer wins). Modality is engine-owned and always
+	// taken from the result, so it is set after the merge.
+	mergeState(&session.State, stepSession.State)
 	session.State.Modality = result.Modality()
-	mergeVars(&session.State, stepSession.State.Vars)
 	if err := insertStep(ctx, s.e.db, s.e.prefix, step, &session.State); err != nil {
 		return nil, fmt.Errorf("loom: persist step: %w", err)
 	}
 
-	// Update session history and the session row.
+	// Update session history and the session row. The step, its result and its
+	// checkpoint are already committed above; this write is separate, so if it
+	// fails the step is durable while loom_sessions.state is stale. That is a
+	// partial write and the caller has to know: it is returned alongside the
+	// (valid, durable) step rather than swallowed. Recover the authoritative
+	// post-step state with SessionRegistry.StateAt at step.Index.
 	session.History = append(session.History, *step)
 	if err := s.e.sessions.Update(ctx, session); err != nil {
 		// A version conflict means another writer advanced the row (only possible
 		// across engine instances). Resync our version so later steps aren't
-		// permanently frozen; the contended state resolves last-writer-wins.
-		// Full reconciliation is deferred with the multi-instance work.
+		// permanently frozen once the caller reconciles.
 		if errors.Is(err, ErrSessionConflict) {
-			// Flag the losing step so callers (and metrics) can observe the
-			// cross-instance contention rather than only seeing a log line.
+			// Flag the losing step so metrics can observe cross-instance
+			// contention without inspecting the returned error.
 			step.Diagnostics["session_conflict"] = true
 			if fresh, gerr := querySession(ctx, s.e.db, s.e.prefix, session.ID); gerr == nil {
 				session.Version = fresh.Version
 			}
 		}
 		s.e.log.Error("update session after step", "session_id", session.ID, "err", err)
+
+		// Cost is still recorded: the step happened and the tokens were spent.
+		go s.e.costs.recordFromResult(context.Background(), step, agent, result, session.PlatformID)
+
+		return step, fmt.Errorf("%w (step %d): %w", ErrSessionNotPersisted, step.Index, err)
 	}
 
 	// Record cost asynchronously (best-effort).
@@ -320,7 +331,10 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 
 // resolveSystemPrompt loads a system-prompt override from the registry
 // (Slug+Version) or a file (File). An empty ref yields "".
-func (s *stepService) resolveSystemPrompt(ctx context.Context, ref PromptRef) (string, error) {
+//
+// owner scopes the registry lookup — it is the step's Owner, so a prompt
+// override resolves within the same tenant scope as the agent itself.
+func (s *stepService) resolveSystemPrompt(ctx context.Context, owner string, ref PromptRef) (string, error) {
 	if ref.Literal != "" {
 		return ref.Literal, nil
 	}
@@ -336,7 +350,7 @@ func (s *stepService) resolveSystemPrompt(ctx context.Context, ref PromptRef) (s
 		return string(b), nil
 	}
 	if ref.Slug != "" {
-		p, err := s.e.prompts.Get(ctx, ref.Slug, ref.Version)
+		p, err := s.e.prompts.Get(ctx, owner, ref.Slug, ref.Version)
 		if err != nil {
 			return "", err
 		}
@@ -412,7 +426,7 @@ func (s *stepService) buildGenerateRequest(
 	// A per-call system-prompt override (e.g. a harness prompt variant) replaces
 	// the agent's system prompt for this step only.
 	if req.SystemPromptOverride != nil {
-		body, err := s.resolveSystemPrompt(ctx, *req.SystemPromptOverride)
+		body, err := s.resolveSystemPrompt(ctx, req.Owner, *req.SystemPromptOverride)
 		if err != nil {
 			return GenerateRequest{}, fmt.Errorf("resolve system-prompt override: %w", err)
 		}

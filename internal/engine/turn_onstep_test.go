@@ -6,6 +6,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -137,7 +138,10 @@ func TestOnStep_FollowersNotSerialized(t *testing.T) {
 	<-done
 }
 
-// L8 — a CAS miss on the session Update flags the losing step.
+// L8 — a CAS miss on the session Update flags the losing step AND is reported
+// to the caller. The step itself is valid and durable, so RunStep returns it
+// alongside ErrSessionNotPersisted (wrapping ErrSessionConflict) rather than
+// reporting success on state the database does not have.
 func TestSessionConflict_Diagnostic(t *testing.T) {
 	ctx := context.Background()
 	e, _ := reproEngine(t, "conflict", map[string]Generator{"g": &kbGen{}}, PollerConfig{})
@@ -153,11 +157,23 @@ func TestSessionConflict_Diagnostic(t *testing.T) {
 	// next Update's compare-and-set misses.
 	sess.Version--
 	step, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a"})
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrSessionNotPersisted) {
+		t.Fatalf("err = %v, want ErrSessionNotPersisted", err)
+	}
+	if !errors.Is(err, ErrSessionConflict) {
+		t.Fatalf("err = %v, want it to wrap ErrSessionConflict", err)
+	}
+	// The step ran and committed, so it must still come back usable.
+	if step == nil {
+		t.Fatal("step = nil, want the committed step alongside the error")
 	}
 	if step.Diagnostics["session_conflict"] != true {
 		t.Fatalf("session_conflict diagnostic = %v, want true", step.Diagnostics["session_conflict"])
+	}
+	// The checkpoint is written inside the step transaction, so the authoritative
+	// post-step state is recoverable even though the session row is stale.
+	if _, found, serr := e.Sessions().StateAt(ctx, sess.ID, step.Index); serr != nil || !found {
+		t.Fatalf("StateAt(%d) = found %v, err %v; want a recoverable checkpoint", step.Index, found, serr)
 	}
 }
 

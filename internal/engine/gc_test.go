@@ -35,24 +35,24 @@ func gcExec(t *testing.T, db *sql.DB, q string, args ...any) {
 }
 
 func gcMakeBranch(t *testing.T, db *sql.DB, prefix string, id, parent uuid.UUID) {
-	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET parent_session_id=$2 WHERE id=$1`, prefix), id, parent)
+	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET parent_session_id=$1 WHERE id=$2`, prefix), parent, id)
 }
 
 func gcSetBranchPoint(t *testing.T, db *sql.DB, prefix string, id uuid.UUID, bp int) {
-	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET branch_point=$2 WHERE id=$1`, prefix), id, bp)
+	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET branch_point=$1 WHERE id=$2`, prefix), bp, id)
 }
 
 func gcAge(t *testing.T, db *sql.DB, prefix string, id uuid.UUID, age time.Duration) {
 	old := time.Now().Add(-age)
-	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET created_at=$2, updated_at=$3 WHERE id=$1`, prefix), id, old, old)
+	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET created_at=$1, updated_at=$2 WHERE id=$3`, prefix), old, old, id)
 }
 
 func gcSoftDelete(t *testing.T, db *sql.DB, prefix string, id uuid.UUID, deletedAt time.Time) {
-	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET deleted_at=$2 WHERE id=$1`, prefix), id, deletedAt)
+	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET deleted_at=$1 WHERE id=$2`, prefix), deletedAt, id)
 }
 
 func gcTagTest(t *testing.T, db *sql.DB, prefix string, id uuid.UUID) {
-	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET tags=$2 WHERE id=$1`, prefix), id, `["test:true"]`)
+	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET tags=$1 WHERE id=$2`, prefix), `["test:true"]`, id)
 }
 
 func gcAddStep(t *testing.T, db *sql.DB, prefix string, sessionID uuid.UUID, index int) {
@@ -241,7 +241,7 @@ func TestGC_T4_ScopesToBranchesAndHonorsPin(t *testing.T) {
 	gcMakeBranch(t, db, e.prefix, lookalike.ID, parent.ID)
 	gcAge(t, db, e.prefix, lookalike.ID, 2*time.Hour)
 	gcAddStep(t, db, e.prefix, lookalike.ID, 0)
-	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET tags=$2 WHERE id=$1`, e.prefix), lookalike.ID, `["latest:true"]`)
+	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET tags=$1 WHERE id=$2`, e.prefix), `["latest:true"]`, lookalike.ID)
 
 	report, err := NewBranchGCWorker(e, gcTestConfig(false)).Sweep(ctx)
 	if err != nil {

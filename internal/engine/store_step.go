@@ -145,14 +145,28 @@ func sqlInsertAction(ctx context.Context, db execer, prefix string, sessionID uu
 }
 
 func sqlQuerySteps(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID) ([]Step, error) {
-	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
+	return sqlQueryStepsPage(ctx, db, prefix, sessionID, 0, 0)
+}
+
+// sqlQueryStepsPage reads a session's steps ordered by index. limit <= 0 means
+// no limit. Each row carries the fully rendered request and the result payload,
+// so an unbounded read grows with session length — hence the paged variant.
+func sqlQueryStepsPage(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID, limit, offset int) ([]Step, error) {
+	q := fmt.Sprintf(`
 		SELECT s.id, s.session_id, s.step_index, s.agent_id,
 		       s.request, s.diagnostics, s.duration_ms, s.created_at,
 		       r.modality, r.status, r.payload
 		FROM %ssteps s
 		JOIN %sresults r ON r.id = s.result_id
 		WHERE s.session_id=$1
-		ORDER BY s.step_index`, prefix, prefix), sessionID)
+		ORDER BY s.step_index`, prefix, prefix)
+	args := []any{sessionID}
+	if limit > 0 {
+		// OFFSET without LIMIT is not portable, so it is only applied alongside one.
+		q += ` LIMIT $2 OFFSET $3`
+		args = append(args, limit, max(offset, 0))
+	}
+	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

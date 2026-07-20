@@ -227,6 +227,17 @@ Enable polling via `Config.AsyncPoller` (Interval, Workers) and `e.StartPoller(c
   `loom.GenerationTransport` (network/stream — often retryable, `ge.Unwrap()` has the cause),
   `loom.GenerationRejected` (provider refused, e.g. content policy — surface to user),
   `loom.GenerationEmpty` (no result).
+- `loom.ErrSessionNotPersisted` — **partial success, and the one error where the returned
+  `*Step` is non-nil and valid.** The step ran and its result + checkpoint committed, but the
+  `loom_sessions` row update failed, so `sessions.state` (and your in-memory `*Session`) is
+  stale. It wraps the cause: `loom.ErrSessionConflict` (another writer won the CAS) or
+  `loom.ErrNotFound` (the session was discarded mid-step). Recover the authoritative state with
+  `e.Sessions().StateAt(ctx, sess.ID, step.Index)` — checkpoints are written inside the step
+  transaction, so they cannot be missing. If you use loom as a system of record, you MUST handle
+  this rather than treating a non-nil error as "the step failed".
+  In `RunTurn` this error does NOT abort the turn: the step lands in `Turn.Steps` as normal and
+  the error is recorded in `Turn.Errors` under `"lead"` or the follower's slug — so a turn can
+  return a nil error while `Turn.Errors` is non-empty. Check it before trusting `Session.State`.
 - Other errors wrap the underlying hook/template/persistence failure.
 
 ```go
@@ -238,6 +249,12 @@ case loom.IsSkip(err):
     // step intentionally skipped
 case errors.Is(err, loom.ErrNotFound):
     var nf *loom.NotFoundError; errors.As(err, &nf) // nf.Kind, nf.Key
+case errors.Is(err, loom.ErrSessionNotPersisted):
+    // The step IS valid and durable — only the session row is stale.
+    // Reconcile from the checkpoint, then carry on with `step`.
+    if st, ok, _ := e.Sessions().StateAt(ctx, sess.ID, step.Index); ok {
+        sess.State = st
+    }
 case errors.Is(err, loom.ErrGeneratorNotRegistered):
     // config problem
 default:
@@ -272,10 +289,34 @@ On a retry error, `loom.RetryAnnotationFrom(err)` returns the annotation; schema
 populate `RetryAnnotation.Violations` (a structured `[]string`). Register hooks before running
 steps (registration is safe but do it at startup).
 
+**Mutating state from a hook.** Hooks are the supported in-step mutation point: a pre-hook can
+write `req.Session.State` before the user template is rendered (e.g. inject recalled memories
+into `Vars`). Each step gets a private deep copy of `State`, and `Vars`, `Snapshot` and
+`AvailableActions` are all merged back onto the shared session and into the step's checkpoint.
+`Vars` merge key-by-key so concurrent followers each contribute their own keys; `Snapshot` and
+`AvailableActions` are opaque whole values, so concurrent writers resolve last-writer-wins.
+`State.Modality` is engine-owned — it is always overwritten by the result's modality.
+
 ## Cost tracking & budgets
 
-Every step records input/output tokens and USD (from a built-in pricing table). Query with
-`e.Cost().SessionUsage(ctx, sess.ID)`. Budgets enforce spend caps per platform key:
+Every step records input/output tokens and USD. Query with
+`e.Cost().SessionUsage(ctx, sess.ID)`.
+
+**Token counts are always exact; the USD figures are only real money if you configured pricing.**
+With no `Config.Pricing` and no `Config.DefaultPrice`, USD is derived from a built-in placeholder
+rate ($1 in / $3 out per 1M) and is fabricated. `UsageSummary.PricingConfigured` (and the same
+field on `AgentCostStats`) tells you which you have — render `TotalUSD`/`ByModel`/`USDP95` as
+"—" rather than a dollar amount when it is false, and never bill off it. Set `Config.Pricing`
+(per model id, reported by the generator on result metadata) or `Config.DefaultPrice`:
+
+```go
+loom.New(loom.Config{ /* ... */
+    Pricing: map[string]loom.ModelPrice{"gpt-4o": {InputPer1M: 2.50, OutputPer1M: 10.00}},
+    DefaultPrice: &loom.ModelPrice{InputPer1M: 1, OutputPer1M: 3}, // models absent from Pricing
+})
+```
+
+Budgets enforce spend caps per platform key:
 
 ```go
 e.Budgets().Create(ctx, &loom.Budget{
@@ -289,6 +330,11 @@ e.Budgets().Create(ctx, &loom.Budget{
 ```
 Enforcement is best-effort (reads prior recorded spend, fails open on DB errors) — not a hard
 transactional ceiling. On block, `RunStep` returns `*loom.BudgetExceededError`.
+
+A `Limit.USD` is evaluated against the same recorded USD described above, so **a USD cap is not
+meaningful without configured pricing** — loom still enforces it (failing open on a spend control
+would be worse) and logs an error once explaining that the cap does not reflect real spend.
+`Limit.Tokens` and `Limit.Steps` are exact regardless.
 
 ## Caching (optional, recommended for hot paths)
 
@@ -307,9 +353,82 @@ See `github.com/rhaqim/loom/judge` and the README for `ScoreRequest`/`PairwiseRe
 ## Sessions: branching & replay, GC
 
 - Fork at a step: `branch, _ := e.Sessions().Fork(ctx, sess.ID, stepIndex)` — parent untouched.
+  **The branch starts with EMPTY history.** Parent steps are not copied and nothing stitches them
+  on at read time, so because generation context is built from `Session.History`, a fresh branch
+  starts with no model context. `State` IS rewound (reconstructed from the parent's checkpoint
+  at-or-before `stepIndex`). Anything that must survive a fork therefore has to live in `State`
+  (`Vars`/`Snapshot`), not in step history. Branch step indices restart at 0, so they are unique
+  only per session — join on `(session_id, step_index)`, never `step_index` alone.
 - Inspect: `tree, _ := e.Sessions().BranchTree(ctx, rootID)`.
 - Stale/speculative/test branches are cleaned by the GC worker (`e.GC()`, configured via
   `Config.BranchGC`; DryRun by default — nothing is deleted until you opt in).
+
+### Reading sessions (matters for long sessions)
+
+`Get` loads the FULL step history, and each step carries its rendered request and result payload
+— megabytes on a long session, growing linearly, so late reads cost more than early ones. When
+resuming you usually only need `Version` and `State`:
+
+- `e.Sessions().GetHeader(ctx, id)` — no history (`History` is left nil, so you can tell
+  "not loaded" from "no steps"). Cost is independent of session length.
+- `e.Sessions().Steps(ctx, id, limit, offset)` — page through history (`limit <= 0` = no limit).
+- `e.Sessions().StateAt(ctx, id, stepIndex)` — the checkpointed state at-or-before a step; how
+  you recover from `ErrSessionNotPersisted`.
+
+### Deleting and pinning
+
+- `Discard` soft-deletes. Afterwards the session is invisible to `Get`, `GetHeader`, `List`,
+  `BranchTree` and `Fork`, and `Update` rejects it. Use `GetIncludingDeleted` to read one back
+  (e.g. to restore it) — note you cannot write it until it is restored.
+- `Pin` exempts a session from all four GC tiers. `Purge` (irreversible hard delete, cascades
+  steps/actions/checkpoints) **refuses a pinned session** with `loom.ErrSessionPinned`; use
+  `ForcePurge` to delete it anyway. `Discard` is not blocked by a pin.
+- Writes to a missing or already-discarded session return `*loom.NotFoundError` rather than
+  silently affecting zero rows.
+
+## Registries: versioning, lookup, and the `owner` scope
+
+Agents, prompts and response formats are immutable and versioned. Edits create a NEW version;
+version `0` on a read resolves to the latest.
+
+**Every registry read is scoped by `owner`** — an opaque, app-controlled tenant string, `""` for
+the global scope. It is the first argument on every lookup:
+
+```go
+a, err := e.Agents().Get(ctx, owner, "assistant", 1)   // version 0 => latest
+a, err := e.Agents().Latest(ctx, owner, "assistant")
+list, err := e.Agents().List(ctx, owner, category)
+vers, err := e.Agents().Versions(ctx, owner, "assistant") // newest first
+err = e.Agents().Delete(ctx, owner, "assistant", 1)
+
+p, err := e.Prompts().Get(ctx, owner, "assistant-sys", 1)
+list, err := e.Prompts().List(ctx, owner, loom.PromptKindSystem, category)
+```
+
+`Create` is unchanged — the owner comes from the record's own `Owner` field
+(`&loom.Agent{Slug: "assistant", Owner: "tenant-a", ...}`).
+
+Single-tenant applications pass `""` everywhere and can ignore this.
+
+`""` is a distinct namespace, NOT a wildcard: a tenant with no matching record gets
+`ErrNotFound` rather than falling through to the global scope. Two owners may hold the same slug.
+
+Execution is scoped too, and this is the part that is easy to miss — `RunStep` resolves the agent
+by slug, so **the owner must be on the request or you are not tenant-isolated**:
+
+```go
+step, err := e.RunStep(ctx, sess, loom.StepRequest{Owner: "tenant-a", AgentSlug: "assistant"})
+turn, err := e.RunTurn(ctx, sess, loom.TurnRequest{Owner: "tenant-a", Flow: f})
+```
+`RunTurnBySlug` sets `Owner` from the persisted flow's own owner, so a stored flow always
+resolves its agents inside its own tenant.
+
+`GetByID(ctx, id)` (agents, prompts, response formats) is deliberately NOT owner-scoped — it
+exists to resolve internal FK references such as `Agent.SystemPromptID`. Do not hand it
+untrusted tenant-supplied IDs without checking the returned record's `Owner` yourself.
+
+`e.Generators()` lists the generator slugs registered in this process (sorted), so a UI can
+validate `Agent.GeneratorSlug` before saving instead of failing at generation time.
 
 ## Schema & migrations (IMPORTANT gotcha)
 
@@ -344,6 +463,13 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
   inline schema on the agent) and register `loom.SchemaValidationPostHook()`.
 - "Stream to a client" → set `StepRequest.OnChunk` (or `TurnRequest.OnChunk` for a turn's lead).
 - "Test without API keys" → use `generator/echo`.
+- "Multi-tenant registries" → set `Owner` on each Agent/Prompt/ResponseFormatRecord you create,
+  pass that owner to every registry read, AND set `StepRequest.Owner` / `TurnRequest.Owner` so
+  execution resolves in the same scope.
+- "Resume a long session cheaply" → `GetHeader` for `Version`+`State`, then `Steps(ctx, id,
+  limit, offset)` if you need history. Avoid `Get` on sessions with many steps.
+- "Show real costs" → set `Config.Pricing`/`Config.DefaultPrice`, and gate any USD you display
+  on `UsageSummary.PricingConfigured`.
 
 ## Things NOT to do
 
@@ -353,6 +479,13 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
 - Do not mutate a returned Agent/Prompt and expect it to persist — create a new version instead.
 - Do not set `StepRequest.Overrides["base_url"]` expecting built-in openai/anthropic to honor it
   unless the operator allowlisted that URL (security guard).
+- Do not treat a non-nil `RunStep` error as "nothing happened" — `loom.ErrSessionNotPersisted`
+  means the step DID commit and `step` is valid; only the session row is stale.
+- Do not rely on step history surviving a `Fork` — it does not. Carry continuity in `State`.
+- Do not display `TotalUSD`/`USDP95` as money when `PricingConfigured` is false — those numbers
+  are placeholders, not spend.
+- Do not omit `StepRequest.Owner` in a multi-tenant app and assume registry scoping covers you —
+  agent resolution happens per step, so an absent owner resolves in the global scope.
 
 ## Where to look next
 

@@ -97,8 +97,8 @@ func main() {
 	seedPrompt(ctx, e, userTmpl)
 
 	// Resolve prompt IDs for the agent.
-	sys, _ := e.Prompts().Get(ctx, "narrator-system", 1)
-	ut, _ := e.Prompts().Get(ctx, "narrator-user", 1)
+	sys, _ := e.Prompts().Get(ctx, "", "narrator-system", 1)
+	ut, _ := e.Prompts().Get(ctx, "", "narrator-user", 1)
 
 	agent := &loom.Agent{
 		Slug:           "narrator",
@@ -199,7 +199,7 @@ func main() {
 
 // seedPrompt inserts a prompt if it doesn't already exist.
 func seedPrompt(ctx context.Context, e *loom.Engine, p *loom.Prompt) {
-	existing, _ := e.Prompts().Get(ctx, p.Slug, p.Version)
+	existing, _ := e.Prompts().Get(ctx, "", p.Slug, p.Version)
 	if existing != nil {
 		return
 	}
@@ -210,7 +210,7 @@ func seedPrompt(ctx context.Context, e *loom.Engine, p *loom.Prompt) {
 
 // seedAgent inserts an agent if it doesn't already exist.
 func seedAgent(ctx context.Context, e *loom.Engine, a *loom.Agent) {
-	existing, _ := e.Agents().Get(ctx, a.Slug, a.Version)
+	existing, _ := e.Agents().Get(ctx, "", a.Slug, a.Version)
 	if existing != nil {
 		return
 	}

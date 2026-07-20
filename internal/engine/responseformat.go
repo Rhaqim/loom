@@ -19,7 +19,7 @@ import (
 type ResponseFormatRecord struct {
 	ID         uuid.UUID
 	Slug       string // human-readable identifier, e.g. "logician-schema"
-	Owner      string // opaque app-owned scope ("" = global); reserved for future per-tenant use
+	Owner      string // opaque app-owned scope ("" = global)
 	Version    int    // monotonically increasing; editing creates a new version
 	Schema     map[string]any
 	StrictMode bool
@@ -34,19 +34,30 @@ func (r *ResponseFormatRecord) Format() *ResponseFormat {
 	return &ResponseFormat{Schema: r.Schema, StrictMode: r.StrictMode}
 }
 
-// ResponseFormatRegistry resolves and manages reusable response formats.
+// ResponseFormatRegistry resolves and manages reusable response formats. owner
+// is an opaque scope the embedding application controls (e.g. a tenant/studio
+// id); "" is the global default. Slugs are only unique within an owner, so every
+// slug-addressed lookup takes one.
 type ResponseFormatRegistry interface {
-	// Create persists a new response-format version.
+	// Create persists a new response-format version. The scope comes from
+	// rf.Owner.
 	Create(ctx context.Context, rf *ResponseFormatRecord) error
-	// Get retrieves a specific version. Version 0 resolves to LATEST.
-	Get(ctx context.Context, slug string, version int) (*ResponseFormatRecord, error)
-	// Latest resolves the highest version of slug.
-	Latest(ctx context.Context, slug string) (*ResponseFormatRecord, error)
+	// Get retrieves a specific version within owner. Version 0 resolves to LATEST.
+	Get(ctx context.Context, owner, slug string, version int) (*ResponseFormatRecord, error)
+	// Latest resolves the highest version of slug within owner.
+	Latest(ctx context.Context, owner, slug string) (*ResponseFormatRecord, error)
 	// GetByID retrieves a response format by ID.
+	//
+	// This is NOT owner-scoped: it exists to resolve loom's own internal FK
+	// references (Agent.ResponseFormatID), and a UUID primary key is globally
+	// unique. An application must therefore not pass an untrusted,
+	// tenant-supplied ID to it without checking the returned record's Owner
+	// against the caller's scope itself.
 	GetByID(ctx context.Context, id uuid.UUID) (*ResponseFormatRecord, error)
-	// Delete removes a specific response-format version (>= 1). On Postgres it
-	// fails if the version is still referenced by an agent (ON DELETE RESTRICT).
-	Delete(ctx context.Context, slug string, version int) error
+	// Delete removes a specific response-format version (>= 1) within owner. On
+	// Postgres it fails if the version is still referenced by an agent (ON DELETE
+	// RESTRICT).
+	Delete(ctx context.Context, owner, slug string, version int) error
 }
 
 // ResponseFormats returns the response-format registry.
@@ -64,15 +75,15 @@ func (s *responseFormatService) Create(ctx context.Context, rf *ResponseFormatRe
 	return sqlInsertResponseFormat(ctx, s.e.db, s.e.prefix, rf)
 }
 
-func (s *responseFormatService) Get(ctx context.Context, slug string, version int) (*ResponseFormatRecord, error) {
+func (s *responseFormatService) Get(ctx context.Context, owner, slug string, version int) (*ResponseFormatRecord, error) {
 	if version == 0 {
-		return s.Latest(ctx, slug)
+		return s.Latest(ctx, owner, slug)
 	}
-	key := cacheKey("rf", s.e.prefix, slug, version)
+	key := cacheKeyOwned("rf", s.e.prefix, owner, slug, version)
 	if r, ok := cacheGet[ResponseFormatRecord](ctx, s.e.cache, key); ok {
 		return r, nil
 	}
-	r, err := sqlQueryResponseFormat(ctx, s.e.db, s.e.prefix, slug, version)
+	r, err := sqlQueryResponseFormat(ctx, s.e.db, s.e.prefix, owner, slug, version)
 	if err != nil {
 		return nil, wrapNotFound(err, "response_format", fmt.Sprintf("%s@v%d", slug, version))
 	}
@@ -80,11 +91,12 @@ func (s *responseFormatService) Get(ctx context.Context, slug string, version in
 	return r, nil
 }
 
-func (s *responseFormatService) Latest(ctx context.Context, slug string) (*ResponseFormatRecord, error) {
-	r, err := sqlQueryResponseFormatLatest(ctx, s.e.db, s.e.prefix, slug)
+func (s *responseFormatService) Latest(ctx context.Context, owner, slug string) (*ResponseFormatRecord, error) {
+	r, err := sqlQueryResponseFormatLatest(ctx, s.e.db, s.e.prefix, owner, slug)
 	return r, wrapNotFound(err, "response_format", slug)
 }
 
+// GetByID is deliberately not owner-scoped — see ResponseFormatRegistry.GetByID.
 func (s *responseFormatService) GetByID(ctx context.Context, id uuid.UUID) (*ResponseFormatRecord, error) {
 	key := cacheKey("rf-id", s.e.prefix, id.String(), 0)
 	if r, ok := cacheGet[ResponseFormatRecord](ctx, s.e.cache, key); ok {
@@ -98,20 +110,20 @@ func (s *responseFormatService) GetByID(ctx context.Context, id uuid.UUID) (*Res
 	return r, nil
 }
 
-func (s *responseFormatService) Delete(ctx context.Context, slug string, version int) error {
+func (s *responseFormatService) Delete(ctx context.Context, owner, slug string, version int) error {
 	if version < 1 {
 		return fmt.Errorf("loom: delete response format %q: an explicit version >= 1 is required", slug)
 	}
 	// Resolve the row id first so we can also evict the by-id cache that GetByID
 	// and the agent-build path populate (cacheKey "rf-id").
 	var id uuid.UUID
-	if rf, err := sqlQueryResponseFormat(ctx, s.e.db, s.e.prefix, slug, version); err == nil {
+	if rf, err := sqlQueryResponseFormat(ctx, s.e.db, s.e.prefix, owner, slug, version); err == nil {
 		id = rf.ID
 	}
-	if err := sqlDeleteResponseFormat(ctx, s.e.db, s.e.prefix, slug, version); err != nil {
+	if err := sqlDeleteResponseFormat(ctx, s.e.db, s.e.prefix, owner, slug, version); err != nil {
 		return err
 	}
-	cacheDelete(ctx, s.e.cache, cacheKey("rf", s.e.prefix, slug, version))
+	cacheDelete(ctx, s.e.cache, cacheKeyOwned("rf", s.e.prefix, owner, slug, version))
 	if id != uuid.Nil {
 		cacheDelete(ctx, s.e.cache, cacheKey("rf-id", s.e.prefix, id.String(), 0))
 	}

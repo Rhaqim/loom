@@ -3,7 +3,9 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -360,6 +362,13 @@ func TestMultiSchemaBackfillPostgres(t *testing.T) {
 	// that is not on the search_path.
 	setup := []string{
 		`DROP TABLE IF EXISTS loom_schema_migrations`,
+		// Clear the shared tables first. Dropping the owner column below also
+		// drops the unique key that contains it, so any rows other tests left
+		// behind that were distinct only BY owner collapse into duplicates the
+		// moment owner is re-added with DEFAULT '' — which then makes
+		// migration 6 rightly refuse to re-create the key. This test is about
+		// column backfill, not row data, so start from empty.
+		`TRUNCATE loom_prompts CASCADE`,
 		`ALTER TABLE loom_prompts DROP COLUMN IF EXISTS owner`,
 		`DROP SCHEMA IF EXISTS mig_other CASCADE`,
 		`CREATE SCHEMA mig_other`,
@@ -386,5 +395,197 @@ func TestMultiSchemaBackfillPostgres(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("public.loom_prompts was not backfilled: the decoy in mig_other masked the missing column")
+	}
+}
+
+// TestOwnerUniqueKeyUpgradePostgres exercises migration 6 on a database that
+// predates it — one whose registry tables still carry the narrow
+// UNIQUE (slug, version) key from the original baseline.
+//
+// The fresh-database tests cannot cover this: the current baseline already
+// creates the wide key, so the DROP CONSTRAINT path never runs there. This
+// builds the OLD shape by hand, applies the migration, and asserts the key
+// actually widened — two owners can share a slug afterwards, and a true
+// duplicate is still rejected.
+func TestOwnerUniqueKeyUpgradePostgres(t *testing.T) {
+	dsn := os.Getenv("LOOM_DSN")
+	if dsn == "" {
+		t.Skip("set LOOM_DSN to run the Postgres owner-key upgrade test")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cleanups run LIFO, so registering the close FIRST makes it run LAST —
+	// after the table drop below, which still needs a live connection.
+	t.Cleanup(func() { db.Close() })
+
+	// Isolated schema so this cannot disturb the other Postgres tests.
+	const prefix = "upg_"
+	dropPrefixed(t, db, prefix)
+	t.Cleanup(func() { dropPrefixed(t, db, prefix) })
+
+	// Build the PRE-migration shape: owner column present (migration 2 shipped
+	// it) but uniqueness still keyed on slug+version only.
+	legacy := []string{
+		fmt.Sprintf(`CREATE TABLE %sprompts (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			slug TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '',
+			version INT NOT NULL, kind TEXT NOT NULL DEFAULT 'system',
+			category TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '',
+			variables JSONB NOT NULL DEFAULT '[]', metadata JSONB NOT NULL DEFAULT '{}',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(), notes TEXT NOT NULL DEFAULT '',
+			UNIQUE (slug, version, kind)
+		)`, prefix),
+		fmt.Sprintf(`CREATE TABLE %sresponse_formats (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			slug TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '',
+			version INT NOT NULL, schema JSONB NOT NULL DEFAULT '{}',
+			strict BOOL NOT NULL DEFAULT false,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (slug, version)
+		)`, prefix),
+		fmt.Sprintf(`CREATE TABLE %sagents (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			slug TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '',
+			version INT NOT NULL, category TEXT NOT NULL DEFAULT '',
+			modality TEXT NOT NULL DEFAULT 'text', generator_slug TEXT NOT NULL DEFAULT '',
+			params JSONB NOT NULL DEFAULT '{}',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (slug, version)
+		)`, prefix),
+	}
+	for _, s := range legacy {
+		if _, err := db.ExecContext(ctx, s); err != nil {
+			t.Fatalf("build legacy schema: %v\nSQL: %s", err, s)
+		}
+	}
+
+	// Two owners sharing a slug must be REJECTED before the migration —
+	// otherwise this test would pass even if the migration did nothing.
+	if _, err := db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO %sagents (slug, owner, version) VALUES ('narrator','a',1)`, prefix)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO %sagents (slug, owner, version) VALUES ('narrator','b',1)`, prefix)); err == nil {
+		t.Fatal("legacy schema accepted two owners sharing a slug — precondition is wrong, test proves nothing")
+	}
+
+	if err := NewLoader(DialectPostgres, prefix).Apply(ctx, db); err != nil {
+		t.Fatalf("Apply on a legacy database: %v", err)
+	}
+
+	// After the migration the same insert must succeed.
+	if _, err := db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO %sagents (slug, owner, version) VALUES ('narrator','b',1)`, prefix)); err != nil {
+		t.Fatalf("two owners still cannot share a slug after migration 6: %v", err)
+	}
+	// ...and a genuine duplicate must still be rejected.
+	if _, err := db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO %sagents (slug, owner, version) VALUES ('narrator','b',1)`, prefix)); err == nil {
+		t.Fatal("duplicate (owner, slug, version) was accepted — uniqueness was dropped, not widened")
+	}
+
+	// Same for prompts (4-column key) and response formats.
+	for _, ins := range []string{
+		`INSERT INTO %sprompts (slug, owner, version, kind) VALUES ('p','a',1,'system')`,
+		`INSERT INTO %sprompts (slug, owner, version, kind) VALUES ('p','b',1,'system')`,
+		`INSERT INTO %sresponse_formats (slug, owner, version) VALUES ('rf','a',1)`,
+		`INSERT INTO %sresponse_formats (slug, owner, version) VALUES ('rf','b',1)`,
+	} {
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(ins, prefix)); err != nil {
+			t.Fatalf("post-migration insert failed: %v\nSQL: %s", err, ins)
+		}
+	}
+
+	// Re-applying must stay clean (DROP ... IF EXISTS / CREATE ... IF NOT EXISTS).
+	if err := NewLoader(DialectPostgres, prefix).Apply(ctx, db); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+}
+
+func dropPrefixed(t *testing.T, db *sql.DB, prefix string) {
+	t.Helper()
+	for _, tbl := range []string{"agents", "response_formats", "prompts", "schema_migrations"} {
+		if _, err := db.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS %s%s CASCADE`, prefix, tbl)); err != nil {
+			t.Fatalf("drop %s%s: %v", prefix, tbl, err)
+		}
+	}
+}
+
+// TestOwnerUniqueKeyRefusesDuplicatesPostgres pins migration 6's behaviour when
+// existing data already violates the wider key.
+//
+// This is reachable in production: dropping and re-adding the owner column (or
+// any path that backfills owner=” across rows that were previously distinct BY
+// owner) collapses them into duplicates. Apply gates engine startup, so the
+// failure must name the offending rows rather than surfacing a bare
+// "could not create unique index (23505)" — and it must never resolve the
+// conflict by deleting a caller's rows.
+func TestOwnerUniqueKeyRefusesDuplicatesPostgres(t *testing.T) {
+	dsn := os.Getenv("LOOM_DSN")
+	if dsn == "" {
+		t.Skip("set LOOM_DSN to run the Postgres duplicate-refusal test")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	const prefix = "dup_"
+	dropPrefixed(t, db, prefix)
+	t.Cleanup(func() { dropPrefixed(t, db, prefix) })
+
+	// A legacy-shaped agents table with NO unique key at all, holding rows that
+	// the wide key would reject.
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE TABLE %sagents (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		slug TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '',
+		version INT NOT NULL, category TEXT NOT NULL DEFAULT '',
+		modality TEXT NOT NULL DEFAULT 'text', generator_slug TEXT NOT NULL DEFAULT '',
+		params JSONB NOT NULL DEFAULT '{}',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`, prefix)); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(
+			`INSERT INTO %sagents (slug, owner, version) VALUES ('dupe','', 1)`, prefix)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = NewLoader(DialectPostgres, prefix).Apply(ctx, db)
+	if err == nil {
+		t.Fatal("Apply succeeded despite duplicate rows — the key was not enforced")
+	}
+	for _, want := range []string{"dup_agents", "owner, slug, version", "slug=dupe"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error is not actionable: missing %q\ngot: %v", want, err)
+		}
+	}
+
+	// The duplicates must still be there — a migration does not get to delete data.
+	var n int
+	if qerr := db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT count(*) FROM %sagents WHERE slug='dupe'`, prefix)).Scan(&n); qerr != nil {
+		t.Fatal(qerr)
+	}
+	if n != 2 {
+		t.Fatalf("row count = %d, want 2 — the migration destroyed data it should have refused", n)
+	}
+
+	// After the operator dedupes, the same Apply must go through.
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		`DELETE FROM %sagents WHERE ctid NOT IN (SELECT min(ctid) FROM %sagents GROUP BY owner, slug, version)`,
+		prefix, prefix)); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewLoader(DialectPostgres, prefix).Apply(ctx, db); err != nil {
+		t.Fatalf("Apply after dedupe: %v", err)
 	}
 }

@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.25.x"
           cache: true
 
       # Fail if aliases.go was not regenerated after changing the public surface
@@ -31,9 +31,52 @@ jobs:
         run: go build ./...
 
       # No LOOM_DSN is set, so the Postgres-backed integration tests in
-      # internal/enginetest and internal/clitest skip themselves. The SQLite and
-      # in-memory tests (including the facade drift guard) still run under -race.
-      # For full integration coverage, run `make test-all` against a local
-      # Postgres (see `make up`).
+      # schema, internal/enginetest and internal/clitest skip themselves. The
+      # SQLite and in-memory tests (including the facade drift guard) still run
+      # under -race. The `postgres` job below covers what is skipped here.
       - name: Test (race)
         run: go test -race -count=1 ./...
+
+  postgres:
+    name: Postgres integration & migrations
+    runs-on: ubuntu-latest
+
+    # Without this job the Postgres-only code paths — most importantly the
+    # schema migrations that ALTER existing tables — are never executed in CI.
+    # A migration that fails on a populated database blocks Loader.Apply, which
+    # gates engine startup, so a regression here is a deploy-time outage rather
+    # than a test failure. The SQLite suite cannot catch it: the dialects differ
+    # in exactly the places migrations touch.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: loom
+          POSTGRES_PASSWORD: loom
+          POSTGRES_DB: loom
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U loom -d loom"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      # -p 1 is REQUIRED — see the note on `test-all` in the Makefile. These
+      # packages share one database and the same loom_ prefixed tables, so
+      # running them in parallel interleaves migrations with other packages'
+      # data and fails spuriously.
+      # Set DSN, not LOOM_DSN: the Makefile does `LOOM_DSN := $(DSN)`, which
+      # overrides anything LOOM_DSN held in the environment. DSN uses ?= and so
+      # honours this.
+      - name: Integration tests (serial)
+        env:
+          DSN: postgres://loom:loom@localhost:5432/loom?sslmode=disable
+        run: make test-all

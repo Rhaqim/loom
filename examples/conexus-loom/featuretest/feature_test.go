@@ -203,11 +203,15 @@ func TestPerModelPricing(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 1,000,000 in + 1,000,000 out at 0.15/0.60 => $0.75.
-	if got := e.PriceResult("gpt-4o-mini", 1_000_000, 1_000_000); got != 0.75 {
+	if got, ok := e.PriceResult("gpt-4o-mini", 1_000_000, 1_000_000); !ok {
+		t.Fatalf("PriceResult error: %v", ok)
+	} else if got != 0.75 {
 		t.Errorf("per-model price wrong: got %v want 0.75", got)
 	}
 	// Unknown model falls back to the built-in flat default ($1/$3) => $4.
-	if got := e.PriceResult("mystery", 1_000_000, 1_000_000); got != 4.0 {
+	if got, ok := e.PriceResult("mystery", 1_000_000, 1_000_000); !ok {
+		t.Fatalf("PriceResult error: %v", ok)
+	} else if got != 4.0 {
 		t.Errorf("fallback price wrong: got %v want 4.0", got)
 	}
 }
@@ -255,7 +259,7 @@ func TestSharedResponseFormatReference(t *testing.T) {
 		}
 	}
 	// Stored once.
-	got, err := e.ResponseFormats().Get(ctx, "shared", 1)
+	got, err := e.ResponseFormats().Get(ctx, "", "shared", 1)
 	if err != nil || got.ID != rec.ID {
 		t.Fatalf("response format not retrievable as a single record: %v", err)
 	}

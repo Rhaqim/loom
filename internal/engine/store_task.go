@@ -77,8 +77,8 @@ func sqlTaskStatus(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID)
 
 func sqlIncrementTaskAttempts(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID, lastErr string) error {
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE %stasks SET attempts=attempts+1, last_error=$2, updated_at=$3 WHERE id=$1`,
-		prefix), id, lastErr, time.Now())
+		UPDATE %stasks SET attempts=attempts+1, last_error=$1, updated_at=$2 WHERE id=$3`,
+		prefix), lastErr, time.Now(), id)
 	return err
 }
 
@@ -100,8 +100,8 @@ func sqlMarkTaskReady(ctx context.Context, db *sql.DB, prefix string, id uuid.UU
 			return err
 		}
 		res, err := tx.ExecContext(ctx, fmt.Sprintf(`
-			UPDATE %sresults SET status=$2, payload=$3, updated_at=$4 WHERE task_id=$1`, prefix),
-			id, string(result.Status()), payload, now,
+			UPDATE %sresults SET status=$1, payload=$2, updated_at=$3 WHERE task_id=$4`, prefix),
+			string(result.Status()), payload, now, id,
 		)
 		if err != nil {
 			return err
@@ -113,8 +113,8 @@ func sqlMarkTaskReady(ctx context.Context, db *sql.DB, prefix string, id uuid.UU
 		}
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE %stasks SET status='ready', updated_at=$2 WHERE id=$1`, prefix),
-		id, now,
+		UPDATE %stasks SET status='ready', updated_at=$1 WHERE id=$2`, prefix),
+		now, id,
 	); err != nil {
 		return err
 	}
@@ -131,14 +131,14 @@ func sqlMarkTaskFailed(ctx context.Context, db *sql.DB, prefix string, id uuid.U
 	defer tx.Rollback()
 	now := time.Now()
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE %sresults SET status='failed', updated_at=$2 WHERE task_id=$1`, prefix),
-		id, now,
+		UPDATE %sresults SET status='failed', updated_at=$1 WHERE task_id=$2`, prefix),
+		now, id,
 	); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE %stasks SET status='failed', last_error=$2, updated_at=$3 WHERE id=$1`, prefix),
-		id, reason, now,
+		UPDATE %stasks SET status='failed', last_error=$1, updated_at=$2 WHERE id=$3`, prefix),
+		reason, now, id,
 	); err != nil {
 		return err
 	}

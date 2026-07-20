@@ -227,6 +227,17 @@ Enable polling via `Config.AsyncPoller` (Interval, Workers) and `e.StartPoller(c
   `loom.GenerationTransport` (network/stream — often retryable, `ge.Unwrap()` has the cause),
   `loom.GenerationRejected` (provider refused, e.g. content policy — surface to user),
   `loom.GenerationEmpty` (no result).
+- `loom.ErrSessionNotPersisted` — **partial success, and the one error where the returned
+  `*Step` is non-nil and valid.** The step ran and its result + checkpoint committed, but the
+  `loom_sessions` row update failed, so `sessions.state` (and your in-memory `*Session`) is
+  stale. It wraps the cause: `loom.ErrSessionConflict` (another writer won the CAS) or
+  `loom.ErrNotFound` (the session was discarded mid-step). Recover the authoritative state with
+  `e.Sessions().StateAt(ctx, sess.ID, step.Index)` — checkpoints are written inside the step
+  transaction, so they cannot be missing. If you use loom as a system of record, you MUST handle
+  this rather than treating a non-nil error as "the step failed".
+  In `RunTurn` this error does NOT abort the turn: the step lands in `Turn.Steps` as normal and
+  the error is recorded in `Turn.Errors` under `"lead"` or the follower's slug — so a turn can
+  return a nil error while `Turn.Errors` is non-empty. Check it before trusting `Session.State`.
 - Other errors wrap the underlying hook/template/persistence failure.
 
 ```go
@@ -238,6 +249,12 @@ case loom.IsSkip(err):
     // step intentionally skipped
 case errors.Is(err, loom.ErrNotFound):
     var nf *loom.NotFoundError; errors.As(err, &nf) // nf.Kind, nf.Key
+case errors.Is(err, loom.ErrSessionNotPersisted):
+    // The step IS valid and durable — only the session row is stale.
+    // Reconcile from the checkpoint, then carry on with `step`.
+    if st, ok, _ := e.Sessions().StateAt(ctx, sess.ID, step.Index); ok {
+        sess.State = st
+    }
 case errors.Is(err, loom.ErrGeneratorNotRegistered):
     // config problem
 default:
@@ -272,10 +289,34 @@ On a retry error, `loom.RetryAnnotationFrom(err)` returns the annotation; schema
 populate `RetryAnnotation.Violations` (a structured `[]string`). Register hooks before running
 steps (registration is safe but do it at startup).
 
+**Mutating state from a hook.** Hooks are the supported in-step mutation point: a pre-hook can
+write `req.Session.State` before the user template is rendered (e.g. inject recalled memories
+into `Vars`). Each step gets a private deep copy of `State`, and `Vars`, `Snapshot` and
+`AvailableActions` are all merged back onto the shared session and into the step's checkpoint.
+`Vars` merge key-by-key so concurrent followers each contribute their own keys; `Snapshot` and
+`AvailableActions` are opaque whole values, so concurrent writers resolve last-writer-wins.
+`State.Modality` is engine-owned — it is always overwritten by the result's modality.
+
 ## Cost tracking & budgets
 
-Every step records input/output tokens and USD (from a built-in pricing table). Query with
-`e.Cost().SessionUsage(ctx, sess.ID)`. Budgets enforce spend caps per platform key:
+Every step records input/output tokens and USD. Query with
+`e.Cost().SessionUsage(ctx, sess.ID)`.
+
+**Token counts are always exact; the USD figures are only real money if you configured pricing.**
+With no `Config.Pricing` and no `Config.DefaultPrice`, USD is derived from a built-in placeholder
+rate ($1 in / $3 out per 1M) and is fabricated. `UsageSummary.PricingConfigured` (and the same
+field on `AgentCostStats`) tells you which you have — render `TotalUSD`/`ByModel`/`USDP95` as
+"—" rather than a dollar amount when it is false, and never bill off it. Set `Config.Pricing`
+(per model id, reported by the generator on result metadata) or `Config.DefaultPrice`:
+
+```go
+loom.New(loom.Config{ /* ... */
+    Pricing: map[string]loom.ModelPrice{"gpt-4o": {InputPer1M: 2.50, OutputPer1M: 10.00}},
+    DefaultPrice: &loom.ModelPrice{InputPer1M: 1, OutputPer1M: 3}, // models absent from Pricing
+})
+```
+
+Budgets enforce spend caps per platform key:
 
 ```go
 e.Budgets().Create(ctx, &loom.Budget{
@@ -289,6 +330,11 @@ e.Budgets().Create(ctx, &loom.Budget{
 ```
 Enforcement is best-effort (reads prior recorded spend, fails open on DB errors) — not a hard
 transactional ceiling. On block, `RunStep` returns `*loom.BudgetExceededError`.
+
+A `Limit.USD` is evaluated against the same recorded USD described above, so **a USD cap is not
+meaningful without configured pricing** — loom still enforces it (failing open on a spend control
+would be worse) and logs an error once explaining that the cap does not reflect real spend.
+`Limit.Tokens` and `Limit.Steps` are exact regardless.
 
 ## Caching (optional, recommended for hot paths)
 
@@ -307,9 +353,82 @@ See `github.com/rhaqim/loom/judge` and the README for `ScoreRequest`/`PairwiseRe
 ## Sessions: branching & replay, GC
 
 - Fork at a step: `branch, _ := e.Sessions().Fork(ctx, sess.ID, stepIndex)` — parent untouched.
+  **The branch starts with EMPTY history.** Parent steps are not copied and nothing stitches them
+  on at read time, so because generation context is built from `Session.History`, a fresh branch
+  starts with no model context. `State` IS rewound (reconstructed from the parent's checkpoint
+  at-or-before `stepIndex`). Anything that must survive a fork therefore has to live in `State`
+  (`Vars`/`Snapshot`), not in step history. Branch step indices restart at 0, so they are unique
+  only per session — join on `(session_id, step_index)`, never `step_index` alone.
 - Inspect: `tree, _ := e.Sessions().BranchTree(ctx, rootID)`.
 - Stale/speculative/test branches are cleaned by the GC worker (`e.GC()`, configured via
   `Config.BranchGC`; DryRun by default — nothing is deleted until you opt in).
+
+### Reading sessions (matters for long sessions)
+
+`Get` loads the FULL step history, and each step carries its rendered request and result payload
+— megabytes on a long session, growing linearly, so late reads cost more than early ones. When
+resuming you usually only need `Version` and `State`:
+
+- `e.Sessions().GetHeader(ctx, id)` — no history (`History` is left nil, so you can tell
+  "not loaded" from "no steps"). Cost is independent of session length.
+- `e.Sessions().Steps(ctx, id, limit, offset)` — page through history (`limit <= 0` = no limit).
+- `e.Sessions().StateAt(ctx, id, stepIndex)` — the checkpointed state at-or-before a step; how
+  you recover from `ErrSessionNotPersisted`.
+
+### Deleting and pinning
+
+- `Discard` soft-deletes. Afterwards the session is invisible to `Get`, `GetHeader`, `List`,
+  `BranchTree` and `Fork`, and `Update` rejects it. Use `GetIncludingDeleted` to read one back
+  (e.g. to restore it) — note you cannot write it until it is restored.
+- `Pin` exempts a session from all four GC tiers. `Purge` (irreversible hard delete, cascades
+  steps/actions/checkpoints) **refuses a pinned session** with `loom.ErrSessionPinned`; use
+  `ForcePurge` to delete it anyway. `Discard` is not blocked by a pin.
+- Writes to a missing or already-discarded session return `*loom.NotFoundError` rather than
+  silently affecting zero rows.
+
+## Registries: versioning, lookup, and the `owner` scope
+
+Agents, prompts and response formats are immutable and versioned. Edits create a NEW version;
+version `0` on a read resolves to the latest.
+
+**Every registry read is scoped by `owner`** — an opaque, app-controlled tenant string, `""` for
+the global scope. It is the first argument on every lookup:
+
+```go
+a, err := e.Agents().Get(ctx, owner, "assistant", 1)   // version 0 => latest
+a, err := e.Agents().Latest(ctx, owner, "assistant")
+list, err := e.Agents().List(ctx, owner, category)
+vers, err := e.Agents().Versions(ctx, owner, "assistant") // newest first
+err = e.Agents().Delete(ctx, owner, "assistant", 1)
+
+p, err := e.Prompts().Get(ctx, owner, "assistant-sys", 1)
+list, err := e.Prompts().List(ctx, owner, loom.PromptKindSystem, category)
+```
+
+`Create` is unchanged — the owner comes from the record's own `Owner` field
+(`&loom.Agent{Slug: "assistant", Owner: "tenant-a", ...}`).
+
+Single-tenant applications pass `""` everywhere and can ignore this.
+
+`""` is a distinct namespace, NOT a wildcard: a tenant with no matching record gets
+`ErrNotFound` rather than falling through to the global scope. Two owners may hold the same slug.
+
+Execution is scoped too, and this is the part that is easy to miss — `RunStep` resolves the agent
+by slug, so **the owner must be on the request or you are not tenant-isolated**:
+
+```go
+step, err := e.RunStep(ctx, sess, loom.StepRequest{Owner: "tenant-a", AgentSlug: "assistant"})
+turn, err := e.RunTurn(ctx, sess, loom.TurnRequest{Owner: "tenant-a", Flow: f})
+```
+`RunTurnBySlug` sets `Owner` from the persisted flow's own owner, so a stored flow always
+resolves its agents inside its own tenant.
+
+`GetByID(ctx, id)` (agents, prompts, response formats) is deliberately NOT owner-scoped — it
+exists to resolve internal FK references such as `Agent.SystemPromptID`. Do not hand it
+untrusted tenant-supplied IDs without checking the returned record's `Owner` yourself.
+
+`e.Generators()` lists the generator slugs registered in this process (sorted), so a UI can
+validate `Agent.GeneratorSlug` before saving instead of failing at generation time.
 
 ## Schema & migrations (IMPORTANT gotcha)
 
@@ -344,6 +463,13 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
   inline schema on the agent) and register `loom.SchemaValidationPostHook()`.
 - "Stream to a client" → set `StepRequest.OnChunk` (or `TurnRequest.OnChunk` for a turn's lead).
 - "Test without API keys" → use `generator/echo`.
+- "Multi-tenant registries" → set `Owner` on each Agent/Prompt/ResponseFormatRecord you create,
+  pass that owner to every registry read, AND set `StepRequest.Owner` / `TurnRequest.Owner` so
+  execution resolves in the same scope.
+- "Resume a long session cheaply" → `GetHeader` for `Version`+`State`, then `Steps(ctx, id,
+  limit, offset)` if you need history. Avoid `Get` on sessions with many steps.
+- "Show real costs" → set `Config.Pricing`/`Config.DefaultPrice`, and gate any USD you display
+  on `UsageSummary.PricingConfigured`.
 
 ## Things NOT to do
 
@@ -353,6 +479,13 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
 - Do not mutate a returned Agent/Prompt and expect it to persist — create a new version instead.
 - Do not set `StepRequest.Overrides["base_url"]` expecting built-in openai/anthropic to honor it
   unless the operator allowlisted that URL (security guard).
+- Do not treat a non-nil `RunStep` error as "nothing happened" — `loom.ErrSessionNotPersisted`
+  means the step DID commit and `step` is valid; only the session row is stale.
+- Do not rely on step history surviving a `Fork` — it does not. Carry continuity in `State`.
+- Do not display `TotalUSD`/`USDP95` as money when `PricingConfigured` is false — those numbers
+  are placeholders, not spend.
+- Do not omit `StepRequest.Owner` in a multi-tenant app and assume registry scoping covers you —
+  agent resolution happens per step, so an absent owner resolves in the global scope.
 
 ## Where to look next
 
@@ -423,6 +556,28 @@ var ErrSessionConflict = errors.New("loom: session update conflict")
     ErrSessionConflict is returned by Session update when the row's version
     no longer matches the in-memory copy — another writer updated it first,
     so this write would clobber theirs (optimistic-concurrency conflict).
+
+var ErrSessionNotPersisted = errors.New("loom: session row not persisted after step")
+    ErrSessionNotPersisted is returned by RunStep (and wrapped into Turn.Errors
+    by RunTurn) when a step ran and committed — its result and checkpoint are
+    durable — but the subsequent loom_sessions row update failed. The returned
+    *Step is valid and usable; what is stale is loom_sessions.state, and any
+    in-memory *Session the caller holds.
+
+    It always wraps a more specific cause: ErrSessionConflict when another
+    writer advanced the row, ErrNotFound when the row was discarded mid-step,
+    or a raw driver error. Recover the authoritative post-step state with
+    SessionRegistry.StateAt(ctx, id, step.Index) and retry the write, or re-Get
+    the session and replay.
+
+    This is deliberately a returned error rather than a diagnostics flag:
+    a caller using loom as a system of record must not proceed on state the
+    database does not have.
+
+var ErrSessionPinned = errors.New("loom: session is pinned")
+    ErrSessionPinned is returned by Purge when the target session is pinned.
+    Pinning marks data as protected, so an irreversible delete requires the
+    explicit ForcePurge instead.
 
 var ErrSkip = skipError{reason: "step cancelled by pre-hook"}
     ErrSkip cancels the current step when returned from a pre-hook.
@@ -520,7 +675,7 @@ type ActionTemplate struct {
 type Agent struct {
 	ID             uuid.UUID
 	Slug           string    // human-readable identifier
-	Owner          string    // opaque app-owned scope ("" = global); reserved for future per-tenant use
+	Owner          string    // opaque app-owned scope ("" = global)
 	Version        int       // monotonically increasing
 	Category       string    // platform-defined grouping
 	Modal          Modality  // the modality this agent produces
@@ -546,24 +701,43 @@ type AgentCostStats struct {
 	USDP95    float64
 	TokensP50 int
 	TokensP95 int
+
+	// PricingConfigured — see UsageSummary.PricingConfigured.
+	PricingConfigured bool
 }
-    AgentCostStats holds statistical cost data for an agent.
+    AgentCostStats holds statistical cost data for an agent. The USD* fields are
+    only real money when PricingConfigured is true; see UsageSummary.
 
 type AgentRegistry interface {
-	// Get retrieves a specific version. Version 0 resolves to LATEST. A missing
-	// agent returns *NotFoundError (which unwraps to ErrNotFound).
-	Get(ctx context.Context, slug string, version int) (*Agent, error)
-	// Latest resolves the highest version of slug.
-	Latest(ctx context.Context, slug string) (*Agent, error)
-	// Create persists a new agent version.
+	// Get retrieves a specific version within owner. Version 0 resolves to
+	// LATEST. A missing agent returns *NotFoundError (which unwraps to
+	// ErrNotFound).
+	Get(ctx context.Context, owner, slug string, version int) (*Agent, error)
+	// Latest resolves the highest version of slug within owner.
+	Latest(ctx context.Context, owner, slug string) (*Agent, error)
+	// GetByID retrieves an agent by row ID — the way a FallbackAgentID is
+	// resolved back to the agent it points at without listing every agent.
+	//
+	// This is NOT owner-scoped: it exists to resolve loom's own internal FK
+	// references, and a UUID primary key is globally unique. An application must
+	// therefore not pass an untrusted, tenant-supplied ID to it without checking
+	// the returned record's Owner against the caller's scope itself.
+	GetByID(ctx context.Context, id uuid.UUID) (*Agent, error)
+	// Create persists a new agent version. The scope comes from a.Owner.
 	Create(ctx context.Context, a *Agent) error
-	// List returns all agents matching optional category filter.
-	List(ctx context.Context, category string) ([]*Agent, error)
-	// Delete removes a specific agent version (>= 1). On Postgres it fails if the
-	// version is still referenced (e.g. by persisted steps, ON DELETE RESTRICT).
-	Delete(ctx context.Context, slug string, version int) error
+	// List returns all agents for owner matching optional category filter.
+	List(ctx context.Context, owner, category string) ([]*Agent, error)
+	// Versions returns every stored version of slug within owner, newest first.
+	Versions(ctx context.Context, owner, slug string) ([]*Agent, error)
+	// Delete removes a specific agent version (>= 1) within owner. On Postgres it
+	// fails if the version is still referenced (e.g. by persisted steps, ON
+	// DELETE RESTRICT).
+	Delete(ctx context.Context, owner, slug string, version int) error
 }
-    AgentRegistry resolves and manages agents.
+    AgentRegistry resolves and manages agents. owner is an opaque scope the
+    embedding application controls (e.g. a tenant/studio id); "" is the global
+    default. Slugs are only unique within an owner, so every slug-addressed
+    lookup takes one — an agent stored under owner A is invisible to owner B.
 
 type AgentUsage struct {
 	AgentSlug    string
@@ -872,6 +1046,12 @@ func (e *Engine) Flows() FlowRegistry
 func (e *Engine) GC() GCService
     GC returns the branch garbage collection service.
 
+func (e *Engine) Generators() []string
+    Generators returns the slugs of the generators registered in THIS process,
+    sorted. It reflects in-process registration only (built-ins plus any
+    RegisterGenerator calls), not any database table — use it to validate an
+    agent's GeneratorSlug before saving.
+
 func (e *Engine) Hooks() HookBus
     Hooks returns the engine's hook bus for registering pre/post processors.
 
@@ -885,11 +1065,15 @@ func (e *Engine) OnTaskResolved(fn func(context.Context, TaskResolution))
     a later call replaces it. Embedders use this to write a resolved asset into
     their own tables without reaching into loom's internal task tables.
 
-func (e *Engine) PriceResult(model string, inputTokens, outputTokens int) float64
+func (e *Engine) PriceResult(model string, inputTokens, outputTokens int) (float64, bool)
     PriceResult returns the USD cost for a result's token usage under the
     model's configured pricing. model is the generator's reported model id (""
     uses the default price). Exposed so applications can compute per-turn spend
     consistently with what the engine records.
+
+    The second return reports whether the price was configured. When false the
+    USD figure is a placeholder derived from a built-in flat rate — render it as
+    unknown rather than as money.
 
 func (e *Engine) Prompts() PromptRegistry
     Prompts returns the prompt registry.
@@ -917,6 +1101,13 @@ func (e *Engine) RunStep(ctx context.Context, session *Session, req StepRequest)
       - *BudgetExceededError — a configured budget blocked the step.
       - *GenerationError — the generator failed; switch on Kind (transport /
         rejected / empty).
+      - ErrSessionNotPersisted — PARTIAL SUCCESS. The step ran and committed,
+        and the returned *Step is non-nil and valid; only the loom_sessions
+        row update failed, so session.State in the database (and any in-memory
+        *Session) is stale. Callers using loom as a system of record must
+        reconcile — StateAt(ctx, id, step.Index) returns the authoritative
+        post-step state — before trusting session state. This is the one error
+        for which the returned *Step is non-nil.
       - otherwise, a wrapped error from a hook, template render, or persistence.
 
 func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest) (*Turn, error)
@@ -931,6 +1122,13 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
     (see RunStep for the error contract) wrapped with the turn and agent slug.
     Follower failures are never returned here — inspect Turn.Errors (keyed by
     agent slug) for those.
+
+    ErrSessionNotPersisted is the exception: it means the step itself ran and
+    committed and only the session row is stale, so the turn is NOT aborted.
+    The step appears in Turn.Steps (and Turn.Followers) as normal and the error
+    is recorded in Turn.Errors under "lead" or the follower's agent slug. A turn
+    can therefore return a nil error while carrying entries in Turn.Errors —
+    check it before treating Session.State as authoritative.
 
 func (e *Engine) RunTurnBySlug(ctx context.Context, session *Session, owner, slug string, version int, req TurnRequest) (*Turn, error)
     RunTurnBySlug loads a persisted flow (owner/slug/version; version 0 =
@@ -1008,6 +1206,13 @@ type FlowAgentEntry struct {
 	Stream            bool
 	GeneratorOverride string
 	Params            map[string]any
+	// RetryMode and MaxRetries mirror the runtime FlowAgent fields so a flow's
+	// retry policy survives persistence. Before these were stored, a flow saved
+	// with RetryKeepBest came back as RetryDiscard while the write reported
+	// success. Their zero values (RetryDiscard, engine-default cap) are what
+	// rows written before the columns existed resolve to.
+	RetryMode  RetryMode
+	MaxRetries int
 }
     FlowAgentEntry is one agent's slot in a persisted flow.
 
@@ -1308,7 +1513,7 @@ type PreHook func(ctx context.Context, req *StepRequest) error
 type Prompt struct {
 	ID        uuid.UUID
 	Slug      string // human-readable identifier, e.g. "opening-author"
-	Owner     string // opaque app-owned scope ("" = global); reserved for future per-tenant use
+	Owner     string // opaque app-owned scope ("" = global)
 	Version   int    // monotonically increasing; editing creates a new version
 	Kind      PromptKind
 	Category  string   // platform-defined grouping
@@ -1345,20 +1550,36 @@ func PromptFromFile(path string) PromptRef
     PromptFromFile constructs a PromptRef loaded from a file path.
 
 type PromptRegistry interface {
-	// Get retrieves a specific version. Version 0 resolves to LATEST. A missing
-	// prompt returns *NotFoundError (which unwraps to ErrNotFound).
-	Get(ctx context.Context, slug string, version int) (*Prompt, error)
-	// Latest resolves the highest version of slug.
-	Latest(ctx context.Context, slug string) (*Prompt, error)
-	// Create persists a new prompt version.
+	// Get retrieves a specific version within owner. Version 0 resolves to
+	// LATEST. A missing prompt returns *NotFoundError (which unwraps to
+	// ErrNotFound).
+	Get(ctx context.Context, owner, slug string, version int) (*Prompt, error)
+	// Latest resolves the highest version of slug within owner.
+	Latest(ctx context.Context, owner, slug string) (*Prompt, error)
+	// GetByID retrieves a prompt by row ID — the way an Agent's SystemPromptID
+	// and UserTemplateID FKs are resolved back to prompt text without listing
+	// every prompt.
+	//
+	// This is NOT owner-scoped: it exists to resolve loom's own internal FK
+	// references, and a UUID primary key is globally unique. An application must
+	// therefore not pass an untrusted, tenant-supplied ID to it without checking
+	// the returned record's Owner against the caller's scope itself.
+	GetByID(ctx context.Context, id uuid.UUID) (*Prompt, error)
+	// Create persists a new prompt version. The scope comes from p.Owner.
 	Create(ctx context.Context, p *Prompt) error
-	// List returns all prompts matching kind and optional category filter.
-	List(ctx context.Context, kind PromptKind, category string) ([]*Prompt, error)
-	// Delete removes a specific prompt version (>= 1). On Postgres it fails if the
-	// version is still referenced by an agent (ON DELETE RESTRICT).
-	Delete(ctx context.Context, slug string, version int) error
+	// List returns all prompts for owner matching kind and optional category
+	// filter.
+	List(ctx context.Context, owner string, kind PromptKind, category string) ([]*Prompt, error)
+	// Versions returns every stored version of slug within owner, newest first.
+	Versions(ctx context.Context, owner, slug string) ([]*Prompt, error)
+	// Delete removes a specific prompt version (>= 1) within owner. On Postgres it
+	// fails if the version is still referenced by an agent (ON DELETE RESTRICT).
+	Delete(ctx context.Context, owner, slug string, version int) error
 }
-    PromptRegistry resolves and manages prompts.
+    PromptRegistry resolves and manages prompts. owner is an opaque scope the
+    embedding application controls (e.g. a tenant/studio id); "" is the global
+    default. Slugs are only unique within an owner, so every slug-addressed
+    lookup takes one.
 
 type RawInput struct {
 	Kind    string
@@ -1388,7 +1609,7 @@ func ResponseFormatJSON(rawSchema string, strict bool) (*ResponseFormat, error)
 type ResponseFormatRecord struct {
 	ID         uuid.UUID
 	Slug       string // human-readable identifier, e.g. "logician-schema"
-	Owner      string // opaque app-owned scope ("" = global); reserved for future per-tenant use
+	Owner      string // opaque app-owned scope ("" = global)
 	Version    int    // monotonically increasing; editing creates a new version
 	Schema     map[string]any
 	StrictMode bool
@@ -1400,19 +1621,30 @@ func (r *ResponseFormatRecord) Format() *ResponseFormat
     Format returns the value form used in a GenerateRequest.
 
 type ResponseFormatRegistry interface {
-	// Create persists a new response-format version.
+	// Create persists a new response-format version. The scope comes from
+	// rf.Owner.
 	Create(ctx context.Context, rf *ResponseFormatRecord) error
-	// Get retrieves a specific version. Version 0 resolves to LATEST.
-	Get(ctx context.Context, slug string, version int) (*ResponseFormatRecord, error)
-	// Latest resolves the highest version of slug.
-	Latest(ctx context.Context, slug string) (*ResponseFormatRecord, error)
+	// Get retrieves a specific version within owner. Version 0 resolves to LATEST.
+	Get(ctx context.Context, owner, slug string, version int) (*ResponseFormatRecord, error)
+	// Latest resolves the highest version of slug within owner.
+	Latest(ctx context.Context, owner, slug string) (*ResponseFormatRecord, error)
 	// GetByID retrieves a response format by ID.
+	//
+	// This is NOT owner-scoped: it exists to resolve loom's own internal FK
+	// references (Agent.ResponseFormatID), and a UUID primary key is globally
+	// unique. An application must therefore not pass an untrusted,
+	// tenant-supplied ID to it without checking the returned record's Owner
+	// against the caller's scope itself.
 	GetByID(ctx context.Context, id uuid.UUID) (*ResponseFormatRecord, error)
-	// Delete removes a specific response-format version (>= 1). On Postgres it
-	// fails if the version is still referenced by an agent (ON DELETE RESTRICT).
-	Delete(ctx context.Context, slug string, version int) error
+	// Delete removes a specific response-format version (>= 1) within owner. On
+	// Postgres it fails if the version is still referenced by an agent (ON DELETE
+	// RESTRICT).
+	Delete(ctx context.Context, owner, slug string, version int) error
 }
-    ResponseFormatRegistry resolves and manages reusable response formats.
+    ResponseFormatRegistry resolves and manages reusable response formats. owner
+    is an opaque scope the embedding application controls (e.g. a tenant/studio
+    id); "" is the global default. Slugs are only unique within an owner,
+    so every slug-addressed lookup takes one.
 
 type Result interface {
 	ResultID() uuid.UUID
@@ -1521,24 +1753,79 @@ type Session struct {
 type SessionRegistry interface {
 	// Create persists a new session.
 	Create(ctx context.Context, s *Session) error
-	// Get retrieves a session by ID. A missing session returns *NotFoundError
-	// (which unwraps to ErrNotFound).
+	// Get retrieves a session by ID, with its full step history loaded. A
+	// missing OR soft-deleted session returns *NotFoundError (which unwraps to
+	// ErrNotFound) — consistent with List, BranchTree and Update. Use
+	// GetIncludingDeleted to read a discarded session (e.g. to restore it).
+	//
+	// Get loads every step, and each step carries its fully rendered request and
+	// result payload. For a long session that is megabytes per read and grows
+	// linearly. When only the header is needed — the common case when resuming,
+	// where Version and State are what matter — use GetHeader instead, and page
+	// through history with Steps.
 	Get(ctx context.Context, id uuid.UUID) (*Session, error)
-	// Update persists state changes to an existing session.
+	// GetHeader retrieves a session by ID WITHOUT its step history: History is
+	// left nil. Cost is independent of session length. Same not-found and
+	// soft-delete semantics as Get.
+	GetHeader(ctx context.Context, id uuid.UUID) (*Session, error)
+	// GetIncludingDeleted retrieves a session by ID even if it has been
+	// soft-deleted, with history loaded. Check Session.DeletedAt to tell which.
+	// Note that Update rejects a soft-deleted row, so a session read this way
+	// cannot be written until it is restored.
+	GetIncludingDeleted(ctx context.Context, id uuid.UUID) (*Session, error)
+	// Steps returns a page of a session's steps ordered by step index. A limit
+	// of 0 or less means "no limit". Use this instead of Get when history is
+	// large or only a window is needed.
+	Steps(ctx context.Context, id uuid.UUID, limit, offset int) ([]Step, error)
+	// StateAt returns the checkpointed State as of the newest step at or before
+	// stepIndex, and whether such a checkpoint exists.
+	//
+	// Checkpoints are written inside the step transaction, so a step can never
+	// commit without one. The loom_sessions row, by contrast, is updated in a
+	// separate write afterwards. If that write fails (see ErrSessionNotPersisted)
+	// or the process dies between the two, sessions.state is stale while the
+	// checkpoint holds the truth — StateAt is how a caller recovers it.
+	StateAt(ctx context.Context, id uuid.UUID, stepIndex int) (State, bool, error)
+	// Update persists state changes to an existing session. Fails with
+	// ErrSessionConflict if another writer advanced the row first, and with
+	// *NotFoundError if the session is missing or soft-deleted.
 	Update(ctx context.Context, s *Session) error
 	// Fork creates a branch session from parentID at the given step index.
-	// The branch session sees parent steps 0..stepIndex; subsequent steps diverge.
+	//
+	// The branch starts with EMPTY history: parent steps are NOT copied, and
+	// nothing stitches them on at read time. Because generation context is built
+	// from Session.History, a freshly forked branch also starts with no model
+	// context.
+	//
+	// State IS rewound — the branch's State is reconstructed from the parent's
+	// checkpoint at-or-before stepIndex (falling back to the parent's current
+	// state if no checkpoint that early exists). So anything a caller needs to
+	// survive a fork must live in State (Vars/Snapshot), not in step history.
+	//
+	// Step indices on the branch restart at 0; they are only unique per session,
+	// so join on (session_id, step_index) and never on step_index alone.
 	Fork(ctx context.Context, parentID uuid.UUID, stepIndex int) (*Session, error)
 	// BranchTree returns the full descendant tree rooted at sessionID.
 	BranchTree(ctx context.Context, rootID uuid.UUID) (*BranchNode, error)
-	// Pin marks a session as exempt from garbage collection.
+	// Pin marks a session as exempt from garbage collection. A pinned session is
+	// skipped by all four GC tiers. It does NOT protect against the explicit
+	// operator actions Discard and Purge — Purge refuses a pinned session (see
+	// ErrSessionPinned), but Discard does not.
 	Pin(ctx context.Context, id uuid.UUID) error
 	// Unpin removes the GC exemption.
 	Unpin(ctx context.Context, id uuid.UUID) error
 	// Discard soft-deletes a session immediately (bypasses T1/T2 GC tiers).
+	// After this the session is invisible to Get, List and BranchTree, and
+	// Update rejects it; the row and its steps survive until GC or Purge.
 	Discard(ctx context.Context, id uuid.UUID) error
-	// Purge performs an immediate hard delete (irreversible).
+	// Purge performs an immediate hard delete of the session and its cascaded
+	// steps, actions and checkpoints. Irreversible.
+	//
+	// Returns ErrSessionPinned if the session is pinned — deleting pinned data
+	// is usually a mistake. Use ForcePurge to delete it anyway.
 	Purge(ctx context.Context, id uuid.UUID) error
+	// ForcePurge is Purge without the pinned check.
+	ForcePurge(ctx context.Context, id uuid.UUID) error
 	// List returns sessions for a platform ID.
 	List(ctx context.Context, platformID string, limit, offset int) ([]*Session, error)
 }
@@ -1579,6 +1866,18 @@ type StepRequest struct {
 	Agent        *Agent
 	AgentSlug    string // resolved to LATEST if Version is 0
 	AgentVersion int
+
+	// Owner scopes every registry lookup this step performs — the agent named
+	// by AgentSlug and any prompt resolved by slug through
+	// SystemPromptOverride. It is the same opaque app-owned scope carried on
+	// Agent.Owner / Prompt.Owner; "" is the global scope.
+	//
+	// A multi-tenant caller MUST set this. Leaving it "" resolves against the
+	// global scope, which will simply not find a tenant's records rather than
+	// silently reaching across tenants. Owner is NOT consulted when Agent is
+	// supplied directly, since that bypasses resolution entirely — the caller
+	// is responsible for having loaded a record it is entitled to.
+	Owner string
 
 	// Action is the discriminator's input; nil for the opening step.
 	Action *Action
@@ -1777,6 +2076,11 @@ type Turn struct {
 
 type TurnRequest struct {
 	Flow Flow
+	// Owner scopes registry resolution for every agent in the turn — the lead
+	// and all followers — exactly as StepRequest.Owner does for a single step.
+	// "" is the global scope. RunTurnBySlug sets this from the flow's own owner
+	// so a persisted flow always resolves its agents within its own tenant.
+	Owner string
 	// Action is the user input that drives the turn (nil for an opening).
 	Action *Action
 	// OnChunk receives streaming fragments from the lead agent (if Lead.Stream).
@@ -1820,8 +2124,21 @@ type UsageSummary struct {
 	TotalTokens int
 	StepCount   int
 	ByModel     map[string]float64
+
+	// PricingConfigured reports whether the engine had real pricing (either
+	// Config.Pricing or Config.DefaultPrice) when these costs were recorded.
+	//
+	// When false, TotalUSD and ByModel are derived from a built-in placeholder
+	// rate and are NOT real money. Render them as "—"/unknown rather than as a
+	// dollar amount, and do not use them for billing or reporting. Note that any
+	// USD-denominated budget is evaluated against these same figures, so a USD
+	// limit is not enforceable in this state.
+	PricingConfigured bool
 }
     UsageSummary aggregates cost metrics.
+
+    Token and step counts are always exact. The USD figures are only meaningful
+    when PricingConfigured is true — see that field.
 
 type VideoResult struct {
 	URL          string

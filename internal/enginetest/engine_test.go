@@ -95,11 +95,11 @@ func seedTestAgent(t *testing.T, e *loom.Engine, slug string) string {
 	_ = e.Prompts().Create(ctx, sysPrmt)
 	_ = e.Prompts().Create(ctx, userTmpl)
 
-	sys, err := e.Prompts().Get(ctx, slug+"-sys", 1)
+	sys, err := e.Prompts().Get(ctx, "", slug+"-sys", 1)
 	if err != nil {
 		t.Fatalf("get system prompt: %v", err)
 	}
-	ut, err := e.Prompts().Get(ctx, slug+"-user", 1)
+	ut, err := e.Prompts().Get(ctx, "", slug+"-user", 1)
 	if err != nil {
 		t.Fatalf("get user template: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestEngine_Prompts_CRUD(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	got, err := e.Prompts().Get(ctx, slug, 1)
+	got, err := e.Prompts().Get(ctx, "", slug, 1)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestEngine_Prompts_CRUD(t *testing.T) {
 		t.Errorf("Body: got %q want %q", got.Body, p.Body)
 	}
 
-	list, err := e.Prompts().List(ctx, loom.PromptKindSystem, "test")
+	list, err := e.Prompts().List(ctx, "", loom.PromptKindSystem, "test")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -427,7 +427,7 @@ func TestEngine_Agents_CRUD(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	got, err := e.Agents().Get(ctx, slug, 1)
+	got, err := e.Agents().Get(ctx, "", slug, 1)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -435,7 +435,7 @@ func TestEngine_Agents_CRUD(t *testing.T) {
 		t.Errorf("Slug: got %q want %q", got.Slug, slug)
 	}
 
-	latest, err := e.Agents().Latest(ctx, slug)
+	latest, err := e.Agents().Latest(ctx, "", slug)
 	if err != nil {
 		t.Fatalf("Latest: %v", err)
 	}

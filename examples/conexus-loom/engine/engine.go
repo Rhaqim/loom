@@ -409,7 +409,8 @@ func (c *Conexus) turnCost(turn *loom.Turn) (in, out int, usd float64) {
 		i, o := tokensOf(s.Result)
 		in += i
 		out += o
-		usd += c.cfg.Loom.PriceResult(loom.ResultModel(s.Result), i, o)
+		price, _ := c.cfg.Loom.PriceResult(loom.ResultModel(s.Result), i, o)
+		usd += price
 	}
 	return
 }

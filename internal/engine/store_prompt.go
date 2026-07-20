@@ -29,20 +29,22 @@ func sqlInsertPrompt(ctx context.Context, db *sql.DB, prefix string, p *Prompt) 
 	return err
 }
 
-func sqlQueryPrompt(ctx context.Context, db *sql.DB, prefix, slug string, version int) (*Prompt, error) {
+func sqlQueryPrompt(ctx context.Context, db *sql.DB, prefix, owner, slug string, version int) (*Prompt, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
-		FROM %sprompts WHERE slug=$1 AND version=$2`, promptColumns, prefix), slug, version)
+		FROM %sprompts WHERE owner=$1 AND slug=$2 AND version=$3`, promptColumns, prefix), owner, slug, version)
 	return scanPrompt(row)
 }
 
-func sqlQueryPromptLatest(ctx context.Context, db *sql.DB, prefix, slug string) (*Prompt, error) {
+func sqlQueryPromptLatest(ctx context.Context, db *sql.DB, prefix, owner, slug string) (*Prompt, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
-		FROM %sprompts WHERE slug=$1 ORDER BY version DESC LIMIT 1`, promptColumns, prefix), slug)
+		FROM %sprompts WHERE owner=$1 AND slug=$2 ORDER BY version DESC LIMIT 1`, promptColumns, prefix), owner, slug)
 	return scanPrompt(row)
 }
 
+// sqlQueryPromptByID is intentionally not owner-filtered: the row UUID is
+// globally unique and this resolves loom's own FK references.
 func sqlQueryPromptByID(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Prompt, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
@@ -50,9 +52,9 @@ func sqlQueryPromptByID(ctx context.Context, db *sql.DB, prefix string, id uuid.
 	return scanPrompt(row)
 }
 
-func sqlListPrompts(ctx context.Context, db *sql.DB, prefix string, kind PromptKind, category string) ([]*Prompt, error) {
-	args := []any{}
-	conds := []string{}
+func sqlListPrompts(ctx context.Context, db *sql.DB, prefix, owner string, kind PromptKind, category string) ([]*Prompt, error) {
+	args := []any{owner}
+	conds := []string{"owner=$1"}
 	if kind != "" {
 		args = append(args, string(kind))
 		conds = append(conds, fmt.Sprintf("kind=$%d", len(args)))
@@ -61,12 +63,28 @@ func sqlListPrompts(ctx context.Context, db *sql.DB, prefix string, kind PromptK
 		args = append(args, category)
 		conds = append(conds, fmt.Sprintf("category=$%d", len(args)))
 	}
-	q := fmt.Sprintf("SELECT %s FROM %sprompts", promptColumns, prefix)
-	if len(conds) > 0 {
-		q += " WHERE " + strings.Join(conds, " AND ")
-	}
-	q += " ORDER BY slug, version"
+	q := fmt.Sprintf("SELECT %s FROM %sprompts WHERE %s ORDER BY slug, version",
+		promptColumns, prefix, strings.Join(conds, " AND "))
 	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var prompts []*Prompt
+	for rows.Next() {
+		p, err := scanPrompt(rows)
+		if err != nil {
+			return nil, err
+		}
+		prompts = append(prompts, p)
+	}
+	return prompts, rows.Err()
+}
+
+func sqlQueryPromptVersions(ctx context.Context, db *sql.DB, prefix, owner, slug string) ([]*Prompt, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM %sprompts WHERE owner=$1 AND slug=$2 ORDER BY version DESC`, promptColumns, prefix), owner, slug)
 	if err != nil {
 		return nil, err
 	}

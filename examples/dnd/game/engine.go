@@ -96,7 +96,7 @@ func (e *Engine) SeedDMAgent(ctx context.Context, topic *domain.Topic) (agentSlu
 		return "", fmt.Errorf("seed system prompt: %w", err)
 	}
 	// Fetch the persisted system prompt to get its UUID.
-	sp, err := e.Loom.Prompts().Get(ctx, sysSlug, 1)
+	sp, err := e.Loom.Prompts().Get(ctx, "", sysSlug, 1)
 	if err != nil {
 		return "", fmt.Errorf("fetch system prompt: %w", err)
 	}
@@ -114,7 +114,7 @@ func (e *Engine) SeedDMAgent(ctx context.Context, topic *domain.Topic) (agentSlu
 		return "", fmt.Errorf("seed user template: %w", err)
 	}
 	// Fetch the persisted user template to get its UUID.
-	ut, err := e.Loom.Prompts().Get(ctx, dmUserPromptSlug, dmUserPromptVer)
+	ut, err := e.Loom.Prompts().Get(ctx, "", dmUserPromptSlug, dmUserPromptVer)
 	if err != nil {
 		return "", fmt.Errorf("fetch user template: %w", err)
 	}

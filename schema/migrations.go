@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
+	"strings"
 )
 
 // migrationsTable is the bare (un-prefixed) name of the ledger that records
@@ -105,6 +107,103 @@ func migrations() []Migration {
 				return addColumnIfMissing(ctx, tx, d, p+"agents", "response_format", jsonType)
 			},
 		},
+		{
+			// FlowAgent carries RetryMode/MaxRetries at runtime, but the
+			// flow_agents table never stored them, so a flow persisted with a
+			// non-default retry policy came back with the engine default and the
+			// write appeared to succeed. retry_mode stores the RetryMode enum,
+			// whose zero value is RetryDiscard — so the DEFAULT 0 on existing
+			// rows reproduces exactly what the old code returned.
+			Version: 5,
+			Name:    "flow-agent-retry-policy",
+			Up: func(ctx context.Context, tx *sql.Tx, p string, d Dialect) error {
+				if err := addColumnIfMissing(ctx, tx, d, p+"flow_agents", "retry_mode", "INT NOT NULL DEFAULT 0"); err != nil {
+					return err
+				}
+				return addColumnIfMissing(ctx, tx, d, p+"flow_agents", "max_retries", "INT NOT NULL DEFAULT 0")
+			},
+		},
+		{
+			// The registry `owner` scope became a real lookup key: Get/List/
+			// Delete on agents, prompts and response formats now filter by it,
+			// so two owners can hold the same slug. The baseline tables keyed
+			// uniqueness on (slug, version) alone, which forbids that, so the
+			// constraint has to widen to include owner.
+			//
+			// IMPORTANT — this migration only widens the constraint on
+			// Postgres. On SQLite a table-level UNIQUE is backed by a
+			// sqlite_autoindex_* that cannot be dropped; removing it means
+			// rebuilding the table, and PRAGMA foreign_keys cannot be toggled
+			// inside a transaction — so a rebuild here would cascade-delete
+			// dependent rows for anyone who opened their database with
+			// foreign_keys(1). Refusing to do that silently, an EXISTING SQLite
+			// database keeps the narrower (slug, version) key.
+			//
+			// That is safe, not a hole: reads and writes are owner-scoped either
+			// way, so no tenant can see another's records. The only limitation
+			// is that two owners cannot reuse a slug. Fresh databases get the
+			// wide key from the baseline. To widen an existing SQLite database,
+			// dump and reload it against the current baseline.
+			Version: 6,
+			Name:    "registry-owner-unique-key",
+			Up: func(ctx context.Context, tx *sql.Tx, p string, d Dialect) error {
+				if d == DialectSQLite {
+					return nil
+				}
+				for _, c := range []struct {
+					table  string
+					oldKey string
+					cols   []string
+				}{
+					{"prompts", "prompts_slug_version_kind_key", []string{"owner", "slug", "version", "kind"}},
+					{"response_formats", "response_formats_slug_version_key", []string{"owner", "slug", "version"}},
+					{"agents", "agents_slug_version_key", []string{"owner", "slug", "version"}},
+				} {
+					table := p + c.table
+
+					// A fresh database already got the wide key inline from the
+					// baseline. Creating a second, redundant unique index over
+					// the same columns would be pure noise, so check first.
+					has, err := hasUniqueOn(ctx, tx, table, c.cols)
+					if err != nil {
+						return err
+					}
+					if has {
+						continue
+					}
+
+					// Widening the key can only fail on data that already
+					// violates it — which happens when the narrow key was
+					// dropped or never existed. Surface that as an actionable
+					// message naming the offending rows, because the raw driver
+					// error ("could not create unique index ... 23505") gives an
+					// operator nothing to act on, and this failure blocks
+					// Apply and therefore engine startup.
+					if err := ensureNoDuplicates(ctx, tx, table, c.cols); err != nil {
+						return err
+					}
+
+					// Create the wide key BEFORE dropping the narrow one, so the
+					// table is never left unprotected — if anything below fails,
+					// the whole migration rolls back with a key still in place.
+					if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+						`CREATE UNIQUE INDEX %s_owner_key ON %s (%s)`,
+						table, table, strings.Join(c.cols, ", "))); err != nil {
+						return err
+					}
+					// Postgres names an inline UNIQUE constraint
+					// <table>_<cols>_key, so the baseline's key is predictable.
+					// IF EXISTS makes this a no-op when it was created under
+					// another name or has already been removed.
+					if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+						`ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s%s`,
+						table, p, c.oldKey)); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		},
 	}
 }
 
@@ -190,6 +289,94 @@ func (l *Loader) runMigration(ctx context.Context, db *sql.DB, m Migration) erro
 		return err
 	}
 	return tx.Commit()
+}
+
+// hasUniqueOn reports whether table already carries a unique index or
+// constraint over exactly cols (order-independent). Postgres only — it reads
+// the catalog directly, which is the reliable way to tell an inline UNIQUE
+// from a separately created index.
+func hasUniqueOn(ctx context.Context, tx *sql.Tx, table string, cols []string) (bool, error) {
+	sorted := append([]string(nil), cols...)
+	slices.Sort(sorted)
+	want := strings.Join(sorted, ",")
+
+	// string_agg rather than array_agg so the result scans into a plain string
+	// and this file needs no Postgres driver types.
+	rows, err := tx.QueryContext(ctx, `
+		SELECT string_agg(a.attname, ',' ORDER BY a.attname)
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indrelid
+		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY (i.indkey)
+		WHERE c.relname = $1 AND i.indisunique
+		GROUP BY i.indexrelid`, table)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var got string
+		if err := rows.Scan(&got); err != nil {
+			return false, err
+		}
+		if got == want {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// ensureNoDuplicates returns an actionable error when table already holds rows
+// that would violate a unique key over cols. It names the table, the key, and a
+// sample of the conflicting values so an operator can dedupe without going
+// spelunking — a migration failure here blocks Apply, and Apply gates engine
+// startup.
+func ensureNoDuplicates(ctx context.Context, tx *sql.Tx, table string, cols []string) error {
+	list := strings.Join(cols, ", ")
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s, count(*) FROM %s GROUP BY %s HAVING count(*) > 1 LIMIT 5`,
+		list, table, list))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var samples []string
+	for rows.Next() {
+		vals := make([]any, len(cols)+1)
+		ptrs := make([]any, len(vals))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return err
+		}
+		parts := make([]string, len(cols))
+		for i, col := range cols {
+			parts[i] = fmt.Sprintf("%s=%v", col, derefBytes(vals[i]))
+		}
+		samples = append(samples, fmt.Sprintf("(%s) x%v", strings.Join(parts, ", "), derefBytes(vals[len(cols)])))
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(samples) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"cannot add UNIQUE (%s) to %s: %d or more existing row groups already violate it "+
+			"(e.g. %s). This table lost its narrower unique key at some point, so duplicates "+
+			"were allowed in. Remove or re-key the duplicate rows, then re-run the migration; "+
+			"loom will not delete them for you",
+		list, table, len(samples), strings.Join(samples, "; "))
+}
+
+// derefBytes renders a scanned value, converting []byte (how the driver returns
+// text columns) to a string so it prints readably instead of as a byte slice.
+func derefBytes(v any) any {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return v
 }
 
 // execAll runs the statements in order on tx, annotating failures with the SQL.

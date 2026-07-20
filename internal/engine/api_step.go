@@ -60,6 +60,18 @@ type StepRequest struct {
 	AgentSlug    string // resolved to LATEST if Version is 0
 	AgentVersion int
 
+	// Owner scopes every registry lookup this step performs — the agent named
+	// by AgentSlug and any prompt resolved by slug through
+	// SystemPromptOverride. It is the same opaque app-owned scope carried on
+	// Agent.Owner / Prompt.Owner; "" is the global scope.
+	//
+	// A multi-tenant caller MUST set this. Leaving it "" resolves against the
+	// global scope, which will simply not find a tenant's records rather than
+	// silently reaching across tenants. Owner is NOT consulted when Agent is
+	// supplied directly, since that bypasses resolution entirely — the caller
+	// is responsible for having loaded a record it is entitled to.
+	Owner string
+
 	// Action is the discriminator's input; nil for the opening step.
 	Action *Action
 

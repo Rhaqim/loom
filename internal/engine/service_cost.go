@@ -9,12 +9,27 @@ import (
 
 type costService struct{ e *Engine }
 
+// pricingConfigured reports whether the engine has any real pricing. When
+// false, every USD figure it reports is derived from a built-in placeholder
+// rate and must be presented as unknown rather than as money.
+func (e *Engine) pricingConfigured() bool {
+	return len(e.pricing) > 0 || e.defaultPrice != nil
+}
+
 func (c *costService) SessionUsage(ctx context.Context, sessionID uuid.UUID) (*UsageSummary, error) {
-	return sqlSessionUsage(ctx, c.e.db, c.e.prefix, sessionID)
+	s, err := sqlSessionUsage(ctx, c.e.db, c.e.prefix, sessionID)
+	if s != nil {
+		s.PricingConfigured = c.e.pricingConfigured()
+	}
+	return s, err
 }
 
 func (c *costService) Usage(ctx context.Context, q UsageQuery) (*UsageSummary, error) {
-	return sqlUsage(ctx, c.e.db, c.e.prefix, q)
+	s, err := sqlUsage(ctx, c.e.db, c.e.prefix, q)
+	if s != nil {
+		s.PricingConfigured = c.e.pricingConfigured()
+	}
+	return s, err
 }
 
 func (c *costService) ByAgent(ctx context.Context, q UsageQuery) ([]AgentUsage, error) {
@@ -22,7 +37,11 @@ func (c *costService) ByAgent(ctx context.Context, q UsageQuery) ([]AgentUsage, 
 }
 
 func (c *costService) AgentStats(ctx context.Context, agentID uuid.UUID, window time.Duration) (*AgentCostStats, error) {
-	return sqlAgentStats(ctx, c.e.db, c.e.prefix, agentID, window)
+	s, err := sqlAgentStats(ctx, c.e.db, c.e.prefix, agentID, window)
+	if s != nil {
+		s.PricingConfigured = c.e.pricingConfigured()
+	}
+	return s, err
 }
 
 func (c *costService) Estimate(_ context.Context, req EstimateRequest) (*CostEstimate, error) {
@@ -66,9 +85,13 @@ func (c *costService) recordFromResult(ctx context.Context, step *Step, agent *A
 	if model == "" {
 		model = agent.GeneratorSlug
 	}
-	usdCost = c.e.priceFor(model).Cost(inputTokens, outputTokens)
+	price, priceKnown := c.e.priceFor(model)
+	usdCost = price.Cost(inputTokens, outputTokens)
 
 	rec := CostRecord{
+		// Estimated marks a record whose USD figure came from the built-in flat
+		// rate rather than configured pricing. Tokens are exact either way.
+		Estimated:    !priceKnown,
 		Provider:     agent.GeneratorSlug,
 		Model:        model,
 		Modal:        agent.Modal,
