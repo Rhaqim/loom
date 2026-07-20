@@ -44,20 +44,22 @@ func sqlInsertAgent(ctx context.Context, db *sql.DB, prefix string, a *Agent) er
 	return err
 }
 
-func sqlQueryAgent(ctx context.Context, db *sql.DB, prefix, slug string, version int) (*Agent, error) {
+func sqlQueryAgent(ctx context.Context, db *sql.DB, prefix, owner, slug string, version int) (*Agent, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
-		FROM %sagents WHERE slug=$1 AND version=$2`, agentColumns, prefix), slug, version)
+		FROM %sagents WHERE owner=$1 AND slug=$2 AND version=$3`, agentColumns, prefix), owner, slug, version)
 	return scanAgent(row)
 }
 
-func sqlQueryAgentLatest(ctx context.Context, db *sql.DB, prefix, slug string) (*Agent, error) {
+func sqlQueryAgentLatest(ctx context.Context, db *sql.DB, prefix, owner, slug string) (*Agent, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
-		FROM %sagents WHERE slug=$1 ORDER BY version DESC LIMIT 1`, agentColumns, prefix), slug)
+		FROM %sagents WHERE owner=$1 AND slug=$2 ORDER BY version DESC LIMIT 1`, agentColumns, prefix), owner, slug)
 	return scanAgent(row)
 }
 
+// sqlQueryAgentByID is intentionally not owner-filtered: the row UUID is
+// globally unique and this resolves loom's own FK references.
 func sqlQueryAgentByID(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Agent, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
@@ -65,15 +67,34 @@ func sqlQueryAgentByID(ctx context.Context, db *sql.DB, prefix string, id uuid.U
 	return scanAgent(row)
 }
 
-func sqlListAgents(ctx context.Context, db *sql.DB, prefix, category string) ([]*Agent, error) {
-	q := fmt.Sprintf(`SELECT %s FROM %sagents`, agentColumns, prefix)
-	args := []any{}
+func sqlListAgents(ctx context.Context, db *sql.DB, prefix, owner, category string) ([]*Agent, error) {
+	q := fmt.Sprintf(`SELECT %s FROM %sagents WHERE owner=$1`, agentColumns, prefix)
+	args := []any{owner}
 	if category != "" {
-		q += " WHERE category=$1"
+		q += " AND category=$2"
 		args = append(args, category)
 	}
 	q += " ORDER BY slug, version"
 	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var agents []*Agent
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			return nil, err
+		}
+		agents = append(agents, a)
+	}
+	return agents, rows.Err()
+}
+
+func sqlQueryAgentVersions(ctx context.Context, db *sql.DB, prefix, owner, slug string) ([]*Agent, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM %sagents WHERE owner=$1 AND slug=$2 ORDER BY version DESC`, agentColumns, prefix), owner, slug)
 	if err != nil {
 		return nil, err
 	}

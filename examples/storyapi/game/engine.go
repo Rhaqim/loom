@@ -100,7 +100,7 @@ func (e *Engine) SeedStoryAgent(ctx context.Context, topic *domain.Topic) (agent
 	if err := e.Loom.Prompts().Create(ctx, sysPrompt); err != nil && !isDuplicateErr(err) {
 		return "", fmt.Errorf("seed system prompt: %w", err)
 	}
-	sp, err := e.Loom.Prompts().Get(ctx, sysSlug, 1)
+	sp, err := e.Loom.Prompts().Get(ctx, "", sysSlug, 1)
 	if err != nil {
 		return "", fmt.Errorf("fetch system prompt: %w", err)
 	}
@@ -117,7 +117,7 @@ func (e *Engine) SeedStoryAgent(ctx context.Context, topic *domain.Topic) (agent
 	if err := e.Loom.Prompts().Create(ctx, userPrompt); err != nil && !isDuplicateErr(err) {
 		return "", fmt.Errorf("seed user template: %w", err)
 	}
-	ut, err := e.Loom.Prompts().Get(ctx, userPromptSlug, userPromptVer)
+	ut, err := e.Loom.Prompts().Get(ctx, "", userPromptSlug, userPromptVer)
 	if err != nil {
 		return "", fmt.Errorf("fetch user template: %w", err)
 	}

@@ -30,12 +30,37 @@ func sqlInsertSession(ctx context.Context, db *sql.DB, prefix string, s *Session
 	return err
 }
 
+// sessionColumns is the column list shared by every single-session read.
+const sessionColumns = `id, platform_id, parent_session_id, branch_point, version,
+		       state, metadata, tags, pinned, deleted_at, created_at, updated_at`
+
+// sqlQuerySession reads a live session. Soft-deleted rows are excluded so reads
+// agree with sqlUpdateSession, sqlListSessions and buildChildren, all of which
+// filter on deleted_at — otherwise a discarded session is readable and forkable
+// but not writable, and Discard fails to hide the data it was asked to remove.
 func sqlQuerySession(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Session, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT id, platform_id, parent_session_id, branch_point, version,
-		       state, metadata, tags, pinned, deleted_at, created_at, updated_at
-		FROM %ssessions WHERE id=$1`, prefix), id)
+		SELECT %s
+		FROM %ssessions WHERE id=$1 AND deleted_at IS NULL`, sessionColumns, prefix), id)
 	return scanSession(row)
+}
+
+// sqlQuerySessionIncludingDeleted reads a session whether or not it has been
+// soft-deleted. Only for the explicit restore/audit path (GetIncludingDeleted).
+func sqlQuerySessionIncludingDeleted(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*Session, error) {
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM %ssessions WHERE id=$1`, sessionColumns, prefix), id)
+	return scanSession(row)
+}
+
+// sqlIsSessionPinned reports whether a live session is pinned. Returns
+// sql.ErrNoRows if the session is missing or already discarded.
+func sqlIsSessionPinned(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (bool, error) {
+	var pinned bool
+	err := db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT pinned FROM %ssessions WHERE id=$1`, prefix), id).Scan(&pinned)
+	return pinned, err
 }
 
 func sqlUpdateSession(ctx context.Context, db *sql.DB, prefix string, s *Session) error {
@@ -49,9 +74,9 @@ func sqlUpdateSession(ctx context.Context, db *sql.DB, prefix string, s *Session
 	// rows are excluded so Updates do not keep mutating a discarded session.
 	res, err := db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %ssessions
-		SET state=$2, metadata=$3, tags=$4, updated_at=$5, version=version+1
-		WHERE id=$1 AND version=$6 AND deleted_at IS NULL`, prefix),
-		s.ID, stateJSON, metaJSON, tagsJSON, s.UpdatedAt, s.Version,
+		SET state=$1, metadata=$2, tags=$3, updated_at=$4, version=version+1
+		WHERE id=$5 AND version=$6 AND deleted_at IS NULL`, prefix),
+		stateJSON, metaJSON, tagsJSON, s.UpdatedAt, s.ID, s.Version,
 	)
 	if err != nil {
 		return err
@@ -135,25 +160,56 @@ func buildChildren(ctx context.Context, db *sql.DB, prefix string, node *BranchN
 	return rows.Err()
 }
 
+// Placeholders below are numbered in ascending order of APPEARANCE, not by
+// logical importance, and args are appended to match. loom's own drivers
+// (modernc.org/sqlite, lib/pq) bind $N by number, so this is not required for
+// correctness here — but mattn/go-sqlite3 binds $N by order of appearance, and
+// callers supply their own *sql.DB. Keeping appearance order == numeric order
+// makes these statements correct under positional binders too. Preserve it.
+
 func sqlSetPinned(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID, pinned bool) error {
-	_, err := db.ExecContext(ctx,
-		fmt.Sprintf(`UPDATE %ssessions SET pinned=$2, updated_at=$3 WHERE id=$1`, prefix),
-		id, pinned, time.Now())
-	return err
+	res, err := db.ExecContext(ctx,
+		fmt.Sprintf(`UPDATE %ssessions SET pinned=$1, updated_at=$2 WHERE id=$3 AND deleted_at IS NULL`, prefix),
+		pinned, time.Now(), id)
+	if err != nil {
+		return err
+	}
+	return affectedOrNotFound(res, "session", id)
 }
 
 func sqlSoftDeleteSession(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) error {
 	now := time.Now()
-	_, err := db.ExecContext(ctx,
-		fmt.Sprintf(`UPDATE %ssessions SET deleted_at=$2, updated_at=$3 WHERE id=$1`, prefix),
-		id, now, now)
-	return err
+	res, err := db.ExecContext(ctx,
+		fmt.Sprintf(`UPDATE %ssessions SET deleted_at=$1, updated_at=$2 WHERE id=$3 AND deleted_at IS NULL`, prefix),
+		now, now, id)
+	if err != nil {
+		return err
+	}
+	return affectedOrNotFound(res, "session", id)
 }
 
 func sqlHardDeleteSession(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) error {
-	_, err := db.ExecContext(ctx,
+	res, err := db.ExecContext(ctx,
 		fmt.Sprintf(`DELETE FROM %ssessions WHERE id=$1`, prefix), id)
-	return err
+	if err != nil {
+		return err
+	}
+	return affectedOrNotFound(res, "session", id)
+}
+
+// affectedOrNotFound turns a zero-row write into *NotFoundError. Without this a
+// write against a missing (or already-discarded) row reports success, which is
+// the same silent-no-op failure mode as a mis-bound placeholder. Drivers that
+// cannot report RowsAffected are treated as success, since we cannot tell.
+func affectedOrNotFound(res sql.Result, kind string, id uuid.UUID) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil
+	}
+	if n == 0 {
+		return &NotFoundError{Kind: kind, Key: id.String()}
+	}
+	return nil
 }
 
 type sessionRow interface {

@@ -55,7 +55,7 @@ func postgresStatements(p string) []string {
 			metadata      JSONB NOT NULL DEFAULT '{}',
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 			notes         TEXT NOT NULL DEFAULT '',
-			UNIQUE (slug, version, kind)
+			UNIQUE (owner, slug, version, kind)
 		)`, p),
 
 		// Generators (configuration records)
@@ -77,7 +77,7 @@ func postgresStatements(p string) []string {
 			schema        JSONB NOT NULL DEFAULT '{}',
 			strict        BOOL NOT NULL DEFAULT false,
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-			UNIQUE (slug, version)
+			UNIQUE (owner, slug, version)
 		)`, p),
 
 		// Agents
@@ -96,7 +96,7 @@ func postgresStatements(p string) []string {
 			params              JSONB NOT NULL DEFAULT '{}',
 			fallback_agent_id   UUID,
 			created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-			UNIQUE (slug, version)
+			UNIQUE (owner, slug, version)
 		)`, p, p, p, p),
 
 		// Flows (persisted agent maps)
@@ -121,6 +121,8 @@ func postgresStatements(p string) []string {
 			stream             INT NOT NULL DEFAULT 0,
 			generator_override TEXT NOT NULL DEFAULT '',
 			params             JSONB NOT NULL DEFAULT '{}',
+			retry_mode         INT NOT NULL DEFAULT 0,
+			max_retries        INT NOT NULL DEFAULT 0,
 			UNIQUE (flow_id, position)
 		)`, p, p),
 
@@ -302,7 +304,7 @@ func sqliteStatements(p string) []string {
 			metadata TEXT NOT NULL DEFAULT '{}',
 			created_at DATETIME NOT NULL,
 			notes TEXT NOT NULL DEFAULT '',
-			UNIQUE (slug, version, kind)
+			UNIQUE (owner, slug, version, kind)
 		)`, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sgenerators (
@@ -322,7 +324,7 @@ func sqliteStatements(p string) []string {
 			schema TEXT NOT NULL DEFAULT '{}',
 			strict INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
-			UNIQUE (slug, version)
+			UNIQUE (owner, slug, version)
 		)`, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sagents (
@@ -340,7 +342,7 @@ func sqliteStatements(p string) []string {
 			params TEXT NOT NULL DEFAULT '{}',
 			fallback_agent_id TEXT,
 			created_at DATETIME NOT NULL,
-			UNIQUE (slug, version)
+			UNIQUE (owner, slug, version)
 		)`, p, p, p, p),
 
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %sflows (
@@ -364,6 +366,8 @@ func sqliteStatements(p string) []string {
 			stream             INTEGER NOT NULL DEFAULT 0,
 			generator_override TEXT NOT NULL DEFAULT '',
 			params             TEXT NOT NULL DEFAULT '{}',
+			retry_mode         INTEGER NOT NULL DEFAULT 0,
+			max_retries        INTEGER NOT NULL DEFAULT 0,
 			UNIQUE (flow_id, position)
 		)`, p, p),
 

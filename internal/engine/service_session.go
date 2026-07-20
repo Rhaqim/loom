@@ -35,6 +35,34 @@ func (s *sessionService) Get(ctx context.Context, id uuid.UUID) (*Session, error
 	return sess, nil
 }
 
+func (s *sessionService) GetHeader(ctx context.Context, id uuid.UUID) (*Session, error) {
+	// Deliberately does not touch loom_steps: cost is independent of history
+	// length. History is left nil rather than empty so a caller can tell "not
+	// loaded" from "no steps".
+	return querySession(ctx, s.e.db, s.e.prefix, id)
+}
+
+func (s *sessionService) GetIncludingDeleted(ctx context.Context, id uuid.UUID) (*Session, error) {
+	sess, err := querySessionIncludingDeleted(ctx, s.e.db, s.e.prefix, id)
+	if err != nil {
+		return nil, err
+	}
+	steps, err := querySteps(ctx, s.e.db, s.e.prefix, id)
+	if err != nil {
+		return nil, err
+	}
+	sess.History = steps
+	return sess, nil
+}
+
+func (s *sessionService) Steps(ctx context.Context, id uuid.UUID, limit, offset int) ([]Step, error) {
+	return queryStepsPage(ctx, s.e.db, s.e.prefix, id, limit, offset)
+}
+
+func (s *sessionService) StateAt(ctx context.Context, id uuid.UUID, stepIndex int) (State, bool, error) {
+	return querySnapshotAt(ctx, s.e.db, s.e.prefix, id, stepIndex)
+}
+
 func (s *sessionService) Update(ctx context.Context, sess *Session) error {
 	sess.UpdatedAt = time.Now()
 	return updateSession(ctx, s.e.db, s.e.prefix, sess)
@@ -88,6 +116,22 @@ func (s *sessionService) Discard(ctx context.Context, id uuid.UUID) error {
 }
 
 func (s *sessionService) Purge(ctx context.Context, id uuid.UUID) error {
+	// Pin means "do not collect this". GC honours it on all four tiers; an
+	// explicit Purge previously did not, so a pin gave no protection against the
+	// one path that deletes irreversibly. Refuse, and make the override explicit.
+	// The pin lookup ignores deleted_at so a discarded-but-pinned session is
+	// still protected.
+	pinned, err := isSessionPinned(ctx, s.e.db, s.e.prefix, id)
+	if err != nil {
+		return err
+	}
+	if pinned {
+		return fmt.Errorf("%w: %s (use ForcePurge to delete anyway)", ErrSessionPinned, id)
+	}
+	return hardDeleteSession(ctx, s.e.db, s.e.prefix, id)
+}
+
+func (s *sessionService) ForcePurge(ctx context.Context, id uuid.UUID) error {
 	return hardDeleteSession(ctx, s.e.db, s.e.prefix, id)
 }
 

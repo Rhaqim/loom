@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"sort"
 	"sync"
 	"time"
 
@@ -207,6 +208,21 @@ func (e *Engine) RegisterGenerator(slug string, g Generator) {
 	e.generators[slug] = g
 }
 
+// Generators returns the slugs of the generators registered in THIS process,
+// sorted. It reflects in-process registration only (built-ins plus any
+// RegisterGenerator calls), not any database table — use it to validate an
+// agent's GeneratorSlug before saving.
+func (e *Engine) Generators() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	slugs := make([]string, 0, len(e.generators))
+	for slug := range e.generators {
+		slugs = append(slugs, slug)
+	}
+	sort.Strings(slugs)
+	return slugs
+}
+
 // generator resolves a registered generator by slug under a read lock.
 func (e *Engine) generator(slug string) (Generator, bool) {
 	e.mu.RLock()
@@ -295,6 +311,13 @@ func (e *Engine) StartPoller(ctx context.Context) {
 //   - *BudgetExceededError — a configured budget blocked the step.
 //   - *GenerationError — the generator failed; switch on Kind (transport /
 //     rejected / empty).
+//   - ErrSessionNotPersisted — PARTIAL SUCCESS. The step ran and committed, and
+//     the returned *Step is non-nil and valid; only the loom_sessions row
+//     update failed, so session.State in the database (and any in-memory
+//     *Session) is stale. Callers using loom as a system of record must
+//     reconcile — StateAt(ctx, id, step.Index) returns the authoritative
+//     post-step state — before trusting session state. This is the one error
+//     for which the returned *Step is non-nil.
 //   - otherwise, a wrapped error from a hook, template render, or persistence.
 func (e *Engine) RunStep(ctx context.Context, session *Session, req StepRequest) (*Step, error) {
 	return e.steps.run(ctx, session, req)

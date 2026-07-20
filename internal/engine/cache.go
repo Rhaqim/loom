@@ -36,9 +36,20 @@ type Cache interface {
 // your cache backend enforces eviction.
 const defaultCacheTTL = 24 * time.Hour
 
-// cacheKey formats a cache key for a given kind, prefix, slug, and version.
+// cacheKey formats a cache key for a given kind, prefix, slug, and version. Use
+// it only for globally unique addresses (a row UUID); anything addressed by slug
+// is owner-scoped and must use cacheKeyOwned.
 func cacheKey(kind, prefix, slug string, version int) string {
 	return fmt.Sprintf("loom:%s:%s:%s:%d", kind, prefix, slug, version)
+}
+
+// cacheKeyOwned formats a cache key for a record addressed by owner+slug+version.
+// The owner MUST be part of the key: slugs are only unique within an owner, so a
+// key without it would serve one tenant's agent/prompt to another — the cache
+// silently defeating the SQL owner filter. "" (the global scope) is just another
+// owner value here.
+func cacheKeyOwned(kind, prefix, owner, slug string, version int) string {
+	return fmt.Sprintf("loom:%s:%s:%s:%s:%d", kind, prefix, owner, slug, version)
 }
 
 // cacheGet attempts to deserialise a cached value into dst.

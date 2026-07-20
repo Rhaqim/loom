@@ -14,7 +14,7 @@ import (
 type Prompt struct {
 	ID        uuid.UUID
 	Slug      string // human-readable identifier, e.g. "opening-author"
-	Owner     string // opaque app-owned scope ("" = global); reserved for future per-tenant use
+	Owner     string // opaque app-owned scope ("" = global)
 	Version   int    // monotonically increasing; editing creates a new version
 	Kind      PromptKind
 	Category  string   // platform-defined grouping
@@ -81,18 +81,34 @@ func PromptFromFile(path string) PromptRef {
 	return PromptRef{File: path}
 }
 
-// PromptRegistry resolves and manages prompts.
+// PromptRegistry resolves and manages prompts. owner is an opaque scope the
+// embedding application controls (e.g. a tenant/studio id); "" is the global
+// default. Slugs are only unique within an owner, so every slug-addressed
+// lookup takes one.
 type PromptRegistry interface {
-	// Get retrieves a specific version. Version 0 resolves to LATEST. A missing
-	// prompt returns *NotFoundError (which unwraps to ErrNotFound).
-	Get(ctx context.Context, slug string, version int) (*Prompt, error)
-	// Latest resolves the highest version of slug.
-	Latest(ctx context.Context, slug string) (*Prompt, error)
-	// Create persists a new prompt version.
+	// Get retrieves a specific version within owner. Version 0 resolves to
+	// LATEST. A missing prompt returns *NotFoundError (which unwraps to
+	// ErrNotFound).
+	Get(ctx context.Context, owner, slug string, version int) (*Prompt, error)
+	// Latest resolves the highest version of slug within owner.
+	Latest(ctx context.Context, owner, slug string) (*Prompt, error)
+	// GetByID retrieves a prompt by row ID — the way an Agent's SystemPromptID
+	// and UserTemplateID FKs are resolved back to prompt text without listing
+	// every prompt.
+	//
+	// This is NOT owner-scoped: it exists to resolve loom's own internal FK
+	// references, and a UUID primary key is globally unique. An application must
+	// therefore not pass an untrusted, tenant-supplied ID to it without checking
+	// the returned record's Owner against the caller's scope itself.
+	GetByID(ctx context.Context, id uuid.UUID) (*Prompt, error)
+	// Create persists a new prompt version. The scope comes from p.Owner.
 	Create(ctx context.Context, p *Prompt) error
-	// List returns all prompts matching kind and optional category filter.
-	List(ctx context.Context, kind PromptKind, category string) ([]*Prompt, error)
-	// Delete removes a specific prompt version (>= 1). On Postgres it fails if the
-	// version is still referenced by an agent (ON DELETE RESTRICT).
-	Delete(ctx context.Context, slug string, version int) error
+	// List returns all prompts for owner matching kind and optional category
+	// filter.
+	List(ctx context.Context, owner string, kind PromptKind, category string) ([]*Prompt, error)
+	// Versions returns every stored version of slug within owner, newest first.
+	Versions(ctx context.Context, owner, slug string) ([]*Prompt, error)
+	// Delete removes a specific prompt version (>= 1) within owner. On Postgres it
+	// fails if the version is still referenced by an agent (ON DELETE RESTRICT).
+	Delete(ctx context.Context, owner, slug string, version int) error
 }

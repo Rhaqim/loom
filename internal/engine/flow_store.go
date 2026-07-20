@@ -41,6 +41,13 @@ type FlowAgentEntry struct {
 	Stream            bool
 	GeneratorOverride string
 	Params            map[string]any
+	// RetryMode and MaxRetries mirror the runtime FlowAgent fields so a flow's
+	// retry policy survives persistence. Before these were stored, a flow saved
+	// with RetryKeepBest came back as RetryDiscard while the write reported
+	// success. Their zero values (RetryDiscard, engine-default cap) are what
+	// rows written before the columns existed resolve to.
+	RetryMode  RetryMode
+	MaxRetries int
 }
 
 // Flow builds the runtime Flow from the record: the first entry is the lead, the
@@ -55,6 +62,8 @@ func (r *FlowRecord) Flow() Flow {
 			OutputKey:         e.OutputKey,
 			GeneratorOverride: e.GeneratorOverride,
 			Params:            e.Params,
+			RetryMode:         e.RetryMode,
+			MaxRetries:        e.MaxRetries,
 		}
 		if i == 0 {
 			f.Lead = fa
@@ -140,6 +149,11 @@ func (e *Engine) RunTurnBySlug(ctx context.Context, session *Session, owner, slu
 		return nil, fmt.Errorf("loom: flow %q v%d is not active", slug, rec.Version)
 	}
 	req.Flow = rec.Flow()
+	// Resolve the flow's agents within the flow's own owner scope, so a
+	// persisted flow can never reach an agent belonging to another tenant.
+	// Taken from the loaded record rather than the caller's req so it cannot be
+	// overridden from outside.
+	req.Owner = rec.Owner
 	return e.RunTurn(ctx, session, req)
 }
 
@@ -148,7 +162,7 @@ func (e *Engine) RunTurnBySlug(ctx context.Context, session *Session, owner, slu
 // -----------------------------------------------------------------------
 
 const flowColumns = `id, owner, slug, version, category, is_active, created_at`
-const flowAgentColumns = `position, agent_slug, agent_version, output_key, stream, generator_override, params`
+const flowAgentColumns = `position, agent_slug, agent_version, output_key, stream, generator_override, params, retry_mode, max_retries`
 
 func sqlInsertFlow(ctx context.Context, db *sql.DB, prefix string, r *FlowRecord) error {
 	tx, err := db.BeginTx(ctx, nil)
@@ -171,10 +185,11 @@ func sqlInsertFlow(ctx context.Context, db *sql.DB, prefix string, r *FlowRecord
 		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 			INSERT INTO %sflow_agents
-				(id, flow_id, position, agent_slug, agent_version, output_key, stream, generator_override, params)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, prefix),
+				(id, flow_id, position, agent_slug, agent_version, output_key, stream,
+				 generator_override, params, retry_mode, max_retries)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, prefix),
 			uuid.New(), r.ID, e.Position, e.AgentSlug, e.AgentVersion, e.OutputKey,
-			flowBool(e.Stream), e.GeneratorOverride, paramsJSON,
+			flowBool(e.Stream), e.GeneratorOverride, paramsJSON, int(e.RetryMode), e.MaxRetries,
 		); err != nil {
 			return err
 		}
@@ -288,12 +303,14 @@ func loadFlowAgents(ctx context.Context, db *sql.DB, prefix string, r *FlowRecor
 			e          FlowAgentEntry
 			stream     int
 			paramsJSON []byte
+			retryMode  int
 		)
 		if err := rows.Scan(&e.Position, &e.AgentSlug, &e.AgentVersion, &e.OutputKey,
-			&stream, &e.GeneratorOverride, &paramsJSON); err != nil {
+			&stream, &e.GeneratorOverride, &paramsJSON, &retryMode, &e.MaxRetries); err != nil {
 			return err
 		}
 		e.Stream = stream != 0
+		e.RetryMode = RetryMode(retryMode)
 		if len(paramsJSON) > 0 {
 			_ = json.Unmarshal(paramsJSON, &e.Params)
 		}

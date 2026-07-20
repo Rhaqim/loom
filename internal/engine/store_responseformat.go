@@ -25,16 +25,18 @@ func sqlInsertResponseFormat(ctx context.Context, db *sql.DB, prefix string, rf 
 	return err
 }
 
-func sqlQueryResponseFormat(ctx context.Context, db *sql.DB, prefix, slug string, version int) (*ResponseFormatRecord, error) {
-	row := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT %s FROM %sresponse_formats WHERE slug=$1 AND version=$2`, responseFormatColumns, prefix), slug, version)
+func sqlQueryResponseFormat(ctx context.Context, db *sql.DB, prefix, owner, slug string, version int) (*ResponseFormatRecord, error) {
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT %s FROM %sresponse_formats WHERE owner=$1 AND slug=$2 AND version=$3`, responseFormatColumns, prefix), owner, slug, version)
 	return scanResponseFormat(row)
 }
 
-func sqlQueryResponseFormatLatest(ctx context.Context, db *sql.DB, prefix, slug string) (*ResponseFormatRecord, error) {
-	row := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT %s FROM %sresponse_formats WHERE slug=$1 ORDER BY version DESC LIMIT 1`, responseFormatColumns, prefix), slug)
+func sqlQueryResponseFormatLatest(ctx context.Context, db *sql.DB, prefix, owner, slug string) (*ResponseFormatRecord, error) {
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT %s FROM %sresponse_formats WHERE owner=$1 AND slug=$2 ORDER BY version DESC LIMIT 1`, responseFormatColumns, prefix), owner, slug)
 	return scanResponseFormat(row)
 }
 
+// sqlQueryResponseFormatByID is intentionally not owner-filtered: the row UUID
+// is globally unique and this resolves loom's own FK references.
 func sqlQueryResponseFormatByID(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) (*ResponseFormatRecord, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT %s FROM %sresponse_formats WHERE id=$1`, responseFormatColumns, prefix), id)
 	return scanResponseFormat(row)

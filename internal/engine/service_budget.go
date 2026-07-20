@@ -3,12 +3,18 @@ package engine
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-type budgetService struct{ e *Engine }
+type budgetService struct {
+	e *Engine
+	// unpricedWarn keeps the "USD budget without pricing" warning to one line
+	// per engine, since enforce runs on every step.
+	unpricedWarn sync.Once
+}
 
 func (b *budgetService) Create(ctx context.Context, budget *Budget) error {
 	// Only platform_id budgets are enforced today; reject other kinds rather than
@@ -66,6 +72,16 @@ func (b *budgetService) enforce(ctx context.Context, session *Session, agent *Ag
 		if err != nil {
 			b.e.log.Error("budget: usage", "budget", bud.Name, "err", err)
 			continue
+		}
+		// A USD limit is evaluated against recorded USD, which is fabricated from
+		// a placeholder rate when no pricing is configured. The limit is still
+		// enforced — failing open on spend control would be worse — but it is not
+		// measuring real money, so say so rather than let it look authoritative.
+		if bud.Limit.USD > 0 && !used.PricingConfigured {
+			b.unpricedWarn.Do(func() {
+				b.e.log.Error("budget: USD limit evaluated against placeholder pricing — this cap does not reflect real spend; set Config.Pricing or Config.DefaultPrice",
+					"budget", bud.Name, "limit_usd", bud.Limit.USD, "used_usd", used.TotalUSD)
+			})
 		}
 		if !budgetExceeded(bud.Limit, used) {
 			continue

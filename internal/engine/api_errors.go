@@ -131,6 +131,28 @@ var ErrDuplicateSlug = errors.New("loom: duplicate slug+version")
 // write would clobber theirs (optimistic-concurrency conflict).
 var ErrSessionConflict = errors.New("loom: session update conflict")
 
+// ErrSessionPinned is returned by Purge when the target session is pinned.
+// Pinning marks data as protected, so an irreversible delete requires the
+// explicit ForcePurge instead.
+var ErrSessionPinned = errors.New("loom: session is pinned")
+
+// ErrSessionNotPersisted is returned by RunStep (and wrapped into Turn.Errors
+// by RunTurn) when a step ran and committed — its result and checkpoint are
+// durable — but the subsequent loom_sessions row update failed. The returned
+// *Step is valid and usable; what is stale is loom_sessions.state, and any
+// in-memory *Session the caller holds.
+//
+// It always wraps a more specific cause: ErrSessionConflict when another writer
+// advanced the row, ErrNotFound when the row was discarded mid-step, or a raw
+// driver error. Recover the authoritative post-step state with
+// SessionRegistry.StateAt(ctx, id, step.Index) and retry the write, or re-Get
+// the session and replay.
+//
+// This is deliberately a returned error rather than a diagnostics flag: a
+// caller using loom as a system of record must not proceed on state the
+// database does not have.
+var ErrSessionNotPersisted = errors.New("loom: session row not persisted after step")
+
 // ErrInvalidConfig is returned by New when the Config is missing a required
 // field or is otherwise unusable. Wrapped errors carry the specific reason.
 var ErrInvalidConfig = errors.New("loom: invalid config")

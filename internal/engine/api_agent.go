@@ -12,7 +12,7 @@ import (
 type Agent struct {
 	ID             uuid.UUID
 	Slug           string    // human-readable identifier
-	Owner          string    // opaque app-owned scope ("" = global); reserved for future per-tenant use
+	Owner          string    // opaque app-owned scope ("" = global)
 	Version        int       // monotonically increasing
 	Category       string    // platform-defined grouping
 	Modal          Modality  // the modality this agent produces
@@ -30,18 +30,33 @@ type Agent struct {
 	CreatedAt        time.Time
 }
 
-// AgentRegistry resolves and manages agents.
+// AgentRegistry resolves and manages agents. owner is an opaque scope the
+// embedding application controls (e.g. a tenant/studio id); "" is the global
+// default. Slugs are only unique within an owner, so every slug-addressed
+// lookup takes one — an agent stored under owner A is invisible to owner B.
 type AgentRegistry interface {
-	// Get retrieves a specific version. Version 0 resolves to LATEST. A missing
-	// agent returns *NotFoundError (which unwraps to ErrNotFound).
-	Get(ctx context.Context, slug string, version int) (*Agent, error)
-	// Latest resolves the highest version of slug.
-	Latest(ctx context.Context, slug string) (*Agent, error)
-	// Create persists a new agent version.
+	// Get retrieves a specific version within owner. Version 0 resolves to
+	// LATEST. A missing agent returns *NotFoundError (which unwraps to
+	// ErrNotFound).
+	Get(ctx context.Context, owner, slug string, version int) (*Agent, error)
+	// Latest resolves the highest version of slug within owner.
+	Latest(ctx context.Context, owner, slug string) (*Agent, error)
+	// GetByID retrieves an agent by row ID — the way a FallbackAgentID is
+	// resolved back to the agent it points at without listing every agent.
+	//
+	// This is NOT owner-scoped: it exists to resolve loom's own internal FK
+	// references, and a UUID primary key is globally unique. An application must
+	// therefore not pass an untrusted, tenant-supplied ID to it without checking
+	// the returned record's Owner against the caller's scope itself.
+	GetByID(ctx context.Context, id uuid.UUID) (*Agent, error)
+	// Create persists a new agent version. The scope comes from a.Owner.
 	Create(ctx context.Context, a *Agent) error
-	// List returns all agents matching optional category filter.
-	List(ctx context.Context, category string) ([]*Agent, error)
-	// Delete removes a specific agent version (>= 1). On Postgres it fails if the
-	// version is still referenced (e.g. by persisted steps, ON DELETE RESTRICT).
-	Delete(ctx context.Context, slug string, version int) error
+	// List returns all agents for owner matching optional category filter.
+	List(ctx context.Context, owner, category string) ([]*Agent, error)
+	// Versions returns every stored version of slug within owner, newest first.
+	Versions(ctx context.Context, owner, slug string) ([]*Agent, error)
+	// Delete removes a specific agent version (>= 1) within owner. On Postgres it
+	// fails if the version is still referenced (e.g. by persisted steps, ON
+	// DELETE RESTRICT).
+	Delete(ctx context.Context, owner, slug string, version int) error
 }

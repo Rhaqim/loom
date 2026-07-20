@@ -72,7 +72,10 @@ type SessionRegistry = engine.SessionRegistry
 // response format, and generation params. It is the unit the platform spawns.
 type Agent = engine.Agent
 
-// AgentRegistry resolves and manages agents.
+// AgentRegistry resolves and manages agents. owner is an opaque scope the
+// embedding application controls (e.g. a tenant/studio id); "" is the global
+// default. Slugs are only unique within an owner, so every slug-addressed
+// lookup takes one — an agent stored under owner A is invisible to owner B.
 type AgentRegistry = engine.AgentRegistry
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -111,7 +114,10 @@ var PromptByName = engine.PromptByName
 // PromptFromFile constructs a PromptRef loaded from a file path.
 var PromptFromFile = engine.PromptFromFile
 
-// PromptRegistry resolves and manages prompts.
+// PromptRegistry resolves and manages prompts. owner is an opaque scope the
+// embedding application controls (e.g. a tenant/studio id); "" is the global
+// default. Slugs are only unique within an owner, so every slug-addressed
+// lookup takes one.
 type PromptRegistry = engine.PromptRegistry
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -121,7 +127,10 @@ type PromptRegistry = engine.PromptRegistry
 // ResponseFormatRecord is a stored, versioned response format.
 type ResponseFormatRecord = engine.ResponseFormatRecord
 
-// ResponseFormatRegistry resolves and manages reusable response formats.
+// ResponseFormatRegistry resolves and manages reusable response formats. owner
+// is an opaque scope the embedding application controls (e.g. a tenant/studio
+// id); "" is the global default. Slugs are only unique within an owner, so every
+// slug-addressed lookup takes one.
 type ResponseFormatRegistry = engine.ResponseFormatRegistry
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -471,6 +480,9 @@ var GeneratorCompleter = engine.GeneratorCompleter
 type CostManager = engine.CostManager
 
 // UsageSummary aggregates cost metrics.
+//
+// Token and step counts are always exact. The USD figures are only meaningful
+// when PricingConfigured is true — see that field.
 type UsageSummary = engine.UsageSummary
 
 // UsageQuery is the input to cost queries.
@@ -479,7 +491,8 @@ type UsageQuery = engine.UsageQuery
 // AgentUsage is a per-agent cost breakdown entry.
 type AgentUsage = engine.AgentUsage
 
-// AgentCostStats holds statistical cost data for an agent.
+// AgentCostStats holds statistical cost data for an agent. The USD* fields are
+// only real money when PricingConfigured is true; see UsageSummary.
 type AgentCostStats = engine.AgentCostStats
 
 // EstimateRequest is the input to Cost().Estimate().
@@ -651,6 +664,28 @@ var ErrDuplicateSlug = engine.ErrDuplicateSlug
 // longer matches the in-memory copy — another writer updated it first, so this
 // write would clobber theirs (optimistic-concurrency conflict).
 var ErrSessionConflict = engine.ErrSessionConflict
+
+// ErrSessionPinned is returned by Purge when the target session is pinned.
+// Pinning marks data as protected, so an irreversible delete requires the
+// explicit ForcePurge instead.
+var ErrSessionPinned = engine.ErrSessionPinned
+
+// ErrSessionNotPersisted is returned by RunStep (and wrapped into Turn.Errors
+// by RunTurn) when a step ran and committed — its result and checkpoint are
+// durable — but the subsequent loom_sessions row update failed. The returned
+// *Step is valid and usable; what is stale is loom_sessions.state, and any
+// in-memory *Session the caller holds.
+//
+// It always wraps a more specific cause: ErrSessionConflict when another writer
+// advanced the row, ErrNotFound when the row was discarded mid-step, or a raw
+// driver error. Recover the authoritative post-step state with
+// SessionRegistry.StateAt(ctx, id, step.Index) and retry the write, or re-Get
+// the session and replay.
+//
+// This is deliberately a returned error rather than a diagnostics flag: a
+// caller using loom as a system of record must not proceed on state the
+// database does not have.
+var ErrSessionNotPersisted = engine.ErrSessionNotPersisted
 
 // ErrInvalidConfig is returned by New when the Config is missing a required
 // field or is otherwise unusable. Wrapped errors carry the specific reason.

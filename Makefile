@@ -1,7 +1,7 @@
 DSN ?= postgres://loom:loom@localhost:5432/loom?sslmode=disable
 export LOOM_DSN := $(DSN)
 
-.PHONY: help up down migrate seed example test-engine test-cli test-all build clean generate check-facade check llms-full
+.PHONY: help up down migrate seed example test-engine test-cli test-schema test-all build clean generate check-facade check llms-full
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -31,8 +31,17 @@ test-engine: ## Run engine + harness integration tests (requires Postgres)
 test-cli: ## Run CLI integration tests (requires Postgres)
 	go test -v -count=1 -timeout 60s ./internal/clitest/...
 
-test-all: ## Run all tests (requires Postgres via docker compose up)
-	go test -v -count=1 -timeout 180s \
+test-schema: ## Run schema/migration tests incl. the Postgres upgrade paths (requires Postgres)
+	go test -v -count=1 -timeout 120s ./schema/...
+
+# -p 1 is REQUIRED: these packages share one Postgres database and the same
+# loom_ prefixed tables. Run in parallel, they interleave schema migrations with
+# each other's data and fail spuriously (a migration widening a unique key while
+# another package is inserting rows). Serialising costs a few seconds and makes
+# the suite deterministic.
+test-all: ## Run all Postgres-backed tests serially (requires `make up`)
+	go test -p 1 -v -count=1 -timeout 300s \
+		./schema/... \
 		./internal/enginetest/... \
 		./internal/clitest/...
 
@@ -51,10 +60,15 @@ check-facade: ## Fail if aliases.go is stale (run `make generate` and commit)
 	fi
 	@echo "facade is up to date."
 
-check: check-facade ## Run non-DB checks: facade sync, vet, build, race tests
+# LOOM_DSN is cleared explicitly. This target is documented as the non-DB
+# check, but the Makefile exports LOOM_DSN unconditionally at the top — so
+# without this the Postgres-backed tests do NOT skip, they spend their ping
+# timeout dialling a database that is not running and then fail. Clearing it
+# restores the intended "skip if no DSN" behaviour.
+check: check-facade ## Run non-DB checks: facade sync, vet, build, race tests (no Postgres needed)
 	go vet ./...
 	go build ./...
-	go test -race ./...
+	LOOM_DSN= go test -race -count=1 ./...
 
 build: ## Build the loom-cli binary
 	go build -o bin/loom-cli ./cmd/loom-cli

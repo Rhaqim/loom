@@ -24,11 +24,24 @@ type CostManager interface {
 }
 
 // UsageSummary aggregates cost metrics.
+//
+// Token and step counts are always exact. The USD figures are only meaningful
+// when PricingConfigured is true — see that field.
 type UsageSummary struct {
 	TotalUSD    float64
 	TotalTokens int
 	StepCount   int
 	ByModel     map[string]float64
+
+	// PricingConfigured reports whether the engine had real pricing (either
+	// Config.Pricing or Config.DefaultPrice) when these costs were recorded.
+	//
+	// When false, TotalUSD and ByModel are derived from a built-in placeholder
+	// rate and are NOT real money. Render them as "—"/unknown rather than as a
+	// dollar amount, and do not use them for billing or reporting. Note that any
+	// USD-denominated budget is evaluated against these same figures, so a USD
+	// limit is not enforceable in this state.
+	PricingConfigured bool
 }
 
 // UsageQuery is the input to cost queries.
@@ -47,13 +60,17 @@ type AgentUsage struct {
 	USDTotal     float64
 }
 
-// AgentCostStats holds statistical cost data for an agent.
+// AgentCostStats holds statistical cost data for an agent. The USD* fields are
+// only real money when PricingConfigured is true; see UsageSummary.
 type AgentCostStats struct {
 	USDMean   float64
 	USDP50    float64
 	USDP95    float64
 	TokensP50 int
 	TokensP95 int
+
+	// PricingConfigured — see UsageSummary.PricingConfigured.
+	PricingConfigured bool
 }
 
 // EstimateRequest is the input to Cost().Estimate().
