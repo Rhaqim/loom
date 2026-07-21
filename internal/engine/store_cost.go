@@ -87,3 +87,49 @@ func sqlAgentStats(ctx context.Context, db *sql.DB, prefix string, agentID uuid.
 	s := &AgentCostStats{}
 	return s, row.Scan(&s.USDMean, &s.USDP50, &s.USDP95, &s.TokensP50, &s.TokensP95)
 }
+
+// sqlStepUsage returns one usage row per recorded step of a session, oldest
+// first. Rows with a NULL step_id are skipped — those are session- or
+// platform-level charges with no step to attribute them to.
+//
+// This lives on CostManager rather than being joined into querySteps on
+// purpose: Session.Get is already the expensive read (see GetHeader/Steps), and
+// folding a cost join into it would put that cost on every session load whether
+// the caller wants usage or not.
+func sqlStepUsage(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID) ([]StepUsage, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT step_id, agent_id, provider, model, modality,
+		       input_tokens, output_tokens, images, duration_sec,
+		       usd_cost, estimated, created_at
+		FROM %scost_records
+		WHERE session_id=$1 AND step_id IS NOT NULL
+		ORDER BY created_at`, prefix), sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []StepUsage
+	for rows.Next() {
+		var (
+			u               StepUsage
+			stepID, agentID sql.NullString
+			modal           string
+		)
+		if err := rows.Scan(&stepID, &agentID, &u.Provider, &u.Model, &modal,
+			&u.InputTokens, &u.OutputTokens, &u.Images, &u.DurationSec,
+			&u.USDCost, &u.Estimated, &u.Timestamp); err != nil {
+			return nil, err
+		}
+		u.Modal = Modality(modal)
+		if stepID.Valid {
+			u.StepID, _ = uuid.Parse(stepID.String)
+		}
+		// agent_id is nullable and stays uuid.Nil when absent.
+		if agentID.Valid {
+			u.AgentID, _ = uuid.Parse(agentID.String)
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}

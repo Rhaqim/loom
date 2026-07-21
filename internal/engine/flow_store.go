@@ -81,7 +81,28 @@ func (r *FlowRecord) Flow() Flow {
 type FlowRegistry interface {
 	Create(ctx context.Context, r *FlowRecord) error
 	Get(ctx context.Context, owner, slug string, version int) (*FlowRecord, error)
+	// Latest resolves the highest version of slug within owner REGARDLESS of
+	// IsActive — the authoring view, so an editor can see a draft it just
+	// saved. Use LatestActive for the serving view.
 	Latest(ctx context.Context, owner, slug string) (*FlowRecord, error)
+	// LatestActive resolves the highest version of slug within owner that has
+	// IsActive set — the serving view, and what version 0 resolves to on Get
+	// and RunTurnBySlug.
+	//
+	// This is what makes a draft safe: saving v5 with IsActive false leaves v4
+	// serving traffic instead of taking the slug down. Returns *NotFoundError
+	// if no active version exists. If several versions are active (the default
+	// before SetActive is used — Create does not deactivate siblings), the
+	// highest wins, which is the historical behaviour.
+	LatestActive(ctx context.Context, owner, slug string) (*FlowRecord, error)
+	// SetActive makes one version the active one and deactivates every other
+	// version of the same owner+slug, in a single transaction.
+	//
+	// This turns publish and rollback into a pointer move rather than "write a
+	// newer version", which is the only thing that makes rolling BACK to an
+	// older version possible at all. Returns *NotFoundError if the version does
+	// not exist, leaving the current pointer untouched.
+	SetActive(ctx context.Context, owner, slug string, version int) error
 	// List returns flows for an owner (optional category filter) WITHOUT their
 	// agent entries — a lightweight index for an editor.
 	List(ctx context.Context, owner, category string) ([]*FlowRecord, error)
@@ -114,13 +135,29 @@ func (s *flowService) Create(ctx context.Context, r *FlowRecord) error {
 
 func (s *flowService) Get(ctx context.Context, owner, slug string, version int) (*FlowRecord, error) {
 	if version == 0 {
-		return s.Latest(ctx, owner, slug)
+		// Version 0 means "whatever serves traffic", so it resolves the latest
+		// ACTIVE version. Resolving the latest version and then refusing it for
+		// being inactive is never useful: it lets an unfinished draft take a
+		// slug down instead of sitting harmlessly beside the live version. Use
+		// Latest explicitly for the authoring view that includes drafts.
+		return s.LatestActive(ctx, owner, slug)
 	}
 	return sqlQueryFlow(ctx, s.e.db, s.e.prefix, owner, slug, version)
 }
 
 func (s *flowService) Latest(ctx context.Context, owner, slug string) (*FlowRecord, error) {
 	return sqlQueryFlowLatest(ctx, s.e.db, s.e.prefix, owner, slug)
+}
+
+func (s *flowService) LatestActive(ctx context.Context, owner, slug string) (*FlowRecord, error) {
+	return sqlQueryFlowLatestActive(ctx, s.e.db, s.e.prefix, owner, slug)
+}
+
+func (s *flowService) SetActive(ctx context.Context, owner, slug string, version int) error {
+	if version < 1 {
+		return fmt.Errorf("loom: set active flow %q: an explicit version >= 1 is required", slug)
+	}
+	return sqlSetFlowActive(ctx, s.e.db, s.e.prefix, owner, slug, version)
 }
 
 func (s *flowService) List(ctx context.Context, owner, category string) ([]*FlowRecord, error) {
@@ -143,10 +180,13 @@ func (e *Engine) RunTurnBySlug(ctx context.Context, session *Session, owner, slu
 	if err != nil {
 		return nil, fmt.Errorf("loom: load flow %q: %w", slug, err)
 	}
-	// A retired/disabled flow version must not execute. Re-activate by storing a
-	// new version with IsActive set.
+	// A retired/disabled flow version must not execute. With version 0 this is
+	// unreachable — Get already resolved the latest ACTIVE version — so it only
+	// fires when a caller pins an explicitly inactive version, which is a
+	// caller mistake rather than a draft taking the slug down. Publish with
+	// Flows().SetActive.
 	if !rec.IsActive {
-		return nil, fmt.Errorf("loom: flow %q v%d is not active", slug, rec.Version)
+		return nil, fmt.Errorf("loom: flow %q v%d is not active (publish it with Flows().SetActive)", slug, rec.Version)
 	}
 	req.Flow = rec.Flow()
 	// Resolve the flow's agents within the flow's own owner scope, so a
@@ -223,6 +263,54 @@ func sqlQueryFlowLatest(ctx context.Context, db *sql.DB, prefix, owner, slug str
 		return nil, err
 	}
 	return r, nil
+}
+
+// sqlQueryFlowLatestActive resolves the highest ACTIVE version. is_active is
+// stored as an INT (SQLite has no bool), so compare against 1 rather than using
+// a boolean predicate, which Postgres would accept but SQLite would not.
+func sqlQueryFlowLatestActive(ctx context.Context, db *sql.DB, prefix, owner, slug string) (*FlowRecord, error) {
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s FROM %sflows WHERE owner=$1 AND slug=$2 AND is_active=1
+		ORDER BY version DESC LIMIT 1`, flowColumns, prefix),
+		owner, slug)
+	r, err := scanFlow(row)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadFlowAgents(ctx, db, prefix, r); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// sqlSetFlowActive points owner+slug at one version: it activates that version
+// and deactivates every sibling, in one transaction so no window exists where
+// the slug has zero or two active versions.
+func sqlSetFlowActive(ctx context.Context, db *sql.DB, prefix, owner, slug string, version int) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Activate the target first, so a version that does not exist is caught
+	// BEFORE the siblings are deactivated — otherwise a typo would leave the
+	// slug with nothing serving.
+	res, err := tx.ExecContext(ctx, fmt.Sprintf(
+		`UPDATE %sflows SET is_active=1 WHERE owner=$1 AND slug=$2 AND version=$3`, prefix),
+		owner, slug, version)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return &NotFoundError{Kind: "flow", Key: fmt.Sprintf("%s@v%d", slug, version)}
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+		`UPDATE %sflows SET is_active=0 WHERE owner=$1 AND slug=$2 AND version<>$3`, prefix),
+		owner, slug, version); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func sqlListFlows(ctx context.Context, db *sql.DB, prefix, owner, category string) ([]*FlowRecord, error) {

@@ -44,6 +44,10 @@ func (c *costService) AgentStats(ctx context.Context, agentID uuid.UUID, window 
 	return s, err
 }
 
+func (c *costService) ByStep(ctx context.Context, sessionID uuid.UUID) ([]StepUsage, error) {
+	return sqlStepUsage(ctx, c.e.db, c.e.prefix, sessionID)
+}
+
 func (c *costService) Estimate(_ context.Context, req EstimateRequest) (*CostEstimate, error) {
 	// Simple estimation: count input tokens naively (1 token ≈ 4 chars).
 	inputTokens := len(req.Input) / 4

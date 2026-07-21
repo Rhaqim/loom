@@ -485,6 +485,15 @@ type CostManager = engine.CostManager
 // when PricingConfigured is true — see that field.
 type UsageSummary = engine.UsageSummary
 
+// StepUsage is one step's recorded generation usage — the per-step row behind
+// the aggregates. Token counts, image counts and duration are exact.
+//
+// USDCost is only real money when Estimated is false; when true it was derived
+// from a built-in placeholder rate because no pricing was configured (see
+// UsageSummary.PricingConfigured). Render it as unknown rather than as a
+// dollar amount in that case.
+type StepUsage = engine.StepUsage
+
 // UsageQuery is the input to cost queries.
 type UsageQuery = engine.UsageQuery
 
