@@ -21,6 +21,7 @@ type ResponseFormatRecord struct {
 	Slug       string // human-readable identifier, e.g. "logician-schema"
 	Owner      string // opaque app-owned scope ("" = global)
 	Version    int    // monotonically increasing; editing creates a new version
+	Category   string // optional grouping label, for parity with agents/prompts/flows
 	Schema     map[string]any
 	StrictMode bool
 	CreatedAt  time.Time
@@ -54,6 +55,16 @@ type ResponseFormatRegistry interface {
 	// tenant-supplied ID to it without checking the returned record's Owner
 	// against the caller's scope itself.
 	GetByID(ctx context.Context, id uuid.UUID) (*ResponseFormatRecord, error)
+	// List returns response formats for owner (optional category filter),
+	// WITHOUT their schema bodies — a lightweight index for an editor, matching
+	// the shape AgentRegistry, PromptRegistry and FlowRegistry already use.
+	//
+	// Schema is left nil on every returned record; call Get or GetByID for the
+	// body. This is what lets an authoring UI offer a picker for an agent's
+	// response format instead of leaving it a free-text slug, where a typo
+	// silently means "no schema attached" and the agent returns unstructured
+	// text that every downstream parser then rejects at run time.
+	List(ctx context.Context, owner, category string) ([]*ResponseFormatRecord, error)
 	// Delete removes a specific response-format version (>= 1) within owner. On
 	// Postgres it fails if the version is still referenced by an agent (ON DELETE
 	// RESTRICT).
@@ -108,6 +119,12 @@ func (s *responseFormatService) GetByID(ctx context.Context, id uuid.UUID) (*Res
 	}
 	cacheSet(ctx, s.e.cache, key, r, s.e.cacheTTL)
 	return r, nil
+}
+
+func (s *responseFormatService) List(ctx context.Context, owner, category string) ([]*ResponseFormatRecord, error) {
+	// Not cached: a list is a browse operation over mutable membership (a new
+	// version changes the answer), unlike the immutable single-version reads.
+	return sqlListResponseFormats(ctx, s.e.db, s.e.prefix, owner, category)
 }
 
 func (s *responseFormatService) Delete(ctx context.Context, owner, slug string, version int) error {

@@ -6,6 +6,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -37,8 +38,19 @@ func TestRunTurnBySlugRespectsIsActive(t *testing.T) {
 	if _, err := e.RunTurnBySlug(ctx, sess, "", "f-active", 0, TurnRequest{}); err != nil {
 		t.Errorf("active flow should run, got err: %v", err)
 	}
+
+	// Version 0 resolves the latest ACTIVE version, so a slug whose only
+	// version is inactive has nothing serving — that is ErrNotFound rather than
+	// "not active", since no particular version was refused.
 	_, err := e.RunTurnBySlug(ctx, sess, "", "f-inactive", 0, TurnRequest{})
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("inactive flow via version 0 should be not-found, got err: %v", err)
+	}
+
+	// Pinning the inactive version explicitly still reports it as inactive:
+	// here a specific version WAS named and refused.
+	_, err = e.RunTurnBySlug(ctx, sess, "", "f-inactive", 1, TurnRequest{})
 	if err == nil || !strings.Contains(err.Error(), "not active") {
-		t.Errorf("inactive flow should be refused, got err: %v", err)
+		t.Errorf("pinned inactive flow should be refused as inactive, got err: %v", err)
 	}
 }

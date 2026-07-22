@@ -316,6 +316,14 @@ loom.New(loom.Config{ /* ... */
 })
 ```
 
+For a per-step breakdown — "which agent in this turn was expensive", a step timeline showing
+tokens and cost per generation — use `e.Cost().ByStep(ctx, sess.ID)`, which returns one
+`StepUsage` per recorded step (oldest first) carrying `StepID`, `AgentID`, tokens, images,
+duration, `USDCost` and `Estimated`. It is a separate call rather than a field on `Step`
+because `Sessions().Get` already loads unbounded history; folding a cost join into it would
+charge every session read for data most callers do not want. Resolve `AgentID` to a name with
+`e.Agents().GetByID(ctx, id)`.
+
 Budgets enforce spend caps per platform key:
 
 ```go
@@ -430,6 +438,38 @@ untrusted tenant-supplied IDs without checking the returned record's `Owner` you
 `e.Generators()` lists the generator slugs registered in this process (sorted), so a UI can
 validate `Agent.GeneratorSlug` before saving instead of failing at generation time.
 
+All four registries have a `List` for building pickers. `ResponseFormats().List(ctx, owner,
+category)` returns records **without** their schema bodies (`Schema` is nil) — call `Get`/
+`GetByID` for the body. Use it so an agent's response format is a chosen slug rather than
+free text, where a typo silently means "no schema attached" and the agent returns
+unstructured output that downstream parsers reject at run time.
+
+## Publishing flows: drafts, activation, rollback
+
+`FlowRecord.IsActive` marks which version serves traffic:
+
+- `Flows().Latest(ctx, owner, slug)` — highest version, drafts included (**authoring** view).
+- `Flows().LatestActive(ctx, owner, slug)` — highest ACTIVE version (**serving** view).
+- `Flows().Get(ctx, owner, slug, 0)` and `RunTurnBySlug(..., version: 0)` resolve
+  **latest active**. So saving v5 with `IsActive: false` leaves v4 serving — a half-finished
+  draft sits beside the live version instead of taking the slug down.
+- `Flows().SetActive(ctx, owner, slug, version)` activates one version and deactivates its
+  siblings in one transaction. This makes publish AND rollback a pointer move; without it,
+  going back to an older version means writing a newer copy of it.
+
+```go
+e.Flows().Create(ctx, &loom.FlowRecord{Owner: o, Slug: "story", Version: 5, IsActive: false, /*...*/})
+// v4 still serves; review v5 by pinning it explicitly:
+draft, _ := e.Flows().Get(ctx, o, "story", 5)
+// publish (or roll back to any version) with a pointer move:
+e.Flows().SetActive(ctx, o, "story", 5)
+```
+
+`LatestActive` returns `*loom.NotFoundError` when no version is active. Pinning an explicitly
+inactive version still fails with "not active" — that is a caller mistake, not a draft. If
+several versions are active (the default, since `Create` does not deactivate siblings) the
+highest wins, which is the historical behaviour.
+
 ## Schema & migrations (IMPORTANT gotcha)
 
 `schema.NewLoader(dialect).Apply(ctx, db)` creates tables on a fresh DB and runs ordered
@@ -470,6 +510,11 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
   limit, offset)` if you need history. Avoid `Get` on sessions with many steps.
 - "Show real costs" → set `Config.Pricing`/`Config.DefaultPrice`, and gate any USD you display
   on `UsageSummary.PricingConfigured`.
+- "Per-agent cost attribution / step timeline" → `Cost().ByStep(ctx, sessionID)`, then
+  `Agents().GetByID` for names.
+- "Draft a flow without breaking production" → save it with `IsActive: false`; version 0 keeps
+  serving the last active version. Publish with `Flows().SetActive`.
+- "Schema picker in an authoring UI" → `ResponseFormats().List(ctx, owner, category)`.
 
 ## Things NOT to do
 
@@ -988,6 +1033,20 @@ type CostManager interface {
 	ByAgent(ctx context.Context, q UsageQuery) ([]AgentUsage, error)
 	// AgentStats returns p50/p95 cost stats for a single agent.
 	AgentStats(ctx context.Context, agentID uuid.UUID, window time.Duration) (*AgentCostStats, error)
+	// ByStep returns per-step usage for one session, oldest first — the
+	// breakdown behind SessionUsage's totals.
+	//
+	// Every other cost method is an aggregate, so "which agent in this turn was
+	// expensive" was previously unanswerable; this is what lets a step timeline
+	// show tokens and cost per generation. It is a separate call rather than a
+	// field on Step because Session.Get already loads unbounded history — see
+	// SessionRegistry.GetHeader — and joining costs into that read would charge
+	// every session load for data most callers do not want.
+	//
+	// Charges with no originating step (session- or platform-level records) are
+	// omitted, so these rows sum to SessionUsage only when every charge came
+	// from a step.
+	ByStep(ctx context.Context, sessionID uuid.UUID) ([]StepUsage, error)
 	// Estimate returns a pre-flight cost estimate for a step request.
 	Estimate(ctx context.Context, req EstimateRequest) (*CostEstimate, error)
 	// Record persists a cost record.
@@ -1235,7 +1294,28 @@ func (r *FlowRecord) Flow() Flow
 type FlowRegistry interface {
 	Create(ctx context.Context, r *FlowRecord) error
 	Get(ctx context.Context, owner, slug string, version int) (*FlowRecord, error)
+	// Latest resolves the highest version of slug within owner REGARDLESS of
+	// IsActive — the authoring view, so an editor can see a draft it just
+	// saved. Use LatestActive for the serving view.
 	Latest(ctx context.Context, owner, slug string) (*FlowRecord, error)
+	// LatestActive resolves the highest version of slug within owner that has
+	// IsActive set — the serving view, and what version 0 resolves to on Get
+	// and RunTurnBySlug.
+	//
+	// This is what makes a draft safe: saving v5 with IsActive false leaves v4
+	// serving traffic instead of taking the slug down. Returns *NotFoundError
+	// if no active version exists. If several versions are active (the default
+	// before SetActive is used — Create does not deactivate siblings), the
+	// highest wins, which is the historical behaviour.
+	LatestActive(ctx context.Context, owner, slug string) (*FlowRecord, error)
+	// SetActive makes one version the active one and deactivates every other
+	// version of the same owner+slug, in a single transaction.
+	//
+	// This turns publish and rollback into a pointer move rather than "write a
+	// newer version", which is the only thing that makes rolling BACK to an
+	// older version possible at all. Returns *NotFoundError if the version does
+	// not exist, leaving the current pointer untouched.
+	SetActive(ctx context.Context, owner, slug string, version int) error
 	// List returns flows for an owner (optional category filter) WITHOUT their
 	// agent entries — a lightweight index for an editor.
 	List(ctx context.Context, owner, category string) ([]*FlowRecord, error)
@@ -1611,6 +1691,7 @@ type ResponseFormatRecord struct {
 	Slug       string // human-readable identifier, e.g. "logician-schema"
 	Owner      string // opaque app-owned scope ("" = global)
 	Version    int    // monotonically increasing; editing creates a new version
+	Category   string // optional grouping label, for parity with agents/prompts/flows
 	Schema     map[string]any
 	StrictMode bool
 	CreatedAt  time.Time
@@ -1636,6 +1717,16 @@ type ResponseFormatRegistry interface {
 	// tenant-supplied ID to it without checking the returned record's Owner
 	// against the caller's scope itself.
 	GetByID(ctx context.Context, id uuid.UUID) (*ResponseFormatRecord, error)
+	// List returns response formats for owner (optional category filter),
+	// WITHOUT their schema bodies — a lightweight index for an editor, matching
+	// the shape AgentRegistry, PromptRegistry and FlowRegistry already use.
+	//
+	// Schema is left nil on every returned record; call Get or GetByID for the
+	// body. This is what lets an authoring UI offer a picker for an agent's
+	// response format instead of leaving it a free-text slug, where a typo
+	// silently means "no schema attached" and the agent returns unstructured
+	// text that every downstream parser then rejects at run time.
+	List(ctx context.Context, owner, category string) ([]*ResponseFormatRecord, error)
 	// Delete removes a specific response-format version (>= 1) within owner. On
 	// Postgres it fails if the version is still referenced by an agent (ON DELETE
 	// RESTRICT).
@@ -1967,6 +2058,28 @@ type StepRunner interface {
 	RunStep(ctx context.Context, session *Session, req StepRequest) (*Step, error)
 }
     StepRunner executes a step request against a session.
+
+type StepUsage struct {
+	StepID       uuid.UUID
+	AgentID      uuid.UUID // uuid.Nil if the charge was not attributed to an agent
+	Provider     string
+	Model        string
+	Modal        Modality
+	InputTokens  int
+	OutputTokens int
+	Images       int
+	DurationSec  float64
+	USDCost      float64
+	Estimated    bool
+	Timestamp    time.Time
+}
+    StepUsage is one step's recorded generation usage — the per-step row behind
+    the aggregates. Token counts, image counts and duration are exact.
+
+    USDCost is only real money when Estimated is false; when true it was derived
+    from a built-in placeholder rate because no pricing was configured (see
+    UsageSummary.PricingConfigured). Render it as unknown rather than as a
+    dollar amount in that case.
 
 type StoredRequest struct {
 	SystemPrompt   string          `json:"system_prompt"`

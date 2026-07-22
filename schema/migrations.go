@@ -204,6 +204,17 @@ func migrations() []Migration {
 				return nil
 			},
 		},
+		{
+			// response_formats gained a category column, for parity with
+			// agents, prompts and flows — it is what lets an authoring UI group
+			// schemas in a picker. Nullable-with-default so existing rows are
+			// unaffected and behave exactly as before ("" = ungrouped).
+			Version: 7,
+			Name:    "response-format-category",
+			Up: func(ctx context.Context, tx *sql.Tx, p string, d Dialect) error {
+				return addColumnIfMissing(ctx, tx, d, p+"response_formats", "category", "TEXT NOT NULL DEFAULT ''")
+			},
+		},
 	}
 }
 
