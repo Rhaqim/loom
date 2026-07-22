@@ -618,7 +618,7 @@ var DefaultBranchGCConfig = engine.DefaultBranchGCConfig
 // connection, not a caller choice.
 var NewBranchGCWorker = engine.NewBranchGCWorker
 
-// SweepReport is returned by GC.DryRun.
+// SweepReport is what a GC sweep did (or, for DryRun, would have done).
 type SweepReport = engine.SweepReport
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -93,8 +93,16 @@ func mergeVars(dst *State, vars map[string]any) {
 
 // BranchNode represents a node in the session branch tree.
 type BranchNode struct {
-	Session  *Session
-	Children []*BranchNode
+	Session *Session
+	// StepCount is how many steps this session has recorded.
+	//
+	// It is counted by the tree query itself, because Session.History is NOT
+	// loaded on a tree node — BranchTree deliberately reads session rows only,
+	// so len(node.Session.History) is always 0 here and is not a step count. A
+	// rewind or timeline UI needs the number per node, and fetching it with a
+	// Steps() call per node would be N queries over a tree loom already walked.
+	StepCount int
+	Children  []*BranchNode
 }
 
 // SessionRegistry manages session persistence and branching.
@@ -115,6 +123,17 @@ type SessionRegistry interface {
 	// GetHeader retrieves a session by ID WITHOUT its step history: History is
 	// left nil. Cost is independent of session length. Same not-found and
 	// soft-delete semantics as Get.
+	//
+	// A header-loaded session is safe to run steps against — step indices come
+	// from the database, not from len(History) — so this is the cheap resume
+	// path for a long-lived session.
+	//
+	// It does change what the MODEL sees: generation context is built from
+	// Session.History, so a step run on a header-loaded session is sent no
+	// prior turns. That is correct when the caller supplies context itself
+	// (via StepRequest.Inputs, State.Snapshot/Vars, or a retrieval hook), and
+	// wrong if it expects loom to carry the conversation. Use Get, or page
+	// history in with Steps, when the transcript is the context.
 	GetHeader(ctx context.Context, id uuid.UUID) (*Session, error)
 	// GetIncludingDeleted retrieves a session by ID even if it has been
 	// soft-deleted, with history loaded. Check Session.DeletedAt to tell which.
@@ -153,8 +172,23 @@ type SessionRegistry interface {
 	// Step indices on the branch restart at 0; they are only unique per session,
 	// so join on (session_id, step_index) and never on step_index alone.
 	Fork(ctx context.Context, parentID uuid.UUID, stepIndex int) (*Session, error)
-	// BranchTree returns the full descendant tree rooted at sessionID.
+	// BranchTree returns the full descendant tree rooted at sessionID, in a
+	// single query. Nodes carry session headers plus StepCount; History is not
+	// loaded. Soft-deleted sessions and their subtrees are excluded.
 	BranchTree(ctx context.Context, rootID uuid.UUID) (*BranchNode, error)
+	// Ancestry returns the fork chain from the root down to id inclusive,
+	// oldest first, as headers (History is not loaded). The last element is id
+	// itself; a session with no parent returns just itself.
+	//
+	// Where BranchTree walks DOWN from a root and returns everything, Ancestry
+	// walks UP from a leaf and returns one line — which is what a caller that
+	// forks per turn needs, since a playthrough is a path through the tree and
+	// the tree also holds every abandoned branch. It is one query rather than
+	// one GetHeader per ancestor.
+	//
+	// A soft-deleted session anywhere in the chain truncates the result there:
+	// the walk stops rather than reporting a lineage it cannot substantiate.
+	Ancestry(ctx context.Context, id uuid.UUID) ([]*Session, error)
 	// Pin marks a session as exempt from garbage collection. A pinned session is
 	// skipped by all four GC tiers. It does NOT protect against the explicit
 	// operator actions Discard and Purge — Purge refuses a pinned session (see

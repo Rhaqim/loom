@@ -102,13 +102,21 @@ func TestReproC2_NonTransactionalOrphan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pre-occupy (session_id, step_index=0) so the FINAL steps INSERT fails UNIQUE
-	// after the results row has already autocommitted.
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO loom_steps (id, session_id, step_index, agent_id, result_id, created_at) VALUES (?,?,?,?,?,?)`,
-		uuid.New().String(), sess.ID.String(), 0, uuid.New().String(), uuid.New().String(), time.Now()); err != nil {
-		t.Fatalf("pre-insert step: %v", err)
+	// Force the FINAL steps INSERT to fail, after the results row in the same
+	// transaction has already been written.
+	//
+	// This used to pre-occupy (session_id, step_index=0) to trip the UNIQUE
+	// constraint. That no longer collides: step indices are derived from the
+	// persisted MAX inside the transaction, so the engine now picks the next
+	// free index instead. A trigger fails the insert regardless of index, which
+	// keeps this test about what it is actually guarding — that a failure part
+	// way through the step write leaves no orphaned result row.
+	if _, err := db.ExecContext(ctx, `
+		CREATE TRIGGER reject_steps BEFORE INSERT ON loom_steps
+		BEGIN SELECT RAISE(ABORT, 'c2: forced step insert failure'); END`); err != nil {
+		t.Fatalf("create reject trigger: %v", err)
 	}
+	t.Cleanup(func() { db.ExecContext(context.Background(), `DROP TRIGGER IF EXISTS reject_steps`) })
 
 	countResults := func() int {
 		var n int

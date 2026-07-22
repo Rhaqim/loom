@@ -393,9 +393,26 @@ See `github.com/rhaqim/loom/judge` and the README for `ScoreRequest`/`PairwiseRe
   at-or-before `stepIndex`). Anything that must survive a fork therefore has to live in `State`
   (`Vars`/`Snapshot`), not in step history. Branch step indices restart at 0, so they are unique
   only per session — join on `(session_id, step_index)`, never `step_index` alone.
-- Inspect: `tree, _ := e.Sessions().BranchTree(ctx, rootID)`.
+- Inspect the whole tree: `tree, _ := e.Sessions().BranchTree(ctx, rootID)` — one query, whatever
+  its depth. Nodes are headers plus `BranchNode.StepCount`; `Session.History` is NOT loaded on a
+  tree node, so `len(node.Session.History)` is always 0 and is not a step count.
+- Read ONE line: `line, _ := e.Sessions().Ancestry(ctx, id)` — root→id inclusive, oldest first,
+  headers only, one query. Use this when you fork per turn: a playthrough is a *path* through
+  the tree, while `BranchTree` also returns every abandoned branch. Walking `ParentSessionID`
+  upward by hand is N round trips that grow with every turn.
 - Stale/speculative/test branches are cleaned by the GC worker (`e.GC()`, configured via
   `Config.BranchGC`; DryRun by default — nothing is deleted until you opt in).
+
+### Where application state belongs
+
+`State.Snapshot []byte` is the intended home for your own typed application state — not an
+escape hatch. It is opaque to the engine, persisted in the per-step checkpoint alongside `Vars`,
+restored by `StateAt`, and carried across a `Fork`. Serialize a struct into it and you keep your
+own types.
+
+`State.Vars map[string]any` is for values the engine and templates read
+(`{{.Vars.x}}`). Because it round-trips as JSON, numbers come back as `float64` — if you are
+writing int-coercion helpers to work around that, the data wants to be in `Snapshot` instead.
 
 ### Reading sessions (matters for long sessions)
 
@@ -404,7 +421,11 @@ See `github.com/rhaqim/loom/judge` and the README for `ScoreRequest`/`PairwiseRe
 resuming you usually only need `Version` and `State`:
 
 - `e.Sessions().GetHeader(ctx, id)` — no history (`History` is left nil, so you can tell
-  "not loaded" from "no steps"). Cost is independent of session length.
+  "not loaded" from "no steps"). Cost is independent of session length. It is safe to run
+  steps against a header-loaded session: step indices come from the database, not from
+  `len(History)`. **But the model sees no prior turns** — generation context is built from
+  `Session.History` — so supply context yourself via `StepRequest.Inputs`, `State.Snapshot`
+  /`Vars`, or a retrieval hook. Use `Get` when the transcript IS the context.
 - `e.Sessions().Steps(ctx, id, limit, offset)` — page through history (`limit <= 0` = no limit).
 - `e.Sessions().StateAt(ctx, id, stepIndex)` — the checkpointed state at-or-before a step; how
   you recover from `ErrSessionNotPersisted`.
@@ -419,6 +440,34 @@ resuming you usually only need `Version` and `State`:
   `ForcePurge` to delete it anyway. `Discard` is not blocked by a pin.
 - Writes to a missing or already-discarded session return `*loom.NotFoundError` rather than
   silently affecting zero rows.
+
+### Retention: what GC will and will not collect
+
+Relevant when sessions are business data (a fork-per-turn playthrough) rather than scratch
+branches.
+
+For a session-per-story model the numbers are small: one pinned session per story (plus one
+per rewind branch). For a session-per-turn model they are not, so:
+
+**Pin the HEAD of a chain, not every session in it.** Every GC tier skips a session that still
+has a live child, so an unpinned ancestor is protected simply by being referenced. Pinning the
+head therefore protects the entire ancestry transitively, and pinning all N is redundant work
+that also makes each one individually un-`Purge`-able. Only a leaf can be collected, and the
+pinned head is never a collectable leaf.
+
+**Archive = Pin + Discard.** There is no separate cold tier, because the primitives already
+compose into one: every tier requires `pinned = false`, so a pinned session is never hard
+deleted, and `Discard` hides it from `Get`, `List` and `BranchTree`. The result is readable via
+`GetIncludingDeleted` (with history) and invisible to live queries — "finished, keep it
+readable, stop treating it as live". Unpin to make it collectable again.
+
+**Sweep on demand** with `e.GC().Sweep(ctx)` — `Run` blocks on a timer and `DryRun` never acts,
+so `Sweep` is what an external scheduler or an admin endpoint calls. It honours
+`Config.BranchGC.DryRun`, and `SweepReport.DryRun` tells you which mode produced the counts.
+
+Storage still grows with play — loom does not delete data you pinned. Sizing follows from
+turns × (one session row + its steps, actions, results and one checkpoint per step); if that
+is too much, export finished playthroughs with `Ancestry` + `Steps` and `ForcePurge` the chain.
 
 ## Registries: versioning, lookup, and the `owner` scope
 
@@ -541,6 +590,11 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
 - "Draft a flow without breaking production" → save it with `IsActive: false`; version 0 keeps
   serving the last active version. Publish with `Flows().SetActive`.
 - "Schema picker in an authoring UI" → `ResponseFormats().List(ctx, owner, category)`.
+- "Render one playthrough that forks per turn" → `Sessions().Ancestry(ctx, headID)`, not
+  `BranchTree` (which also returns every abandoned branch).
+- "Rewind UI showing turns and their sizes" → `BranchTree` + `BranchNode.StepCount`.
+- "Sessions are my system of record" → put typed state in `State.Snapshot`, pin only the chain
+  HEAD, read lines with `Ancestry`, and archive finished chains with Pin + `Discard`.
 
 ## Things NOT to do
 
@@ -555,6 +609,12 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
 - Do not treat a non-nil `RunStep` error as "nothing happened" — `loom.ErrSessionNotPersisted`
   means the step DID commit and `step` is valid; only the session row is stale.
 - Do not rely on step history surviving a `Fork` — it does not. Carry continuity in `State`.
+- Do not set `Step.Index` yourself or expect it to track `len(Session.History)` — the engine
+  assigns it from the persisted maximum inside the step transaction.
+- Do not read `len(node.Session.History)` off a `BranchTree` node as a step count — history is
+  not loaded there. Use `BranchNode.StepCount`.
+- Do not pin every session in a fork chain; pin the head. Ancestors are already protected by
+  having a live child, and a pinned session cannot be `Purge`d without `ForcePurge`.
 - Do not display `TotalUSD`/`USDP95` as money when `PricingConfigured` is false — those numbers
   are placeholders, not spend.
 - Do not omit `StepRequest.Owner` in a multi-tenant app and assume registry scoping covers you —

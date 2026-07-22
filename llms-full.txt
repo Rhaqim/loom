@@ -393,9 +393,26 @@ See `github.com/rhaqim/loom/judge` and the README for `ScoreRequest`/`PairwiseRe
   at-or-before `stepIndex`). Anything that must survive a fork therefore has to live in `State`
   (`Vars`/`Snapshot`), not in step history. Branch step indices restart at 0, so they are unique
   only per session — join on `(session_id, step_index)`, never `step_index` alone.
-- Inspect: `tree, _ := e.Sessions().BranchTree(ctx, rootID)`.
+- Inspect the whole tree: `tree, _ := e.Sessions().BranchTree(ctx, rootID)` — one query, whatever
+  its depth. Nodes are headers plus `BranchNode.StepCount`; `Session.History` is NOT loaded on a
+  tree node, so `len(node.Session.History)` is always 0 and is not a step count.
+- Read ONE line: `line, _ := e.Sessions().Ancestry(ctx, id)` — root→id inclusive, oldest first,
+  headers only, one query. Use this when you fork per turn: a playthrough is a *path* through
+  the tree, while `BranchTree` also returns every abandoned branch. Walking `ParentSessionID`
+  upward by hand is N round trips that grow with every turn.
 - Stale/speculative/test branches are cleaned by the GC worker (`e.GC()`, configured via
   `Config.BranchGC`; DryRun by default — nothing is deleted until you opt in).
+
+### Where application state belongs
+
+`State.Snapshot []byte` is the intended home for your own typed application state — not an
+escape hatch. It is opaque to the engine, persisted in the per-step checkpoint alongside `Vars`,
+restored by `StateAt`, and carried across a `Fork`. Serialize a struct into it and you keep your
+own types.
+
+`State.Vars map[string]any` is for values the engine and templates read
+(`{{.Vars.x}}`). Because it round-trips as JSON, numbers come back as `float64` — if you are
+writing int-coercion helpers to work around that, the data wants to be in `Snapshot` instead.
 
 ### Reading sessions (matters for long sessions)
 
@@ -404,7 +421,11 @@ See `github.com/rhaqim/loom/judge` and the README for `ScoreRequest`/`PairwiseRe
 resuming you usually only need `Version` and `State`:
 
 - `e.Sessions().GetHeader(ctx, id)` — no history (`History` is left nil, so you can tell
-  "not loaded" from "no steps"). Cost is independent of session length.
+  "not loaded" from "no steps"). Cost is independent of session length. It is safe to run
+  steps against a header-loaded session: step indices come from the database, not from
+  `len(History)`. **But the model sees no prior turns** — generation context is built from
+  `Session.History` — so supply context yourself via `StepRequest.Inputs`, `State.Snapshot`
+  /`Vars`, or a retrieval hook. Use `Get` when the transcript IS the context.
 - `e.Sessions().Steps(ctx, id, limit, offset)` — page through history (`limit <= 0` = no limit).
 - `e.Sessions().StateAt(ctx, id, stepIndex)` — the checkpointed state at-or-before a step; how
   you recover from `ErrSessionNotPersisted`.
@@ -419,6 +440,34 @@ resuming you usually only need `Version` and `State`:
   `ForcePurge` to delete it anyway. `Discard` is not blocked by a pin.
 - Writes to a missing or already-discarded session return `*loom.NotFoundError` rather than
   silently affecting zero rows.
+
+### Retention: what GC will and will not collect
+
+Relevant when sessions are business data (a fork-per-turn playthrough) rather than scratch
+branches.
+
+For a session-per-story model the numbers are small: one pinned session per story (plus one
+per rewind branch). For a session-per-turn model they are not, so:
+
+**Pin the HEAD of a chain, not every session in it.** Every GC tier skips a session that still
+has a live child, so an unpinned ancestor is protected simply by being referenced. Pinning the
+head therefore protects the entire ancestry transitively, and pinning all N is redundant work
+that also makes each one individually un-`Purge`-able. Only a leaf can be collected, and the
+pinned head is never a collectable leaf.
+
+**Archive = Pin + Discard.** There is no separate cold tier, because the primitives already
+compose into one: every tier requires `pinned = false`, so a pinned session is never hard
+deleted, and `Discard` hides it from `Get`, `List` and `BranchTree`. The result is readable via
+`GetIncludingDeleted` (with history) and invisible to live queries — "finished, keep it
+readable, stop treating it as live". Unpin to make it collectable again.
+
+**Sweep on demand** with `e.GC().Sweep(ctx)` — `Run` blocks on a timer and `DryRun` never acts,
+so `Sweep` is what an external scheduler or an admin endpoint calls. It honours
+`Config.BranchGC.DryRun`, and `SweepReport.DryRun` tells you which mode produced the counts.
+
+Storage still grows with play — loom does not delete data you pinned. Sizing follows from
+turns × (one session row + its steps, actions, results and one checkpoint per step); if that
+is too much, export finished playthroughs with `Ancestry` + `Steps` and `ForcePurge` the chain.
 
 ## Registries: versioning, lookup, and the `owner` scope
 
@@ -541,6 +590,11 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
 - "Draft a flow without breaking production" → save it with `IsActive: false`; version 0 keeps
   serving the last active version. Publish with `Flows().SetActive`.
 - "Schema picker in an authoring UI" → `ResponseFormats().List(ctx, owner, category)`.
+- "Render one playthrough that forks per turn" → `Sessions().Ancestry(ctx, headID)`, not
+  `BranchTree` (which also returns every abandoned branch).
+- "Rewind UI showing turns and their sizes" → `BranchTree` + `BranchNode.StepCount`.
+- "Sessions are my system of record" → put typed state in `State.Snapshot`, pin only the chain
+  HEAD, read lines with `Ancestry`, and archive finished chains with Pin + `Discard`.
 
 ## Things NOT to do
 
@@ -555,6 +609,12 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
 - Do not treat a non-nil `RunStep` error as "nothing happened" — `loom.ErrSessionNotPersisted`
   means the step DID commit and `step` is valid; only the session row is stale.
 - Do not rely on step history surviving a `Fork` — it does not. Carry continuity in `State`.
+- Do not set `Step.Index` yourself or expect it to track `len(Session.History)` — the engine
+  assigns it from the persisted maximum inside the step transaction.
+- Do not read `len(node.Session.History)` off a `BranchTree` node as a step count — history is
+  not loaded there. Use `BranchNode.StepCount`.
+- Do not pin every session in a fork chain; pin the head. Ancestors are already protected by
+  having a live child, and a pinned session cannot be `Purge`d without `ForcePurge`.
 - Do not display `TotalUSD`/`USDP95` as money when `PricingConfigured` is false — those numbers
   are placeholders, not spend.
 - Do not omit `StepRequest.Owner` in a multi-tenant app and assume registry scoping covers you —
@@ -862,8 +922,16 @@ func DefaultBranchGCConfig() BranchGCConfig
     DefaultBranchGCConfig returns sensible production GC defaults.
 
 type BranchNode struct {
-	Session  *Session
-	Children []*BranchNode
+	Session *Session
+	// StepCount is how many steps this session has recorded.
+	//
+	// It is counted by the tree query itself, because Session.History is NOT
+	// loaded on a tree node — BranchTree deliberately reads session rows only,
+	// so len(node.Session.History) is always 0 here and is not a step count. A
+	// rewind or timeline UI needs the number per node, and fetching it with a
+	// Steps() call per node would be N queries over a tree loom already walked.
+	StepCount int
+	Children  []*BranchNode
 }
     BranchNode represents a node in the session branch tree.
 
@@ -1385,6 +1453,14 @@ type GCService interface {
 	Run(ctx context.Context)
 	// DryRun returns what the next sweep would delete without acting.
 	DryRun(ctx context.Context) (*SweepReport, error)
+	// Sweep runs all four GC tiers ONCE and reports what it did, honouring
+	// Config.BranchGC.DryRun.
+	//
+	// Run blocks forever on a timer and DryRun never acts, so without this
+	// there is no way to collect on demand — which is what an external
+	// scheduler (cron, a k8s Job, an admin endpoint) needs, and what a test
+	// needs to assert retention behaviour.
+	Sweep(ctx context.Context) (*SweepReport, error)
 }
     GCService is the public interface returned by Engine.GC().
 
@@ -1907,6 +1983,17 @@ type SessionRegistry interface {
 	// GetHeader retrieves a session by ID WITHOUT its step history: History is
 	// left nil. Cost is independent of session length. Same not-found and
 	// soft-delete semantics as Get.
+	//
+	// A header-loaded session is safe to run steps against — step indices come
+	// from the database, not from len(History) — so this is the cheap resume
+	// path for a long-lived session.
+	//
+	// It does change what the MODEL sees: generation context is built from
+	// Session.History, so a step run on a header-loaded session is sent no
+	// prior turns. That is correct when the caller supplies context itself
+	// (via StepRequest.Inputs, State.Snapshot/Vars, or a retrieval hook), and
+	// wrong if it expects loom to carry the conversation. Use Get, or page
+	// history in with Steps, when the transcript is the context.
 	GetHeader(ctx context.Context, id uuid.UUID) (*Session, error)
 	// GetIncludingDeleted retrieves a session by ID even if it has been
 	// soft-deleted, with history loaded. Check Session.DeletedAt to tell which.
@@ -1945,8 +2032,23 @@ type SessionRegistry interface {
 	// Step indices on the branch restart at 0; they are only unique per session,
 	// so join on (session_id, step_index) and never on step_index alone.
 	Fork(ctx context.Context, parentID uuid.UUID, stepIndex int) (*Session, error)
-	// BranchTree returns the full descendant tree rooted at sessionID.
+	// BranchTree returns the full descendant tree rooted at sessionID, in a
+	// single query. Nodes carry session headers plus StepCount; History is not
+	// loaded. Soft-deleted sessions and their subtrees are excluded.
 	BranchTree(ctx context.Context, rootID uuid.UUID) (*BranchNode, error)
+	// Ancestry returns the fork chain from the root down to id inclusive,
+	// oldest first, as headers (History is not loaded). The last element is id
+	// itself; a session with no parent returns just itself.
+	//
+	// Where BranchTree walks DOWN from a root and returns everything, Ancestry
+	// walks UP from a leaf and returns one line — which is what a caller that
+	// forks per turn needs, since a playthrough is a path through the tree and
+	// the tree also holds every abandoned branch. It is one query rather than
+	// one GetHeader per ancestor.
+	//
+	// A soft-deleted session anywhere in the chain truncates the result there:
+	// the walk stops rather than reporting a lineage it cannot substantiate.
+	Ancestry(ctx context.Context, id uuid.UUID) ([]*Session, error)
 	// Pin marks a session as exempt from garbage collection. A pinned session is
 	// skipped by all four GC tiers. It does NOT protect against the explicit
 	// operator actions Discard and Purge — Purge refuses a pinned session (see
@@ -1986,8 +2088,14 @@ type State struct {
     State is the live state of a session between steps.
 
 type Step struct {
-	ID          uuid.UUID
-	SessionID   uuid.UUID
+	ID        uuid.UUID
+	SessionID uuid.UUID
+	// Index is the step's position within its session, assigned by the engine
+	// from the persisted maximum inside the step's own transaction. It is
+	// contiguous from 0 and unique per session — never across sessions, since a
+	// forked branch restarts at 0. Join on (SessionID, Index), never Index alone.
+	//
+	// It is an output: setting it on a StepRequest has no effect.
 	Index       int
 	AgentID     uuid.UUID
 	Request     StoredRequest
@@ -2177,12 +2285,15 @@ func (r *StructuredResult) Status() ResultStatus
 func (r *StructuredResult) TaskHandle() *TaskHandle
 
 type SweepReport struct {
+	// DryRun reports whether these counts describe planned or actual deletions.
+	// Without it a caller cannot tell a real sweep's report from a dry one.
+	DryRun              bool
 	SpeculativeDeleted  int
 	StaleSoftDeleted    int
 	GraceHardDeleted    int
 	TestBranchesDeleted int
 }
-    SweepReport is returned by GC.DryRun.
+    SweepReport is what a GC sweep did (or, for DryRun, would have done).
 
 type TaskHandle struct {
 	ID       uuid.UUID

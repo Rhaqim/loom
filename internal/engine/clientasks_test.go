@@ -408,3 +408,419 @@ func TestAsk8_CloseAfterContextCancel(t *testing.T) {
 		t.Fatalf("Close after the poller context was cancelled: %v", err)
 	}
 }
+
+// --- §9 / §10 / §11: lineage and retention ---
+
+// buildChain returns root..head, each session forked from the previous and
+// carrying `steps` steps, mirroring a one-session-per-turn playthrough.
+func buildChain(t *testing.T, e *Engine, turns, steps int) []*Session {
+	t.Helper()
+	ctx := context.Background()
+	root := &Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	for range steps {
+		if _, err := e.RunStep(ctx, root, StepRequest{AgentSlug: "a"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chain := []*Session{root}
+	cur := root
+	for range turns {
+		b, err := e.Sessions().Fork(ctx, cur.ID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range steps {
+			if _, err := e.RunStep(ctx, b, StepRequest{AgentSlug: "a"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		chain = append(chain, b)
+		cur = b
+	}
+	return chain
+}
+
+func TestAsk9_BranchTreeCarriesStepCount(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "ask9", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "a", "g")
+
+	chain := buildChain(t, e, 2, 3) // root + 2 forks, 3 steps each
+	// A second branch off the root, so the tree is not a straight line.
+	sib, err := e.Sessions().Fork(ctx, chain[0].ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RunStep(ctx, sib, StepRequest{AgentSlug: "a"}); err != nil {
+		t.Fatal(err)
+	}
+
+	tree, err := e.Sessions().BranchTree(ctx, chain[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tree.StepCount != 3 {
+		t.Fatalf("root StepCount = %d, want 3", tree.StepCount)
+	}
+	// History is deliberately not loaded, so len(History) is NOT a step count —
+	// that asymmetry is exactly why StepCount exists.
+	if len(tree.Session.History) != 0 {
+		t.Fatalf("BranchTree loaded History (%d steps); it must stay header-only",
+			len(tree.Session.History))
+	}
+	if len(tree.Children) != 2 {
+		t.Fatalf("root children = %d, want 2", len(tree.Children))
+	}
+
+	// Walk the whole tree; every node must carry its own count.
+	var walk func(*BranchNode) int
+	walk = func(n *BranchNode) int {
+		total := n.StepCount
+		for _, c := range n.Children {
+			total += walk(c)
+		}
+		return total
+	}
+	// 3 (root) + 3 + 3 (chain) + 1 (sibling) = 10
+	if got := walk(tree); got != 10 {
+		t.Fatalf("total StepCount across tree = %d, want 10", got)
+	}
+}
+
+func TestAsk10_Ancestry(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "ask10", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "a", "g")
+
+	chain := buildChain(t, e, 4, 1)
+	head := chain[len(chain)-1]
+
+	// An abandoned rewind branch must not appear in the head's lineage, even
+	// though BranchTree would return it.
+	if _, err := e.Sessions().Fork(ctx, chain[1].ID, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	line, err := e.Sessions().Ancestry(ctx, head.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(line) != len(chain) {
+		t.Fatalf("Ancestry returned %d sessions, want %d", len(line), len(chain))
+	}
+	for i, s := range line {
+		if s.ID != chain[i].ID {
+			t.Fatalf("Ancestry[%d] = %s, want %s (order must be root-first)", i, s.ID, chain[i].ID)
+		}
+		if s.History != nil {
+			t.Fatalf("Ancestry[%d] loaded History; it must be header-only", i)
+		}
+	}
+
+	// A root resolves to just itself.
+	rootLine, err := e.Sessions().Ancestry(ctx, chain[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rootLine) != 1 || rootLine[0].ID != chain[0].ID {
+		t.Fatalf("Ancestry(root) = %d sessions, want exactly the root", len(rootLine))
+	}
+
+	if _, err := e.Sessions().Ancestry(ctx, uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Ancestry of a missing session = %v, want ErrNotFound", err)
+	}
+}
+
+// §11: an unpinned ancestor is protected purely by having a live descendant, so
+// a chain only needs its HEAD pinned. This is load-bearing guidance — if the
+// child-exists guard is ever dropped from a GC tier, callers who pinned only
+// the head would silently lose history, so it is pinned by a test.
+func TestAsk11_HeadPinProtectsWholeChain(t *testing.T) {
+	ctx := context.Background()
+	e, db := reproEngine(t, "ask11", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "a", "g")
+
+	chain := buildChain(t, e, 3, 1)
+	head := chain[len(chain)-1]
+	if err := e.Sessions().Pin(ctx, head.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Age every session far past every tier's retention.
+	old := time.Now().Add(-365 * 24 * time.Hour)
+	for _, s := range chain {
+		if _, err := db.ExecContext(ctx,
+			`UPDATE loom_sessions SET created_at=$1, updated_at=$2 WHERE id=$3`, old, old, s.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sweep repeatedly: an unravelling chain would lose one link per pass.
+	for range 5 {
+		if _, err := e.GC().Sweep(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i, s := range chain {
+		if _, err := e.Sessions().GetHeader(ctx, s.ID); err != nil {
+			t.Fatalf("chain[%d] (%s) was collected despite a live descendant: %v", i, s.ID, err)
+		}
+	}
+	// And the lineage still reads end to end.
+	line, err := e.Sessions().Ancestry(ctx, head.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(line) != len(chain) {
+		t.Fatalf("Ancestry after GC = %d sessions, want %d", len(line), len(chain))
+	}
+}
+
+// §11: Pin + Discard is the archive tier — readable, invisible to List, and
+// never hard-deleted, since every GC tier requires pinned = false.
+func TestAsk11_PinnedDiscardedIsArchived(t *testing.T) {
+	ctx := context.Background()
+	e, db := reproEngine(t, "ask11b", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "a", "g")
+
+	sess := &Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Sessions().Pin(ctx, sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Sessions().Discard(ctx, sess.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	old := time.Now().Add(-365 * 24 * time.Hour)
+	if _, err := db.ExecContext(ctx,
+		`UPDATE loom_sessions SET created_at=$1, updated_at=$2, deleted_at=$3 WHERE id=$4`,
+		old, old, old, sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if _, err := e.GC().Sweep(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Still readable with its history...
+	got, err := e.Sessions().GetIncludingDeleted(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("archived session was hard-deleted: %v", err)
+	}
+	if len(got.History) != 1 {
+		t.Fatalf("archived history = %d steps, want 1", len(got.History))
+	}
+	// ...but no longer live.
+	if _, err := e.Sessions().Get(ctx, sess.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("archived session is still live: %v", err)
+	}
+	list, err := e.Sessions().List(ctx, "p", 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range list {
+		if s.ID == sess.ID {
+			t.Fatal("archived session still appears in List")
+		}
+	}
+}
+
+// --- §12: step index must come from persisted state, not in-memory history ---
+
+// GetHeader exists so a caller can resume without loading the transcript. When
+// the index was len(session.History) that was impossible: a header-loaded
+// session has History == nil, so every step restarted at 0 and collided with
+// the rows already there.
+func TestAsk12_HeaderLoadedSessionContinuesStepIndex(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "ask12", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "a", "g")
+
+	sess := &Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+
+	// Five turns, each resuming the cheap way — no transcript ever loaded.
+	for turn := range 5 {
+		h, err := e.Sessions().GetHeader(ctx, sess.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.History != nil {
+			t.Fatal("GetHeader loaded History; the premise of this test is gone")
+		}
+		step, err := e.RunStep(ctx, h, StepRequest{AgentSlug: "a"})
+		if err != nil {
+			t.Fatalf("turn %d on a header-loaded session: %v", turn, err)
+		}
+		if step.Index != turn {
+			t.Fatalf("turn %d step index = %d, want %d", turn, step.Index, turn)
+		}
+	}
+
+	steps, err := e.Sessions().Steps(ctx, sess.ID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 5 {
+		t.Fatalf("persisted steps = %d, want 5", len(steps))
+	}
+	for i, s := range steps {
+		if s.Index != i {
+			t.Fatalf("steps[%d].Index = %d, want %d — indices are not contiguous", i, s.Index, i)
+		}
+	}
+
+	// Every step must keep its own checkpoint: a collision would have meant
+	// rewind landing on the wrong state.
+	for i := range 5 {
+		st, found, err := e.Sessions().StateAt(ctx, sess.ID, i)
+		if err != nil || !found {
+			t.Fatalf("no checkpoint at index %d: found=%v err=%v", i, found, err)
+		}
+		_ = st
+	}
+}
+
+// Two callers holding SEPARATE copies of the same session used to compute the
+// same index from their own histories. The index now comes from the database,
+// so the second one continues rather than colliding.
+func TestAsk12_SeparateSessionCopiesDoNotCollide(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "ask12b", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "a", "g")
+
+	sess := &Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two independent loads, each with its own History slice.
+	a, err := e.Sessions().Get(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := e.Sessions().Get(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sa, err := e.RunStep(ctx, a, StepRequest{AgentSlug: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Copy b is now a stale writer, so its SESSION-row write loses the version
+	// CAS and returns ErrSessionNotPersisted. That is the documented
+	// optimistic-concurrency contract and is separate from indexing: the step
+	// itself is still committed, and what matters here is that its index
+	// continued from the database instead of colliding with copy a's.
+	sb, err := e.RunStep(ctx, b, StepRequest{AgentSlug: "a"})
+	if err != nil && !errors.Is(err, ErrSessionNotPersisted) {
+		t.Fatalf("unexpected error from the second copy: %v", err)
+	}
+	if sb == nil {
+		t.Fatal("second copy produced no step")
+	}
+	if sa.Index == sb.Index {
+		t.Fatalf("both copies produced index %d; the index is still derived from in-memory history", sa.Index)
+	}
+	if sa.Index != 1 || sb.Index != 2 {
+		t.Fatalf("indices = %d,%d; want 1,2", sa.Index, sb.Index)
+	}
+	// Both steps are durable and contiguous.
+	steps, err := e.Sessions().Steps(ctx, sess.ID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 3 {
+		t.Fatalf("persisted steps = %d, want 3", len(steps))
+	}
+}
+
+// A forked branch restarts at 0 — its indices are per-session, and the DB-derived
+// index must respect that rather than continuing the parent's numbering.
+func TestAsk12_ForkedBranchRestartsAtZero(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "ask12c", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "a", "g")
+
+	sess := &Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if _, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	branch, err := e.Sessions().Fork(ctx, sess.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := e.RunStep(ctx, branch, StepRequest{AgentSlug: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if step.Index != 0 {
+		t.Fatalf("first step on a fresh branch = index %d, want 0", step.Index)
+	}
+}
+
+// Turn steps must still be numbered consecutively when a flow runs lead +
+// followers against one session.
+func TestAsk12_TurnStepsAreConsecutive(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "ask12d", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "lead", "g")
+	mustAgent(t, e, "f1", "g")
+
+	sess := &Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	flow := Flow{
+		Slug:      "t",
+		Lead:      FlowAgent{AgentSlug: "lead", OutputKey: "Lead"},
+		Followers: []FlowAgent{{AgentSlug: "f1", OutputKey: "F1"}},
+	}
+	// Two turns, each resuming from a header — the session-per-story shape.
+	for turn := range 2 {
+		h, err := e.Sessions().GetHeader(ctx, sess.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr, err := e.RunTurn(ctx, h, TurnRequest{Flow: flow})
+		if err != nil {
+			t.Fatalf("turn %d: %v", turn, err)
+		}
+		if len(tr.Steps) != 2 {
+			t.Fatalf("turn %d produced %d steps, want 2", turn, len(tr.Steps))
+		}
+	}
+	steps, err := e.Sessions().Steps(ctx, sess.ID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 4 {
+		t.Fatalf("persisted steps = %d, want 4 (2 turns x 2 agents)", len(steps))
+	}
+	for i, s := range steps {
+		if s.Index != i {
+			t.Fatalf("steps[%d].Index = %d, want %d", i, s.Index, i)
+		}
+	}
+}

@@ -27,8 +27,14 @@ type StoredResult struct {
 // Step is one iteration of the engine loop: build request → call agent → result → actions.
 // Steps are append-only; they form the complete timeline of a session.
 type Step struct {
-	ID          uuid.UUID
-	SessionID   uuid.UUID
+	ID        uuid.UUID
+	SessionID uuid.UUID
+	// Index is the step's position within its session, assigned by the engine
+	// from the persisted maximum inside the step's own transaction. It is
+	// contiguous from 0 and unique per session — never across sessions, since a
+	// forked branch restarts at 0. Join on (SessionID, Index), never Index alone.
+	//
+	// It is an output: setting it on a StepRequest has no effect.
 	Index       int
 	AgentID     uuid.UUID
 	Request     StoredRequest

@@ -82,6 +82,9 @@ func updateSession(ctx context.Context, db *sql.DB, prefix string, s *Session) e
 func buildBranchTree(ctx context.Context, db *sql.DB, prefix string, rootID uuid.UUID) (*BranchNode, error) {
 	return sqlBuildBranchTree(ctx, db, prefix, rootID)
 }
+func queryAncestry(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) ([]*Session, error) {
+	return sqlQueryAncestry(ctx, db, prefix, id)
+}
 func setPinned(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID, pinned bool) error {
 	return sqlSetPinned(ctx, db, prefix, id, pinned)
 }

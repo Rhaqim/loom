@@ -400,6 +400,14 @@ type GCService interface {
 	Run(ctx context.Context)
 	// DryRun returns what the next sweep would delete without acting.
 	DryRun(ctx context.Context) (*SweepReport, error)
+	// Sweep runs all four GC tiers ONCE and reports what it did, honouring
+	// Config.BranchGC.DryRun.
+	//
+	// Run blocks forever on a timer and DryRun never acts, so without this
+	// there is no way to collect on demand — which is what an external
+	// scheduler (cron, a k8s Job, an admin endpoint) needs, and what a test
+	// needs to assert retention behaviour.
+	Sweep(ctx context.Context) (*SweepReport, error)
 }
 
 type gcService struct{ e *Engine }

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -124,40 +125,123 @@ func sqlListSessions(ctx context.Context, db *sql.DB, prefix, platformID string,
 	return sessions, rows.Err()
 }
 
-func sqlBuildBranchTree(ctx context.Context, db *sql.DB, prefix string, rootID uuid.UUID) (*BranchNode, error) {
-	root, err := sqlQuerySession(ctx, db, prefix, rootID)
-	if err != nil {
-		return nil, err
-	}
-	node := &BranchNode{Session: root}
-	if err := buildChildren(ctx, db, prefix, node); err != nil {
-		return nil, err
-	}
-	return node, nil
-}
+// maxLineageDepth bounds the recursive session walks. parent_session_id should
+// never form a cycle, but neither dialect detects one by default, so a single
+// corrupt row would spin a recursive CTE forever and hang the caller. A story
+// deeper than this is already pathological.
+const maxLineageDepth = 10000
 
-func buildChildren(ctx context.Context, db *sql.DB, prefix string, node *BranchNode) error {
+// sqlBuildBranchTree loads the whole descendant tree in ONE query and assembles
+// it in memory. The previous implementation issued a query per node, so
+// rendering a branch tree cost N round trips — and a rewind-heavy session, the
+// case that grows a tree in the first place, paid the most.
+//
+// Each row also carries its step count, because BranchTree reads session rows
+// only: a node's History is never populated, so len(History) is not a count.
+func sqlBuildBranchTree(ctx context.Context, db *sql.DB, prefix string, rootID uuid.UUID) (*BranchNode, error) {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT id, platform_id, parent_session_id, branch_point, version,
-		       state, metadata, tags, pinned, deleted_at, created_at, updated_at
-		FROM %ssessions WHERE parent_session_id=$1 AND deleted_at IS NULL
-		ORDER BY created_at`, prefix), node.Session.ID)
+		WITH RECURSIVE tree(id, depth) AS (
+			SELECT id, 0 FROM %[1]ssessions WHERE id=$1 AND deleted_at IS NULL
+			UNION ALL
+			SELECT s.id, tree.depth+1
+			FROM %[1]ssessions s
+			JOIN tree ON s.parent_session_id = tree.id
+			WHERE s.deleted_at IS NULL AND tree.depth < %[2]d
+		)
+		SELECT %[3]s,
+		       (SELECT COUNT(*) FROM %[1]ssteps st WHERE st.session_id = se.id)
+		FROM tree
+		JOIN %[1]ssessions se ON se.id = tree.id
+		ORDER BY tree.depth, se.created_at`, prefix, maxLineageDepth, prefixedSessionColumns("se")),
+		rootID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
+
+	nodes := map[uuid.UUID]*BranchNode{}
+	// Ordered by depth then created_at, so a node's parent is always seen
+	// before the node itself and children attach in creation order.
+	var order []*BranchNode
 	for rows.Next() {
-		child, err := scanSession(rows)
+		s, count, err := scanSessionWithCount(rows)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		childNode := &BranchNode{Session: child}
-		if err := buildChildren(ctx, db, prefix, childNode); err != nil {
-			return err
-		}
-		node.Children = append(node.Children, childNode)
+		n := &BranchNode{Session: s, StepCount: count}
+		nodes[s.ID] = n
+		order = append(order, n)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(order) == 0 {
+		return nil, &NotFoundError{Kind: "session", Key: rootID.String()}
+	}
+	for _, n := range order[1:] {
+		if n.Session.ParentSessionID == nil {
+			continue
+		}
+		if parent, ok := nodes[*n.Session.ParentSessionID]; ok {
+			parent.Children = append(parent.Children, n)
+		}
+	}
+	return order[0], nil
+}
+
+// sqlQueryAncestry returns the chain from the root down to id inclusive, oldest
+// first, as headers (no step history).
+//
+// A fork chain is a PATH through the branch tree, and BranchTree only walks
+// downward from a root — so reading one playthrough previously meant following
+// ParentSessionID upward one query at a time: N round trips on a read path that
+// grows with every turn. This walks it in one query on both dialects.
+func sqlQueryAncestry(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID) ([]*Session, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
+		WITH RECURSIVE anc(id, parent_session_id, depth) AS (
+			SELECT id, parent_session_id, 0 FROM %[1]ssessions WHERE id=$1 AND deleted_at IS NULL
+			UNION ALL
+			SELECT s.id, s.parent_session_id, anc.depth+1
+			FROM %[1]ssessions s
+			JOIN anc ON s.id = anc.parent_session_id
+			WHERE s.deleted_at IS NULL AND anc.depth < %[2]d
+		)
+		SELECT %[3]s
+		FROM anc
+		JOIN %[1]ssessions se ON se.id = anc.id
+		ORDER BY anc.depth DESC`, prefix, maxLineageDepth, prefixedSessionColumns("se")),
+		id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*Session
+	for rows.Next() {
+		s, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, &NotFoundError{Kind: "session", Key: id.String()}
+	}
+	return out, nil
+}
+
+// prefixedSessionColumns qualifies the shared session column list with a table
+// alias, so the same ordering can be reused inside a join without repeating the
+// list and risking it drifting out of step with scanSession.
+func prefixedSessionColumns(alias string) string {
+	cols := strings.Split(sessionColumns, ",")
+	for i, c := range cols {
+		cols[i] = alias + "." + strings.TrimSpace(c)
+	}
+	return strings.Join(cols, ", ")
 }
 
 // Placeholders below are numbered in ascending order of APPEARANCE, not by
@@ -217,6 +301,21 @@ type sessionRow interface {
 }
 
 func scanSession(row sessionRow) (*Session, error) {
+	return scanSessionExtra(row)
+}
+
+// scanSessionWithCount scans a session row followed by one trailing COUNT(*)
+// column, as the branch-tree query emits.
+func scanSessionWithCount(row sessionRow) (*Session, int, error) {
+	var count int
+	s, err := scanSessionExtra(row, &count)
+	return s, count, err
+}
+
+// scanSessionExtra scans the standard session columns plus any trailing
+// destinations the caller's query appended, so a joined-on aggregate does not
+// need a second copy of the session-scanning logic.
+func scanSessionExtra(row sessionRow, extra ...any) (*Session, error) {
 	var (
 		s                             Session
 		parentSessionID               sql.NullString
@@ -224,11 +323,13 @@ func scanSession(row sessionRow) (*Session, error) {
 		stateJSON, metaJSON, tagsJSON []byte
 		deletedAt                     sql.NullTime
 	)
-	err := row.Scan(
+	dest := []any{
 		&s.ID, &s.PlatformID, &parentSessionID, &branchPoint, &s.Version,
 		&stateJSON, &metaJSON, &tagsJSON, &s.Pinned, &deletedAt,
 		&s.CreatedAt, &s.UpdatedAt,
-	)
+	}
+	dest = append(dest, extra...)
+	err := row.Scan(dest...)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
