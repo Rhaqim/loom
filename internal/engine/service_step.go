@@ -292,8 +292,17 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	// taken from the result, so it is set after the merge.
 	mergeState(&session.State, stepSession.State)
 	session.State.Modality = result.Modality()
-	if err := insertStep(ctx, s.e.db, s.e.prefix, step, &session.State); err != nil {
-		return nil, fmt.Errorf("loom: persist step: %w", err)
+	// The cost row commits with the step, so a durable step always has durable
+	// cost. A contained cost failure comes back as *costRecordError with the
+	// step still committed — the generation was already billed by the provider,
+	// so losing the bookkeeping row beats discarding the step.
+	cost := s.e.costs.buildCostRecord(step, agent, result, session.PlatformID)
+	if err := insertStep(ctx, s.e.db, s.e.prefix, step, &session.State, &cost); err != nil {
+		var cre *costRecordError
+		if !errors.As(err, &cre) {
+			return nil, fmt.Errorf("loom: persist step: %w", err)
+		}
+		s.e.log.Error("record cost", "step_id", step.ID, "err", err)
 	}
 
 	// Update session history and the session row. The step, its result and its
@@ -317,14 +326,9 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		}
 		s.e.log.Error("update session after step", "session_id", session.ID, "err", err)
 
-		// Cost is still recorded: the step happened and the tokens were spent.
-		go s.e.costs.recordFromResult(context.Background(), step, agent, result, session.PlatformID)
-
+		// Cost needs no handling here: it committed with the step above.
 		return step, fmt.Errorf("%w (step %d): %w", ErrSessionNotPersisted, step.Index, err)
 	}
-
-	// Record cost asynchronously (best-effort).
-	go s.e.costs.recordFromResult(context.Background(), step, agent, result, session.PlatformID)
 
 	return step, nil
 }

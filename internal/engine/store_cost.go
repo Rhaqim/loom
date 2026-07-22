@@ -14,7 +14,7 @@ import (
 // Cost persistence
 // -----------------------------------------------------------------------
 
-func sqlInsertCostRecord(ctx context.Context, db *sql.DB, prefix string, rec CostRecord) error {
+func sqlInsertCostRecord(ctx context.Context, db execer, prefix string, rec CostRecord) error {
 	tagsJSON, _ := json.Marshal(rec.Tags)
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %scost_records
