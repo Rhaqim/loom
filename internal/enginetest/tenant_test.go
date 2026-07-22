@@ -211,3 +211,132 @@ func TestCostSavepointIsolation_Postgres(t *testing.T) {
 		t.Fatalf("ByStep = %d rows, want 1 (the second step only)", len(usage))
 	}
 }
+
+// TestLineage_Postgres exercises the recursive-CTE lineage walks on Postgres.
+// BranchTree and Ancestry are the only queries in loom using WITH RECURSIVE,
+// and CTE behaviour is where the two dialects most plausibly diverge — so the
+// SQLite unit tests are not sufficient evidence for a Postgres deployment.
+func TestLineage_Postgres(t *testing.T) {
+	ctx := context.Background()
+	e := newTestEngine(t)
+
+	slug := tenantSlug("lineage")
+	if err := e.Agents().Create(ctx, &loom.Agent{
+		Slug: slug, Version: 1, Modal: loom.ModalityText, GeneratorSlug: "echo",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A 5-turn playthrough: one session per turn, each forked from the last.
+	root := &loom.Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RunStep(ctx, root, loom.StepRequest{AgentSlug: slug}); err != nil {
+		t.Fatal(err)
+	}
+	chain := []*loom.Session{root}
+	cur := root
+	for range 4 {
+		b, err := e.Sessions().Fork(ctx, cur.ID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.RunStep(ctx, b, loom.StepRequest{AgentSlug: slug}); err != nil {
+			t.Fatal(err)
+		}
+		chain = append(chain, b)
+		cur = b
+	}
+	head := chain[len(chain)-1]
+
+	// An abandoned rewind branch: in the tree, absent from the head's line.
+	if _, err := e.Sessions().Fork(ctx, chain[2].ID, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	line, err := e.Sessions().Ancestry(ctx, head.ID)
+	if err != nil {
+		t.Fatalf("Ancestry on Postgres: %v", err)
+	}
+	if len(line) != len(chain) {
+		t.Fatalf("Ancestry = %d sessions, want %d", len(line), len(chain))
+	}
+	for i, s := range line {
+		if s.ID != chain[i].ID {
+			t.Fatalf("Ancestry[%d] = %s, want %s (root-first order)", i, s.ID, chain[i].ID)
+		}
+	}
+
+	tree, err := e.Sessions().BranchTree(ctx, root.ID)
+	if err != nil {
+		t.Fatalf("BranchTree on Postgres: %v", err)
+	}
+	if tree.StepCount != 1 {
+		t.Fatalf("root StepCount = %d, want 1", tree.StepCount)
+	}
+	var count func(*loom.BranchNode) int
+	count = func(n *loom.BranchNode) int {
+		total := 1
+		for _, c := range n.Children {
+			total += count(c)
+		}
+		return total
+	}
+	// 5 chain sessions + 1 abandoned branch.
+	if got := count(tree); got != 6 {
+		t.Fatalf("tree holds %d nodes, want 6", got)
+	}
+}
+
+// TestHeaderResumeStepIndex_Postgres covers the cheap resume path on Postgres:
+// step indices are derived from the persisted MAX inside the step transaction,
+// so a session loaded with GetHeader (History == nil) continues numbering
+// instead of restarting at 0 and colliding with UNIQUE(session_id, step_index).
+func TestHeaderResumeStepIndex_Postgres(t *testing.T) {
+	ctx := context.Background()
+	e := newTestEngine(t)
+
+	slug := tenantSlug("resume")
+	if err := e.Agents().Create(ctx, &loom.Agent{
+		Slug: slug, Version: 1, Modal: loom.ModalityText, GeneratorSlug: "echo",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sess := &loom.Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+
+	const turns = 6
+	for turn := range turns {
+		h, err := e.Sessions().GetHeader(ctx, sess.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.History != nil {
+			t.Fatal("GetHeader loaded History; the premise of this test is gone")
+		}
+		step, err := e.RunStep(ctx, h, loom.StepRequest{AgentSlug: slug})
+		if err != nil {
+			t.Fatalf("turn %d resuming from a header: %v", turn, err)
+		}
+		if step.Index != turn {
+			t.Fatalf("turn %d step index = %d, want %d", turn, step.Index, turn)
+		}
+	}
+
+	steps, err := e.Sessions().Steps(ctx, sess.ID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != turns {
+		t.Fatalf("persisted steps = %d, want %d", len(steps), turns)
+	}
+	// Each step keeps its own checkpoint, so a rewind lands where it should.
+	for i := range turns {
+		if _, found, err := e.Sessions().StateAt(ctx, sess.ID, i); err != nil || !found {
+			t.Fatalf("no checkpoint at index %d: found=%v err=%v", i, found, err)
+		}
+	}
+}

@@ -78,6 +78,24 @@ func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, c
 	}
 	defer tx.Rollback()
 
+	// Derive the step index from what is PERSISTED, not from the caller's
+	// in-memory history length.
+	//
+	// The index used to be len(session.History), which made it a property of
+	// whichever *Session the caller happened to hold. A session loaded with
+	// GetHeader has History == nil, so every step restarted at 0 and collided
+	// with the existing rows — GetHeader was unusable for resuming, defeating
+	// the reason it exists. Two callers holding separate copies of the same
+	// session had the same problem. Reading MAX inside the step's own
+	// transaction makes the database the single source of truth, and the
+	// UNIQUE (session_id, step_index) constraint remains the backstop if two
+	// writers still race.
+	if err := tx.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT COALESCE(MAX(step_index)+1, 0) FROM %ssteps WHERE session_id=$1`, prefix),
+		step.SessionID).Scan(&step.Index); err != nil {
+		return fmt.Errorf("derive step index: %w", err)
+	}
+
 	var actionID *string
 	if step.Action != nil {
 		s := step.Action.ID.String()

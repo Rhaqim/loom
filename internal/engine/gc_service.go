@@ -48,16 +48,38 @@ func (g *gcService) DryRun(ctx context.Context) (*SweepReport, error) {
 	if err != nil {
 		return nil, err
 	}
+	return toSweepReport(r), nil
+}
+
+func (g *gcService) Sweep(ctx context.Context) (*SweepReport, error) {
+	worker := loomgc.NewWorker(g.e.db, g.e.prefix, g.gcConfig())
+	r, err := worker.Sweep(ctx)
+	if err != nil {
+		// A tier failure still returns the counts from the tiers that ran, so a
+		// caller can see what was collected before the error.
+		return toSweepReport(r), err
+	}
+	return toSweepReport(r), nil
+}
+
+func toSweepReport(r *loomgc.SweepReport) *SweepReport {
+	if r == nil {
+		return nil
+	}
 	return &SweepReport{
+		DryRun:              r.DryRun,
 		SpeculativeDeleted:  r.SpeculativeDeleted,
 		StaleSoftDeleted:    r.StaleSoftDeleted,
 		GraceHardDeleted:    r.GraceHardDeleted,
 		TestBranchesDeleted: r.TestBranchesDeleted,
-	}, nil
+	}
 }
 
-// SweepReport is returned by GC.DryRun.
+// SweepReport is what a GC sweep did (or, for DryRun, would have done).
 type SweepReport struct {
+	// DryRun reports whether these counts describe planned or actual deletions.
+	// Without it a caller cannot tell a real sweep's report from a dry one.
+	DryRun              bool
 	SpeculativeDeleted  int
 	StaleSoftDeleted    int
 	GraceHardDeleted    int

@@ -103,6 +103,10 @@ func (s *sessionService) BranchTree(ctx context.Context, rootID uuid.UUID) (*Bra
 	return buildBranchTree(ctx, s.e.db, s.e.prefix, rootID)
 }
 
+func (s *sessionService) Ancestry(ctx context.Context, id uuid.UUID) ([]*Session, error) {
+	return queryAncestry(ctx, s.e.db, s.e.prefix, id)
+}
+
 func (s *sessionService) Pin(ctx context.Context, id uuid.UUID) error {
 	return setPinned(ctx, s.e.db, s.e.prefix, id, true)
 }

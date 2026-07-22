@@ -274,9 +274,12 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	defer s.e.mu.Unlock()
 
 	step := &Step{
-		ID:          uuid.New(),
-		SessionID:   session.ID,
-		Index:       len(session.History),
+		ID:        uuid.New(),
+		SessionID: session.ID,
+		// Index is assigned by insertStep from the persisted MAX inside the
+		// step's transaction — deliberately NOT len(session.History), which is
+		// nil on a GetHeader-loaded session and stale on any second copy of the
+		// same session.
 		AgentID:     agent.ID,
 		Request:     buildStoredRequest(genReq),
 		Result:      result,
