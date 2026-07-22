@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -14,10 +15,19 @@ func newAsyncPollerService(e *Engine, cfg PollerConfig) *asyncPollerService {
 	return &asyncPollerService{e: e, cfg: cfg}
 }
 
+// Run polls for resolved async tasks until ctx is cancelled. It does not
+// return until every worker it spawned has finished, so a caller that cancels
+// and waits (see Engine.Close) can be sure no poll is still writing to the
+// database — otherwise a straggler races teardown and fails against dropped
+// tables, or lands a write after the caller believed shutdown was complete.
 func (p *asyncPollerService) Run(ctx context.Context) {
 	ticker := time.NewTicker(p.cfg.Interval)
 	defer ticker.Stop()
 	sem := make(chan struct{}, p.cfg.Workers)
+
+	var workers sync.WaitGroup
+	defer workers.Wait()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -30,7 +40,9 @@ func (p *asyncPollerService) Run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			}
+			workers.Add(1)
 			go func() {
+				defer workers.Done()
 				defer func() { <-sem }()
 				p.pollPending(ctx)
 			}()

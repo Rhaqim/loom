@@ -228,18 +228,10 @@ func TestAsk5_CostByStep(t *testing.T) {
 		stepIDs = append(stepIDs, step.ID.String())
 	}
 
-	// Cost recording is fire-and-forget, so wait for it to settle.
-	var usage []StepUsage
-	for range 50 {
-		var err error
-		usage, err = e.Cost().ByStep(ctx, sess.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(usage) == 3 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	// Cost commits with the step, so this is readable immediately — no polling.
+	usage, err := e.Cost().ByStep(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(usage) != 3 {
 		t.Fatalf("ByStep = %d rows, want 3 (one per step)", len(usage))
@@ -278,5 +270,141 @@ func TestAsk5_CostByStep(t *testing.T) {
 	if tokens != total.TotalTokens {
 		t.Fatalf("ByStep tokens = %d, SessionUsage.TotalTokens = %d; they must agree",
 			tokens, total.TotalTokens)
+	}
+}
+
+// --- §8: cost durability and shutdown ---
+
+// The core of §8: cost must be durable the instant RunStep returns. It used to
+// be written from a detached goroutine, so a redeploy between the return and
+// the insert silently dropped it and every aggregate under-reported.
+func TestAsk8_CostIsDurableWhenRunStepReturns(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "ask8", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "a", "g")
+
+	sess := &Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	step, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read immediately — no sleep, no retry loop. If this needs waiting, the
+	// write is not part of the step transaction.
+	usage, err := e.Cost().ByStep(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 1 {
+		t.Fatalf("ByStep immediately after RunStep = %d rows, want 1 "+
+			"(cost is not committing with the step)", len(usage))
+	}
+	if usage[0].StepID != step.ID {
+		t.Fatalf("cost row StepID = %s, want %s", usage[0].StepID, step.ID)
+	}
+}
+
+// The savepoint contract: the provider has already been billed by the time the
+// cost row is written, so a cost failure must lose the bookkeeping row, never
+// the paid-for step.
+func TestAsk8_CostFailureDoesNotDiscardStep(t *testing.T) {
+	ctx := context.Background()
+	e, db := reproEngine(t, "ask8fail", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "a", "g")
+
+	sess := &Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	// Break only the cost write. Everything else in the step transaction is
+	// untouched, which is exactly the independent-failure case the SAVEPOINT
+	// exists for.
+	if _, err := db.ExecContext(ctx, `DROP TABLE loom_cost_records`); err != nil {
+		t.Fatal(err)
+	}
+
+	step, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a"})
+	if err != nil {
+		t.Fatalf("a cost-write failure discarded the step: %v", err)
+	}
+	if step == nil {
+		t.Fatal("step is nil after a contained cost failure")
+	}
+
+	// The step, its result and its checkpoint must all be durable.
+	got, err := e.Sessions().Get(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.History) != 1 {
+		t.Fatalf("history = %d steps, want 1 — the step was rolled back", len(got.History))
+	}
+	if _, found, err := e.Sessions().StateAt(ctx, sess.ID, step.Index); err != nil || !found {
+		t.Fatalf("checkpoint missing after contained cost failure: found=%v err=%v", found, err)
+	}
+}
+
+// Close must be usable on any engine, including one whose poller never ran,
+// and must be safe to call twice (a shutdown path may be reached by more than
+// one route).
+func TestAsk8_CloseIsSafeAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "ask8close", map[string]Generator{"g": okGen{}}, PollerConfig{})
+
+	if err := e.Close(ctx); err != nil {
+		t.Fatalf("Close on an engine with no poller: %v", err)
+	}
+	if err := e.Close(ctx); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// Close stops the poller and waits for it, so that once it returns nothing is
+// still touching the database — the condition that makes teardown safe.
+func TestAsk8_CloseDrainsPoller(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "ask8drain", map[string]Generator{"g": okGen{}},
+		PollerConfig{Workers: 2, Interval: time.Millisecond})
+
+	e.StartPoller(ctx)
+	// Let it tick a few times so there is real in-flight work to drain.
+	time.Sleep(20 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- e.Close(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return — the poller drain is not terminating")
+	}
+
+	// Starting again after Close must work rather than silently no-op, so a
+	// restart path is available.
+	e.StartPoller(ctx)
+	if err := e.Close(context.Background()); err != nil {
+		t.Fatalf("Close after restart: %v", err)
+	}
+}
+
+// A caller that cancels the poller's own context still gets a clean Close.
+func TestAsk8_CloseAfterContextCancel(t *testing.T) {
+	pollCtx, cancel := context.WithCancel(context.Background())
+	e, _ := reproEngine(t, "ask8cancel", map[string]Generator{"g": okGen{}},
+		PollerConfig{Workers: 1, Interval: time.Millisecond})
+
+	e.StartPoller(pollCtx)
+	time.Sleep(10 * time.Millisecond)
+	cancel() // stop via the caller's context, not Close
+
+	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	if err := e.Close(ctx); err != nil {
+		t.Fatalf("Close after the poller context was cancelled: %v", err)
 	}
 }

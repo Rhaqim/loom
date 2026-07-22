@@ -101,8 +101,8 @@ func querySteps(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.U
 func queryStepsPage(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID, limit, offset int) ([]Step, error) {
 	return sqlQueryStepsPage(ctx, db, prefix, sessionID, limit, offset)
 }
-func insertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, checkpoint *State) error {
-	return sqlInsertStep(ctx, db, prefix, step, checkpoint)
+func insertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, checkpoint *State, cost *CostRecord) error {
+	return sqlInsertStep(ctx, db, prefix, step, checkpoint, cost)
 }
 func querySnapshotAt(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID, stepIndex int) (State, bool, error) {
 	return sqlQuerySnapshotAt(ctx, db, prefix, sessionID, stepIndex)

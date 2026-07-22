@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -64,13 +65,13 @@ func sqlQuerySnapshotAt(ctx context.Context, db *sql.DB, prefix string, sessionI
 // checkpoint is non-nil, the post-step state snapshot — all in one transaction
 // so a step never commits without its checkpoint (which would let a later Fork
 // silently rewind to the wrong state).
-func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, checkpoint *State) error {
+func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, checkpoint *State, cost *CostRecord) error {
 	reqJSON, _ := json.Marshal(step.Request)
 	diagJSON, _ := json.Marshal(step.Diagnostics)
 
-	// All writes (action, result, step, snapshot) commit atomically so a failure
-	// on a later INSERT cannot orphan earlier rows or split a step from its
-	// checkpoint.
+	// All writes (action, result, step, snapshot, cost) commit atomically so a
+	// failure on a later INSERT cannot orphan earlier rows, split a step from
+	// its checkpoint, or leave a durable step with no recorded cost.
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -112,8 +113,66 @@ func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, c
 			return fmt.Errorf("persist snapshot: %w", err)
 		}
 	}
-	return tx.Commit()
+	// A contained cost failure must NOT abort the step, so it is carried past
+	// the commit rather than returned here — returning early would trip the
+	// deferred Rollback and discard the very step we are trying to preserve.
+	var costErr error
+	if cost != nil {
+		if err := insertCostSavepoint(ctx, tx, prefix, *cost); err != nil {
+			var cre *costRecordError
+			if !errors.As(err, &cre) {
+				return err // savepoint machinery failed; the tx is unusable
+			}
+			costErr = err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return costErr
 }
+
+// insertCostSavepoint writes the step's cost record inside the step's own
+// transaction, so a durable step always has durable cost — this used to be a
+// detached `go` with context.Background(), which meant a redeploy between the
+// step returning and the insert landing silently dropped that step's cost and
+// every aggregate built on it under-reported.
+//
+// The insert is wrapped in a SAVEPOINT because the generation has ALREADY been
+// billed by the provider by this point. Discarding a completed, paid-for step
+// because a bookkeeping row failed would be a strictly worse outcome than
+// losing the bookkeeping row, so an independent cost failure rolls back only
+// this insert and is logged by the caller; the step still commits.
+//
+// The ROLLBACK TO is not optional on Postgres: an error inside a transaction
+// poisons it (25P02) until the savepoint is unwound, so without this a failed
+// cost insert would take the whole step down anyway. Both dialects support the
+// SAVEPOINT / ROLLBACK TO / RELEASE trio.
+func insertCostSavepoint(ctx context.Context, tx *sql.Tx, prefix string, rec CostRecord) error {
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT loom_cost`); err != nil {
+		return fmt.Errorf("cost savepoint: %w", err)
+	}
+	if insErr := sqlInsertCostRecord(ctx, tx, prefix, rec); insErr != nil {
+		if _, err := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT loom_cost`); err != nil {
+			// The savepoint could not be unwound, so the transaction is now
+			// unusable — surfacing this is better than committing a step whose
+			// tx is in an undefined state.
+			return fmt.Errorf("cost rollback after %v: %w", insErr, err)
+		}
+		return &costRecordError{err: insErr}
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT loom_cost`); err != nil {
+		return fmt.Errorf("cost release savepoint: %w", err)
+	}
+	return nil
+}
+
+// costRecordError marks a cost-write failure that was contained by the
+// savepoint. The step is still committable; the caller logs and continues.
+type costRecordError struct{ err error }
+
+func (e *costRecordError) Error() string { return "loom: record cost: " + e.err.Error() }
+func (e *costRecordError) Unwrap() error { return e.err }
 
 func sqlInsertResult(ctx context.Context, db execer, prefix string, step *Step) error {
 	payload, _ := marshalResultForStorage(step.Result)

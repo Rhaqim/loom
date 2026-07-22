@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	loom "github.com/rhaqim/loom"
+	"github.com/rhaqim/loom/generator/echo"
 )
 
 // slug keeps each run independent — the Postgres database is shared and
@@ -134,5 +135,79 @@ func TestTenantIsolation_Prompts_Postgres(t *testing.T) {
 	}
 	if _, err := e.Prompts().Get(ctx, "tenant-c", slug, 1); !errors.Is(err, loom.ErrNotFound) {
 		t.Fatalf("Get as tenant-c: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestCostSavepointIsolation_Postgres is the dialect that matters for the
+// SAVEPOINT: on Postgres any error inside a transaction poisons it (25P02)
+// until the savepoint is unwound, so without the ROLLBACK TO a failed cost
+// insert would abort the whole step. SQLite does not behave that way, so the
+// unit test cannot prove this — only a real Postgres run can.
+func TestCostSavepointIsolation_Postgres(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	e, err := loom.New(loom.Config{
+		DB: db, Dialect: loom.DialectPostgres,
+		Generators: map[string]loom.Generator{"echo": echo.New("[test]")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	slug := tenantSlug("cost-sp")
+	if err := e.Agents().Create(ctx, &loom.Agent{
+		Slug: slug, Version: 1, Modal: loom.ModalityText, GeneratorSlug: "echo",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sess := &loom.Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force the cost insert to fail on its own, without disturbing any other
+	// write in the step transaction: a CHECK that no cost row can satisfy.
+	// Dropping the table would break every other test sharing this database.
+	if _, err := db.ExecContext(ctx,
+		`ALTER TABLE loom_cost_records ADD CONSTRAINT loom_cost_reject CHECK (false) NOT VALID`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		db.ExecContext(context.Background(),
+			`ALTER TABLE loom_cost_records DROP CONSTRAINT IF EXISTS loom_cost_reject`)
+	})
+
+	step, err := e.RunStep(ctx, sess, loom.StepRequest{AgentSlug: slug})
+	if err != nil {
+		t.Fatalf("a cost-write failure discarded the step on Postgres: %v", err)
+	}
+
+	// The step and its checkpoint must be durable despite the failed cost row.
+	got, err := e.Sessions().Get(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.History) != 1 {
+		t.Fatalf("history = %d steps, want 1 — the transaction was aborted", len(got.History))
+	}
+	if _, found, err := e.Sessions().StateAt(ctx, sess.ID, step.Index); err != nil || !found {
+		t.Fatalf("checkpoint missing: found=%v err=%v", found, err)
+	}
+
+	// With the constraint gone, cost recording works again and is durable
+	// immediately — proving the savepoint left the connection usable.
+	if _, err := db.ExecContext(ctx,
+		`ALTER TABLE loom_cost_records DROP CONSTRAINT loom_cost_reject`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RunStep(ctx, sess, loom.StepRequest{AgentSlug: slug}); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := e.Cost().ByStep(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 1 {
+		t.Fatalf("ByStep = %d rows, want 1 (the second step only)", len(usage))
 	}
 }

@@ -116,6 +116,12 @@ type Engine struct {
 
 	onTaskResolved func(context.Context, TaskResolution)
 
+	// pollerCancel stops the async poller; bg tracks every background goroutine
+	// the engine owns so Close can wait for them to drain. Both are guarded by
+	// mu.
+	pollerCancel context.CancelFunc
+	bg           sync.WaitGroup
+
 	mu sync.RWMutex
 }
 
@@ -293,9 +299,63 @@ func (e *Engine) Flows() FlowRegistry { return e.flows }
 
 // StartPoller starts the background async-result poller. It is a no-op if
 // AsyncPoller.Workers == 0 in the config.
+//
+// The poller stops when ctx is cancelled OR when Close is called, whichever
+// happens first. Prefer Close: it also WAITS for in-flight polls to finish,
+// whereas cancelling ctx alone returns immediately and leaves stragglers
+// writing to the database.
 func (e *Engine) StartPoller(ctx context.Context) {
-	if e.poller != nil {
-		go e.poller.Run(ctx)
+	if e.poller == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pollerCancel != nil {
+		return // already started; starting twice would orphan the first poller
+	}
+	pollCtx, cancel := context.WithCancel(ctx)
+	e.pollerCancel = cancel
+	e.bg.Add(1)
+	go func() {
+		defer e.bg.Done()
+		e.poller.Run(pollCtx)
+	}()
+}
+
+// Close shuts the engine's background work down and waits for it to finish.
+// It stops the async poller and blocks until every in-flight poll has
+// returned, so that once Close returns the engine is no longer touching the
+// database.
+//
+// Call it before dropping a schema, closing the *sql.DB, or exiting on
+// SIGTERM. Without it a poll in flight races teardown — it either fails
+// against tables that no longer exist, or lands a write after shutdown was
+// believed complete. (Step costs are not at risk: they commit inside the step
+// transaction, so a step is never durable without its cost row.)
+//
+// Close does NOT close the *sql.DB — the caller supplied it and may still be
+// using it. It is safe to call more than once and safe on an engine whose
+// poller was never started. If ctx expires before the drain completes, Close
+// returns ctx.Err() and the stragglers are left running.
+func (e *Engine) Close(ctx context.Context) error {
+	e.mu.Lock()
+	cancel := e.pollerCancel
+	e.pollerCancel = nil
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		e.bg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

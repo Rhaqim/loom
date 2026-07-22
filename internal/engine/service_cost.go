@@ -69,7 +69,10 @@ func (c *costService) Record(ctx context.Context, rec CostRecord) error {
 	return sqlInsertCostRecord(ctx, c.e.db, c.e.prefix, rec)
 }
 
-func (c *costService) recordFromResult(ctx context.Context, step *Step, agent *Agent, result Result, platformID string) {
+// buildCostRecord derives the cost row for a completed step. It is pure — no
+// I/O — so the caller can write it inside the step's own transaction rather
+// than from a detached goroutine that a shutdown could lose.
+func (c *costService) buildCostRecord(step *Step, agent *Agent, result Result, platformID string) CostRecord {
 	var (
 		inputTokens  int
 		outputTokens int
@@ -92,7 +95,7 @@ func (c *costService) recordFromResult(ctx context.Context, step *Step, agent *A
 	price, priceKnown := c.e.priceFor(model)
 	usdCost = price.Cost(inputTokens, outputTokens)
 
-	rec := CostRecord{
+	return CostRecord{
 		// Estimated marks a record whose USD figure came from the built-in flat
 		// rate rather than configured pricing. Tokens are exact either way.
 		Estimated:    !priceKnown,
@@ -107,9 +110,6 @@ func (c *costService) recordFromResult(ctx context.Context, step *Step, agent *A
 		SessionID:    step.SessionID,
 		PlatformID:   platformID,
 		Timestamp:    time.Now(),
-	}
-	if err := c.Record(ctx, rec); err != nil {
-		c.e.log.Error("record cost", "step_id", step.ID, "err", err)
 	}
 }
 

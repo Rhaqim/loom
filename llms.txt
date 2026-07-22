@@ -316,6 +316,12 @@ loom.New(loom.Config{ /* ... */
 })
 ```
 
+Cost is written **inside the step's own transaction**, so a durable step always has a durable
+cost row — `ByStep` and `SessionUsage` are readable the moment `RunStep` returns, with no
+polling or settling. If the cost insert fails on its own it is contained by a SAVEPOINT and
+logged: the step still commits, because the generation was already billed by the provider and
+losing a bookkeeping row beats discarding paid-for work.
+
 For a per-step breakdown — "which agent in this turn was expensive", a step timeline showing
 tokens and cost per generation — use `e.Cost().ByStep(ctx, sess.ID)`, which returns one
 `StepUsage` per recorded step (oldest first) carrying `StepID`, `AgentID`, tokens, images,
@@ -352,6 +358,26 @@ loom.New(loom.Config{ /* ... */ Cache: loom.NewInProcessCache(), CacheTTL: 24 * 
 ```
 `Cache` is an interface — back it with Redis/etc. `CacheTTL` 0 uses the 24h default. Nil Cache
 disables caching (every RunStep hits the DB).
+
+## Shutdown (`Engine.Close`)
+
+The engine owns background work — the async poller started by `StartPoller` — so shut it down
+before you drop a schema, close the `*sql.DB`, or exit:
+
+```go
+defer func() {
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    if err := e.Close(ctx); err != nil { log.Printf("loom: unclean shutdown: %v", err) }
+}()
+```
+
+`Close` stops the poller and **waits** for in-flight polls, so once it returns the engine is no
+longer touching the database. Cancelling the context you passed to `StartPoller` stops the
+poller too but returns immediately, leaving stragglers writing — which is what races test
+teardown and fails against dropped tables. `Close` is idempotent, safe on an engine that never
+started a poller, and does NOT close your `*sql.DB`. It returns `ctx.Err()` if the drain
+outruns the deadline. Step costs are not at risk either way: they commit with the step.
 
 ## Judges (LLM-as-judge scoring)
 
@@ -520,6 +546,8 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
 
 - Do not import `github.com/rhaqim/loom/internal/...` (won't compile from your module).
 - Do not skip `schema.Apply` — you'll get missing-table/column errors.
+- Do not drop a schema or close the `*sql.DB` without `Engine.Close(ctx)` first — an in-flight
+  poll will race the teardown.
 - Do not string-match error messages — use the typed errors above.
 - Do not mutate a returned Agent/Prompt and expect it to persist — create a new version instead.
 - Do not set `StepRequest.Overrides["base_url"]` expecting built-in openai/anthropic to honor it
