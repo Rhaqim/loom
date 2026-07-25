@@ -1123,3 +1123,152 @@ func TestFlowValidate_UndeclaredIsValid(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 }
+
+// --- Flows().Plan: resolved wiring for visualization ---
+
+// planNode / planEdge lookup helpers keep the assertions readable.
+func planNode(p *FlowPlan, slug string) *FlowPlanNode {
+	for i := range p.Nodes {
+		if p.Nodes[i].AgentSlug == slug {
+			return &p.Nodes[i]
+		}
+	}
+	return nil
+}
+func planEdge(p *FlowPlan, to, varName string) *FlowPlanEdge {
+	for i := range p.Edges {
+		if p.Edges[i].To == to && p.Edges[i].Var == varName {
+			return &p.Edges[i]
+		}
+	}
+	return nil
+}
+
+func TestFlowPlan_NodesEdgesLayers(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "plan_ok", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	// lead consumes external "topic"; f1 consumes the lead; f2 consumes f1.
+	agentWithVars(t, e, "lead", []string{"topic"})
+	agentWithVars(t, e, "f1", []string{"Lead"})
+	agentWithVars(t, e, "f2", []string{"F1"})
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Inputs: []string{"topic"},
+		Agents: []FlowAgentEntry{
+			{AgentSlug: "lead", OutputKey: "Lead"},
+			{AgentSlug: "f1", OutputKey: "F1"},
+			{AgentSlug: "f2", OutputKey: "F2"},
+		},
+	}
+	plan, err := e.Flows().Plan(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Layers: lead=0, f1=1 (consumes lead), f2=2 (consumes f1).
+	if plan.Layers != 2 {
+		t.Fatalf("Layers = %d, want 2", plan.Layers)
+	}
+	if n := planNode(plan, "lead"); n == nil || !n.IsLead || n.Layer != 0 || n.OutputKey != "Lead" {
+		t.Fatalf("lead node wrong: %+v", n)
+	}
+	if n := planNode(plan, "f1"); n == nil || n.Layer != 1 {
+		t.Fatalf("f1 layer = %v, want 1", n)
+	}
+	if n := planNode(plan, "f2"); n == nil || n.Layer != 2 {
+		t.Fatalf("f2 layer = %v, want 2", n)
+	}
+
+	// Edges: topic is an external input; Lead→f1 and F1→f2 are agent edges.
+	if ed := planEdge(plan, "lead", "topic"); ed == nil || ed.Source != FlowEdgeInput {
+		t.Fatalf("lead<-topic edge = %+v, want source input", ed)
+	}
+	if ed := planEdge(plan, "f1", "Lead"); ed == nil || ed.Source != FlowEdgeAgent || ed.From != "lead" {
+		t.Fatalf("f1<-Lead edge = %+v, want agent edge from lead", ed)
+	}
+	if ed := planEdge(plan, "f2", "F1"); ed == nil || ed.Source != FlowEdgeAgent || ed.From != "f1" {
+		t.Fatalf("f2<-F1 edge = %+v, want agent edge from f1", ed)
+	}
+	if len(plan.Cyclic) != 0 {
+		t.Fatalf("Cyclic = %v, want none", plan.Cyclic)
+	}
+	if len(plan.Inputs) != 1 || plan.Inputs[0] != "topic" {
+		t.Fatalf("Inputs = %v, want [topic]", plan.Inputs)
+	}
+}
+
+// Plan represents a broken flow rather than erroring: a dangling consumed
+// variable is an unresolved edge, and a cycle fills Cyclic.
+func TestFlowPlan_RepresentsProblems(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "plan_bad", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	// f1 consumes "ghost" (nobody produces it); f2<->f3 form a cycle.
+	agentWithVars(t, e, "lead", nil)
+	agentWithVars(t, e, "f1", []string{"ghost"})
+	agentWithVars(t, e, "f2", []string{"F3"})
+	agentWithVars(t, e, "f3", []string{"F2"})
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Agents: []FlowAgentEntry{
+			{AgentSlug: "lead", OutputKey: "Lead"},
+			{AgentSlug: "f1", OutputKey: "F1"},
+			{AgentSlug: "f2", OutputKey: "F2"},
+			{AgentSlug: "f3", OutputKey: "F3"},
+		},
+	}
+	// Plan does NOT error on a broken flow.
+	plan, err := e.Flows().Plan(ctx, rec)
+	if err != nil {
+		t.Fatalf("Plan should represent a broken flow, not error: %v", err)
+	}
+	if ed := planEdge(plan, "f1", "ghost"); ed == nil || ed.Source != FlowEdgeUnresolved {
+		t.Fatalf("f1<-ghost edge = %+v, want source unresolved", ed)
+	}
+	// f2 and f3 are cyclic.
+	if len(plan.Cyclic) != 2 {
+		t.Fatalf("Cyclic = %v, want f2 and f3", plan.Cyclic)
+	}
+
+	// And the plan's verdict matches Validate: this flow is invalid.
+	if err := e.Flows().Validate(ctx, rec); !errors.Is(err, ErrFlowInvalid) {
+		t.Fatalf("Validate = %v, want ErrFlowInvalid (must agree with Plan's unresolved/cyclic)", err)
+	}
+}
+
+// A plan is "valid" exactly when it has no unresolved edge and no cycle — Plan
+// and Validate must agree.
+func TestFlowPlan_AgreesWithValidate(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "plan_agree", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	agentWithVars(t, e, "lead", []string{"topic"})
+	agentWithVars(t, e, "f1", []string{"Lead"})
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Inputs: []string{"topic"},
+		Agents: []FlowAgentEntry{
+			{AgentSlug: "lead", OutputKey: "Lead"},
+			{AgentSlug: "f1", OutputKey: "F1"},
+		},
+	}
+	plan, err := e.Flows().Plan(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unresolved := 0
+	for _, ed := range plan.Edges {
+		if ed.Source == FlowEdgeUnresolved {
+			unresolved++
+		}
+	}
+	planValid := unresolved == 0 && len(plan.Cyclic) == 0
+	validateOK := e.Flows().Validate(ctx, rec) == nil
+	if planValid != validateOK {
+		t.Fatalf("Plan valid=%v but Validate ok=%v — they must agree", planValid, validateOK)
+	}
+	if !planValid {
+		t.Fatal("expected this flow to be valid")
+	}
+}

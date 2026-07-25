@@ -386,6 +386,35 @@ type FlowRecord = engine.FlowRecord
 // FlowAgentEntry is one agent's slot in a persisted flow.
 type FlowAgentEntry = engine.FlowAgentEntry
 
+// FlowPlan is a flow's resolved wiring, for inspection and visualization — the
+// same producer/consumer graph RunTurn executes and Flows().Validate checks,
+// exposed as data. Unlike Validate it does NOT reject a bad flow: it represents
+// the problems (unresolved inputs are edges of source "unresolved"; a cycle
+// fills Cyclic) so a UI can render exactly why a flow is broken. A flow is valid
+// iff no edge has source FlowEdgeUnresolved and Cyclic is empty.
+type FlowPlan = engine.FlowPlan
+
+// FlowPlanNode is one agent in a plan, with what it produces and consumes.
+type FlowPlanNode = engine.FlowPlanNode
+
+// FlowEdgeSource says where a consumed variable comes from.
+type FlowEdgeSource = engine.FlowEdgeSource
+
+// FlowEdgeAgent — produced by another agent (the edge's From).
+const FlowEdgeAgent = engine.FlowEdgeAgent
+
+// FlowEdgeInput — supplied by the caller (a flow input or the implicit
+// "action").
+const FlowEdgeInput = engine.FlowEdgeInput
+
+// FlowEdgeUnresolved — nothing produces it and it is not a declared input: a
+// broken wire (the lead consuming an agent output also lands here, since the
+// lead runs first).
+const FlowEdgeUnresolved = engine.FlowEdgeUnresolved
+
+// FlowPlanEdge is one consumed variable flowing into a node.
+type FlowPlanEdge = engine.FlowPlanEdge
+
 // FlowRegistry resolves and manages persisted flows (agent maps). owner is an
 // opaque scope ("" = global). On Get/Latest, version 0 resolves to the latest
 // version; Create and Delete require an explicit version >= 1. Edits create a

@@ -591,6 +591,14 @@ follower — as long as the follower graph is acyclic. `Validate` rejects a cycl
 (and the lead, which runs first, may consume only declared inputs). Design and rationale:
 `28-Variable-Producer-Consumer.md`.
 
+`Flows().Plan(ctx, *FlowRecord)` returns that wiring as data for a UI to visualize: `Nodes`
+(each with `Layer`, `OutputKey`, and the `Consumes` input names), `Edges` (`To`/`Var`/`Source`/
+`From` — what flows into what, `Source` being `agent`/`input`/`unresolved`), `Layers` (count),
+and `Cyclic` (followers in a cycle). Plan does NOT error on a bad flow — a dangling input is an
+`unresolved` edge and a cycle fills `Cyclic` — so it renders exactly why a flow is broken. A
+flow is valid iff it has no `unresolved` edge and no `Cyclic` entry, which always matches
+`Validate`.
+
 ## Schema & migrations (IMPORTANT gotcha)
 
 `schema.NewLoader(dialect).Apply(ctx, db)` creates tables on a fresh DB and runs ordered
@@ -1481,6 +1489,70 @@ type FlowAgentEntry struct {
 }
     FlowAgentEntry is one agent's slot in a persisted flow.
 
+type FlowEdgeSource string
+    FlowEdgeSource says where a consumed variable comes from.
+
+const (
+	// FlowEdgeAgent — produced by another agent (the edge's From).
+	FlowEdgeAgent FlowEdgeSource = "agent"
+	// FlowEdgeInput — supplied by the caller (a flow input or the implicit
+	// "action").
+	FlowEdgeInput FlowEdgeSource = "input"
+	// FlowEdgeUnresolved — nothing produces it and it is not a declared input: a
+	// broken wire (the lead consuming an agent output also lands here, since the
+	// lead runs first).
+	FlowEdgeUnresolved FlowEdgeSource = "unresolved"
+)
+type FlowPlan struct {
+	// Nodes in execution order: the lead (Layer 0) first, then followers by
+	// dependency layer.
+	Nodes []FlowPlanNode
+	// Edges describe every input variable a node consumes and where it resolves
+	// from — the arrows a diagram draws.
+	Edges []FlowPlanEdge
+	// Layers is the number of follower dependency layers (0 with no followers).
+	Layers int
+	// Inputs the flow declares it receives from the caller (FlowRecord.Inputs).
+	// The implicit "action" input is always available in addition to these.
+	Inputs []string
+	// Cyclic names followers that could not be placed in a layer because they
+	// form a dependency cycle; empty for a valid flow.
+	Cyclic []string
+}
+    FlowPlan is a flow's resolved wiring, for inspection and visualization — the
+    same producer/consumer graph RunTurn executes and Flows().Validate checks,
+    exposed as data. Unlike Validate it does NOT reject a bad flow: it
+    represents the problems (unresolved inputs are edges of source "unresolved";
+    a cycle fills Cyclic) so a UI can render exactly why a flow is broken. A
+    flow is valid iff no edge has source FlowEdgeUnresolved and Cyclic is empty.
+
+type FlowPlanEdge struct {
+	// To is the consuming agent's slug; Var is the variable that flows.
+	To  string
+	Var string
+	// Source classifies the origin; From is the producing agent's slug only when
+	// Source == FlowEdgeAgent.
+	Source FlowEdgeSource
+	From   string
+}
+    FlowPlanEdge is one consumed variable flowing into a node.
+
+type FlowPlanNode struct {
+	AgentSlug    string
+	AgentVersion int
+	IsLead       bool
+	// Layer is 0 for the lead and 1..Layers for a follower (its execution
+	// layer). A cyclic follower is placed after the last real layer.
+	Layer int
+	// OutputKey is the name this agent's output is exposed under ("" = it
+	// produces no consumable output).
+	OutputKey string
+	// Consumes is the input variable names this agent's user template declares
+	// (its Prompt.Variables).
+	Consumes []string
+}
+    FlowPlanNode is one agent in a plan, with what it produces and consumes.
+
 type FlowRecord struct {
 	ID       uuid.UUID
 	Owner    string // opaque app-owned scope; "" = global
@@ -1545,6 +1617,11 @@ type FlowRegistry interface {
 	// A flow whose agents declare no input variables passes trivially, so this
 	// is a no-op for flows that do not opt into wiring.
 	Validate(ctx context.Context, r *FlowRecord) error
+	// Plan returns the flow's resolved wiring — nodes, edges, execution layers,
+	// and any dependency cycle — for inspection and visualization. It is what
+	// Validate checks and RunTurn executes, exposed as data, and does not error
+	// on a bad flow (it represents the problems). See FlowPlan.
+	Plan(ctx context.Context, r *FlowRecord) (*FlowPlan, error)
 }
     FlowRegistry resolves and manages persisted flows (agent maps). owner is an
     opaque scope ("" = global). On Get/Latest, version 0 resolves to the latest

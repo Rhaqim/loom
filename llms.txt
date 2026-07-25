@@ -591,6 +591,14 @@ follower — as long as the follower graph is acyclic. `Validate` rejects a cycl
 (and the lead, which runs first, may consume only declared inputs). Design and rationale:
 `28-Variable-Producer-Consumer.md`.
 
+`Flows().Plan(ctx, *FlowRecord)` returns that wiring as data for a UI to visualize: `Nodes`
+(each with `Layer`, `OutputKey`, and the `Consumes` input names), `Edges` (`To`/`Var`/`Source`/
+`From` — what flows into what, `Source` being `agent`/`input`/`unresolved`), `Layers` (count),
+and `Cyclic` (followers in a cycle). Plan does NOT error on a bad flow — a dangling input is an
+`unresolved` edge and a cycle fills `Cyclic` — so it renders exactly why a flow is broken. A
+flow is valid iff it has no `unresolved` edge and no `Cyclic` entry, which always matches
+`Validate`.
+
 ## Schema & migrations (IMPORTANT gotcha)
 
 `schema.NewLoader(dialect).Apply(ctx, db)` creates tables on a fresh DB and runs ordered

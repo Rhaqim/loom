@@ -514,3 +514,60 @@ func TestLayeredExecution_Postgres(t *testing.T) {
 		t.Fatalf("f2 output = %q, want %q (did not receive f1's output)", got, "F1OUT")
 	}
 }
+
+// TestFlowPlan_Postgres confirms the resolved wiring plan (nodes, edges,
+// layers) computes end to end on Postgres — the structure a client renders.
+func TestFlowPlan_Postgres(t *testing.T) {
+	ctx := context.Background()
+	e := newTestEngine(t)
+
+	mk := func(slug string, vars []string) {
+		ut := &loom.Prompt{Slug: slug + "-ut", Version: 1, Kind: loom.PromptKindUserTemplate,
+			Body: "x", Variables: vars}
+		if err := e.Prompts().Create(ctx, ut); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Agents().Create(ctx, &loom.Agent{
+			Slug: slug, Version: 1, Modal: loom.ModalityText, GeneratorSlug: "echo",
+			UserTemplateID: ut.ID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	leadS, f1S, f2S := tenantSlug("lead"), tenantSlug("f1"), tenantSlug("f2")
+	mk(leadS, []string{"topic"})
+	mk(f1S, []string{"Lead"})
+	mk(f2S, []string{"F1"})
+
+	rec := &loom.FlowRecord{
+		Slug: tenantSlug("flow"), Version: 1, IsActive: true,
+		Inputs: []string{"topic"},
+		Agents: []loom.FlowAgentEntry{
+			{AgentSlug: leadS, OutputKey: "Lead"},
+			{AgentSlug: f1S, OutputKey: "F1"},
+			{AgentSlug: f2S, OutputKey: "F2"},
+		},
+	}
+	plan, err := e.Flows().Plan(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Layers != 2 {
+		t.Fatalf("Layers = %d, want 2", plan.Layers)
+	}
+	var f1Lead, f2F1 bool
+	for _, ed := range plan.Edges {
+		if ed.To == f1S && ed.Var == "Lead" && ed.Source == loom.FlowEdgeAgent && ed.From == leadS {
+			f1Lead = true
+		}
+		if ed.To == f2S && ed.Var == "F1" && ed.Source == loom.FlowEdgeAgent && ed.From == f1S {
+			f2F1 = true
+		}
+		if ed.Source == loom.FlowEdgeUnresolved {
+			t.Fatalf("unexpected unresolved edge: %+v", ed)
+		}
+	}
+	if !f1Lead || !f2F1 {
+		t.Fatalf("expected Lead→f1 and F1→f2 agent edges; got %+v", plan.Edges)
+	}
+}
