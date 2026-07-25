@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -22,12 +23,18 @@ import (
 
 // FlowRecord is a persisted, versioned agent map.
 type FlowRecord struct {
-	ID        uuid.UUID
-	Owner     string // opaque app-owned scope; "" = global
-	Slug      string
-	Version   int
-	Category  string
-	IsActive  bool
+	ID       uuid.UUID
+	Owner    string // opaque app-owned scope; "" = global
+	Slug     string
+	Version  int
+	Category string
+	IsActive bool
+	// Inputs names the variables this flow expects to be supplied at RunTurn
+	// time (via TurnRequest.Inputs), as opposed to being produced by an agent
+	// in the flow. Validate treats these as external producers: an agent
+	// consuming one of these needs no in-flow producer for it. Optional; a flow
+	// that declares nothing is unaffected.
+	Inputs    []string
 	Agents    []FlowAgentEntry // ordered; index 0 is the lead
 	CreatedAt time.Time
 }
@@ -107,6 +114,19 @@ type FlowRegistry interface {
 	// agent entries — a lightweight index for an editor.
 	List(ctx context.Context, owner, category string) ([]*FlowRecord, error)
 	Delete(ctx context.Context, owner, slug string, version int) error
+	// Validate checks a flow's variable wiring against the current registry
+	// state WITHOUT persisting anything, so an editor can call it before Create.
+	//
+	// It resolves each agent's declared input variables (its user template's
+	// Prompt.Variables) and confirms every one is satisfiable, then checks that
+	// producer names are unique. Returns nil when the wiring is sound, or an
+	// ErrFlowInvalid joining every problem found (dangling variable, duplicate
+	// producer, unknown referenced agent). Create runs the self-contained subset
+	// of these checks; Validate runs the full resolving check.
+	//
+	// A flow whose agents declare no input variables passes trivially, so this
+	// is a no-op for flows that do not opt into wiring.
+	Validate(ctx context.Context, r *FlowRecord) error
 }
 
 // flowService implements FlowRegistry.
@@ -129,6 +149,12 @@ func (s *flowService) Create(ctx context.Context, r *FlowRecord) error {
 	// order so callers don't have to set them.
 	for i := range r.Agents {
 		r.Agents[i].Position = i
+	}
+	// Self-contained wiring checks (no agent/prompt resolution, so Create does
+	// not depend on the referenced agents existing yet). The full consumed-vs-
+	// produced check that resolves prompts is Flows().Validate.
+	if errs := flowProducerConflicts(r); len(errs) > 0 {
+		return fmt.Errorf("%w: %w", ErrFlowInvalid, errors.Join(errs...))
 	}
 	if err := sqlInsertFlow(ctx, s.e.db, s.e.prefix, r); err != nil {
 		return err
@@ -195,6 +221,124 @@ func (s *flowService) Delete(ctx context.Context, owner, slug string, version in
 	return nil
 }
 
+// leadOutputKey returns a FlowAgentEntry's effective output key: the lead
+// defaults to "Lead" (matching RunTurn), so the two agree on the name the lead's
+// output is exposed under.
+func leadOutputKey(e FlowAgentEntry) string {
+	if e.OutputKey == "" {
+		return "Lead"
+	}
+	return e.OutputKey
+}
+
+// flowProducerConflicts returns the wiring problems detectable WITHOUT resolving
+// any agent or prompt: two agents producing the same output name, or an output
+// name shadowing a declared external input. Both are ambiguities — the shared
+// inputs map has one slot per name — so they are refused rather than silently
+// last-writer-wins.
+func flowProducerConflicts(r *FlowRecord) []error {
+	var errs []error
+	seen := map[string]int{} // output name -> count
+	for i, e := range r.Agents {
+		key := e.OutputKey
+		if i == 0 {
+			key = leadOutputKey(e)
+		}
+		if key == "" {
+			continue // a follower with no output key produces nothing consumable
+		}
+		seen[key]++
+		if seen[key] == 2 {
+			errs = append(errs, fmt.Errorf("output key %q is produced by more than one agent", key))
+		}
+	}
+	external := map[string]bool{}
+	for _, in := range r.Inputs {
+		external[in] = true
+	}
+	for name := range seen {
+		if external[name] {
+			errs = append(errs, fmt.Errorf("output key %q collides with a declared flow input", name))
+		}
+	}
+	return errs
+}
+
+func (s *flowService) Validate(ctx context.Context, r *FlowRecord) error {
+	if len(r.Agents) == 0 {
+		return fmt.Errorf("%w: needs at least one agent (the lead)", ErrFlowInvalid)
+	}
+	errs := flowProducerConflicts(r)
+
+	// External producers every agent can see: the flow's declared inputs plus
+	// "action", which RunTurn injects into every agent's inputs.
+	external := map[string]bool{"action": true}
+	for _, in := range r.Inputs {
+		external[in] = true
+	}
+	leadKey := leadOutputKey(r.Agents[0])
+
+	// The set of names produced only by a follower — used to give a precise
+	// message when a consumer depends on a sibling, which layered execution does
+	// not run yet (see 28-Variable-Producer-Consumer.md, phase 2).
+	followerProduces := map[string]bool{}
+	for _, e := range r.Agents[1:] {
+		if e.OutputKey != "" {
+			followerProduces[e.OutputKey] = true
+		}
+	}
+
+	for i, e := range r.Agents {
+		isLead := i == 0
+		consumed, err := s.agentConsumes(ctx, r.Owner, e)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, name := range consumed {
+			switch {
+			case external[name]:
+				// Supplied at RunTurn time.
+			case !isLead && name == leadKey:
+				// A follower may read the lead's output.
+			case followerProduces[name]:
+				// Produced, but only by a sibling follower. The lead cannot
+				// consume a follower at all; a follower consuming another
+				// follower needs layered execution, which is not enabled yet.
+				errs = append(errs, fmt.Errorf(
+					"agent %q consumes %q, produced only by a follower — cross-follower wiring is not executed yet (phase 2)",
+					e.AgentSlug, name))
+			default:
+				errs = append(errs, fmt.Errorf(
+					"agent %q consumes %q, which no agent produces and the flow does not declare as an input",
+					e.AgentSlug, name))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%w: %w", ErrFlowInvalid, errors.Join(errs...))
+	}
+	return nil
+}
+
+// agentConsumes resolves the input-variable names an agent's user template
+// declares (its user-template Prompt.Variables), under the flow's owner scope.
+// An agent with no user template consumes nothing declared.
+func (s *flowService) agentConsumes(ctx context.Context, owner string, e FlowAgentEntry) ([]string, error) {
+	agent, err := s.e.agents.Get(ctx, owner, e.AgentSlug, e.AgentVersion)
+	if err != nil {
+		return nil, fmt.Errorf("flow references agent %q@v%d: %w", e.AgentSlug, e.AgentVersion, err)
+	}
+	if agent.UserTemplateID == uuid.Nil {
+		return nil, nil
+	}
+	ut, err := s.e.prompts.GetByID(ctx, agent.UserTemplateID)
+	if err != nil {
+		return nil, fmt.Errorf("agent %q user template: %w", e.AgentSlug, err)
+	}
+	return ut.Variables, nil
+}
+
 // RunTurnBySlug loads a persisted flow (owner/slug/version; version 0 = latest)
 // and executes it as a turn, exactly like RunTurn on an in-code Flow. The
 // caller's TurnRequest fields (Action, OnChunk, Inputs, Overrides, Params) are
@@ -225,7 +369,7 @@ func (e *Engine) RunTurnBySlug(ctx context.Context, session *Session, owner, slu
 // SQL
 // -----------------------------------------------------------------------
 
-const flowColumns = `id, owner, slug, version, category, is_active, created_at`
+const flowColumns = `id, owner, slug, version, category, is_active, inputs, created_at`
 const flowAgentColumns = `position, agent_slug, agent_version, output_key, stream, generator_override, params, retry_mode, max_retries`
 
 func sqlInsertFlow(ctx context.Context, db *sql.DB, prefix string, r *FlowRecord) error {
@@ -235,10 +379,14 @@ func sqlInsertFlow(ctx context.Context, db *sql.DB, prefix string, r *FlowRecord
 	}
 	defer tx.Rollback()
 
+	inputsJSON, _ := json.Marshal(r.Inputs)
+	if len(inputsJSON) == 0 || string(inputsJSON) == "null" {
+		inputsJSON = []byte("[]")
+	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %sflows (id, owner, slug, version, category, is_active, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)`, prefix),
-		r.ID, r.Owner, r.Slug, r.Version, r.Category, flowBool(r.IsActive), r.CreatedAt,
+		INSERT INTO %sflows (id, owner, slug, version, category, is_active, inputs, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, prefix),
+		r.ID, r.Owner, r.Slug, r.Version, r.Category, flowBool(r.IsActive), inputsJSON, r.CreatedAt,
 	); err != nil {
 		return err
 	}
@@ -388,10 +536,11 @@ type flowRow interface {
 
 func scanFlow(row flowRow) (*FlowRecord, error) {
 	var (
-		r        FlowRecord
-		isActive int
+		r          FlowRecord
+		isActive   int
+		inputsJSON []byte
 	)
-	err := row.Scan(&r.ID, &r.Owner, &r.Slug, &r.Version, &r.Category, &isActive, &r.CreatedAt)
+	err := row.Scan(&r.ID, &r.Owner, &r.Slug, &r.Version, &r.Category, &isActive, &inputsJSON, &r.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -399,6 +548,9 @@ func scanFlow(row flowRow) (*FlowRecord, error) {
 		return nil, err
 	}
 	r.IsActive = isActive != 0
+	if len(inputsJSON) > 0 {
+		_ = json.Unmarshal(inputsJSON, &r.Inputs)
+	}
 	return &r, nil
 }
 

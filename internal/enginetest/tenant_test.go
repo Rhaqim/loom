@@ -396,3 +396,63 @@ func TestLatestCache_Postgres(t *testing.T) {
 		t.Fatalf("Latest(other) = %v, want ErrNotFound (cache not owner-scoped)", err)
 	}
 }
+
+// TestFlowValidate_Postgres confirms Flow.Inputs persists (migration 8 column)
+// and Flows().Validate resolves each agent's declared variables end to end on
+// Postgres — the wiring the phase-1 producer/consumer work adds.
+func TestFlowValidate_Postgres(t *testing.T) {
+	ctx := context.Background()
+	e := newTestEngine(t)
+
+	leadSlug := tenantSlug("lead")
+	folSlug := tenantSlug("fol")
+
+	// Follower consumes the lead's output; lead consumes an external input.
+	mkAgent := func(slug string, vars []string) {
+		ut := &loom.Prompt{Slug: slug + "-ut", Version: 1, Kind: loom.PromptKindUserTemplate,
+			Body: "x", Variables: vars}
+		if err := e.Prompts().Create(ctx, ut); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Agents().Create(ctx, &loom.Agent{
+			Slug: slug, Version: 1, Modal: loom.ModalityText, GeneratorSlug: "echo",
+			UserTemplateID: ut.ID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkAgent(leadSlug, []string{"topic"})
+	mkAgent(folSlug, []string{"Lead"})
+
+	rec := &loom.FlowRecord{
+		Slug: tenantSlug("flow"), Version: 1, IsActive: true,
+		Inputs: []string{"topic"},
+		Agents: []loom.FlowAgentEntry{
+			{AgentSlug: leadSlug, OutputKey: "Lead"},
+			{AgentSlug: folSlug, OutputKey: "Fol"},
+		},
+	}
+	if err := e.Flows().Validate(ctx, rec); err != nil {
+		t.Fatalf("valid wiring rejected on Postgres: %v", err)
+	}
+	if err := e.Flows().Create(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	// Inputs survive the round-trip through the migration-8 column.
+	got, err := e.Flows().Get(ctx, "", rec.Slug, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Inputs) != 1 || got.Inputs[0] != "topic" {
+		t.Fatalf("Inputs round-trip on Postgres = %v, want [topic]", got.Inputs)
+	}
+
+	// A dangling consumed variable is rejected.
+	bad := &loom.FlowRecord{
+		Slug: tenantSlug("bad"), Version: 1, IsActive: true,
+		Agents: []loom.FlowAgentEntry{{AgentSlug: leadSlug, OutputKey: "Lead"}},
+	}
+	if err := e.Flows().Validate(ctx, bad); !errors.Is(err, loom.ErrFlowInvalid) {
+		t.Fatalf("dangling variable on Postgres: err = %v, want ErrFlowInvalid", err)
+	}
+}

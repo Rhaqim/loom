@@ -569,6 +569,25 @@ inactive version still fails with "not active" — that is a caller mistake, not
 several versions are active (the default, since `Create` does not deactivate siblings) the
 highest wins, which is the historical behaviour.
 
+### Validating a flow's variable wiring
+
+A flow's agents can declare data dependencies by variable name: an agent *produces* under its
+`FlowAgent.OutputKey` and *consumes* the inputs its user-template `Prompt.Variables` declares.
+`FlowRecord.Inputs []string` names the variables the flow expects to receive at `RunTurn` time
+(as opposed to being produced by an agent).
+
+`Flows().Validate(ctx, *FlowRecord)` checks that wiring against the current registry WITHOUT
+persisting — call it in an editor before `Create`. It returns `loom.ErrFlowInvalid` (joining
+every problem) when a consumed variable has no producer, a producer name is duplicated, or a
+referenced agent is missing. `Create` runs the self-contained subset (duplicate/colliding
+producer names) automatically; a flow that declares no variables passes trivially, so this is a
+no-op for flows that don't opt into wiring.
+
+Current execution is still lead → all-followers-concurrent, so a follower may consume the lead
+or a declared input, but **not another follower** — `Validate` flags a cross-follower dependency
+as not-yet-executed. Layered execution that runs dependent followers in order is a planned
+follow-up (see `28-Variable-Producer-Consumer.md`).
+
 ## Schema & migrations (IMPORTANT gotcha)
 
 `schema.NewLoader(dialect).Apply(ctx, db)` creates tables on a fresh DB and runs ordered

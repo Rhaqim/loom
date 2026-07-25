@@ -922,3 +922,160 @@ func TestVars_UndeclaredIsBackwardCompatible(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// --- §2.2 (producer/consumer, phase 1): Flow.Inputs + Flows().Validate ---
+
+// helper: create an agent whose user template declares the given required vars.
+func agentWithVars(t *testing.T, e *Engine, slug string, vars []string) {
+	t.Helper()
+	ctx := context.Background()
+	ut := &Prompt{Slug: slug + "-ut", Version: 1, Kind: PromptKindUserTemplate,
+		Body: "x", Variables: vars}
+	if err := e.Prompts().Create(ctx, ut); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Agents().Create(ctx, &Agent{
+		Slug: slug, Version: 1, Modal: ModalityText, GeneratorSlug: "g",
+		UserTemplateID: ut.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFlowValidate_InputsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "fv_rt", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "lead", "g")
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Inputs: []string{"topic", "tone"},
+		Agents: []FlowAgentEntry{{AgentSlug: "lead", OutputKey: "Lead"}},
+	}
+	if err := e.Flows().Create(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.Flows().Get(ctx, "", "f", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Inputs) != 2 || got.Inputs[0] != "topic" || got.Inputs[1] != "tone" {
+		t.Fatalf("Inputs round-trip = %v, want [topic tone]", got.Inputs)
+	}
+}
+
+func TestFlowValidate_ConsumedFromLeadAndInputs(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "fv_ok", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	// lead consumes an external input; follower consumes the lead's output.
+	agentWithVars(t, e, "lead", []string{"topic"})
+	agentWithVars(t, e, "f1", []string{"Lead"})
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Inputs: []string{"topic"},
+		Agents: []FlowAgentEntry{
+			{AgentSlug: "lead", OutputKey: "Lead"},
+			{AgentSlug: "f1", OutputKey: "F1"},
+		},
+	}
+	if err := e.Flows().Validate(ctx, rec); err != nil {
+		t.Fatalf("valid wiring rejected: %v", err)
+	}
+}
+
+func TestFlowValidate_DanglingConsumedVariable(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "fv_dangle", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	// Consumes "topic" but nobody produces it and it is not declared as an input.
+	agentWithVars(t, e, "lead", []string{"topic"})
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Agents: []FlowAgentEntry{{AgentSlug: "lead", OutputKey: "Lead"}},
+	}
+	err := e.Flows().Validate(ctx, rec)
+	if !errors.Is(err, ErrFlowInvalid) {
+		t.Fatalf("err = %v, want ErrFlowInvalid", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "topic") {
+		t.Fatalf("error %v should name the dangling variable 'topic'", err)
+	}
+	// Declaring it as an input fixes it.
+	rec.Inputs = []string{"topic"}
+	if err := e.Flows().Validate(ctx, rec); err != nil {
+		t.Fatalf("after declaring input: %v", err)
+	}
+}
+
+func TestFlowValidate_CrossFollowerNotYetSupported(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "fv_cross", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	// f2 consumes f1's output — a sibling follower dependency (phase 2).
+	mustAgent(t, e, "lead", "g")
+	agentWithVars(t, e, "f1", nil)
+	agentWithVars(t, e, "f2", []string{"F1"})
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Agents: []FlowAgentEntry{
+			{AgentSlug: "lead", OutputKey: "Lead"},
+			{AgentSlug: "f1", OutputKey: "F1"},
+			{AgentSlug: "f2", OutputKey: "F2"},
+		},
+	}
+	err := e.Flows().Validate(ctx, rec)
+	if !errors.Is(err, ErrFlowInvalid) {
+		t.Fatalf("err = %v, want ErrFlowInvalid", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "cross-follower") {
+		t.Fatalf("error %v should explain cross-follower wiring is not yet executed", err)
+	}
+}
+
+// Duplicate producer names are caught by the self-contained check, in BOTH
+// Validate and Create (no agent resolution needed).
+func TestFlowValidate_DuplicateProducerRejectedAtCreate(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "fv_dup", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "lead", "g")
+	mustAgent(t, e, "f1", "g")
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Agents: []FlowAgentEntry{
+			{AgentSlug: "lead", OutputKey: "Shared"},
+			{AgentSlug: "f1", OutputKey: "Shared"},
+		},
+	}
+	err := e.Flows().Create(ctx, rec)
+	if !errors.Is(err, ErrFlowInvalid) {
+		t.Fatalf("Create with duplicate output key: err = %v, want ErrFlowInvalid", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "Shared") {
+		t.Fatalf("error %v should name the duplicated output key", err)
+	}
+}
+
+// A flow that declares no variables and has unique keys is valid — full
+// backward compatibility for existing flows.
+func TestFlowValidate_UndeclaredIsValid(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "fv_compat", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "lead", "g")
+	mustAgent(t, e, "f1", "g")
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Agents: []FlowAgentEntry{
+			{AgentSlug: "lead", OutputKey: "Lead"},
+			{AgentSlug: "f1", OutputKey: "F1"},
+		},
+	}
+	if err := e.Flows().Validate(ctx, rec); err != nil {
+		t.Fatalf("a flow that declares no wiring must be valid: %v", err)
+	}
+	if err := e.Flows().Create(ctx, rec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+}

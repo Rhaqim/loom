@@ -569,6 +569,25 @@ inactive version still fails with "not active" — that is a caller mistake, not
 several versions are active (the default, since `Create` does not deactivate siblings) the
 highest wins, which is the historical behaviour.
 
+### Validating a flow's variable wiring
+
+A flow's agents can declare data dependencies by variable name: an agent *produces* under its
+`FlowAgent.OutputKey` and *consumes* the inputs its user-template `Prompt.Variables` declares.
+`FlowRecord.Inputs []string` names the variables the flow expects to receive at `RunTurn` time
+(as opposed to being produced by an agent).
+
+`Flows().Validate(ctx, *FlowRecord)` checks that wiring against the current registry WITHOUT
+persisting — call it in an editor before `Create`. It returns `loom.ErrFlowInvalid` (joining
+every problem) when a consumed variable has no producer, a producer name is duplicated, or a
+referenced agent is missing. `Create` runs the self-contained subset (duplicate/colliding
+producer names) automatically; a flow that declares no variables passes trivially, so this is a
+no-op for flows that don't opt into wiring.
+
+Current execution is still lead → all-followers-concurrent, so a follower may consume the lead
+or a declared input, but **not another follower** — `Validate` flags a cross-follower dependency
+as not-yet-executed. Layered execution that runs dependent followers in order is a planned
+follow-up (see `28-Variable-Producer-Consumer.md`).
+
 ## Schema & migrations (IMPORTANT gotcha)
 
 `schema.NewLoader(dialect).Apply(ctx, db)` creates tables on a fresh DB and runs ordered
@@ -695,6 +714,13 @@ VARIABLES
 var ErrDuplicateSlug = errors.New("loom: duplicate slug+version")
     ErrDuplicateSlug is returned when an agent or prompt slug+version already
     exists.
+
+var ErrFlowInvalid = errors.New("loom: invalid flow")
+    ErrFlowInvalid is returned by Flows().Validate (and Create's self-contained
+    checks) when a flow's variable wiring is inconsistent — a duplicate
+    producer, a consumed variable with no producer, or (until layered execution
+    lands) a cross-follower dependency. Wrapped errors describe each problem;
+    several may be joined so an author sees all of them at once.
 
 var ErrGeneratorNotRegistered = errors.New("loom: generator not registered")
     ErrGeneratorNotRegistered is returned when a step references a generator
@@ -1444,12 +1470,18 @@ type FlowAgentEntry struct {
     FlowAgentEntry is one agent's slot in a persisted flow.
 
 type FlowRecord struct {
-	ID        uuid.UUID
-	Owner     string // opaque app-owned scope; "" = global
-	Slug      string
-	Version   int
-	Category  string
-	IsActive  bool
+	ID       uuid.UUID
+	Owner    string // opaque app-owned scope; "" = global
+	Slug     string
+	Version  int
+	Category string
+	IsActive bool
+	// Inputs names the variables this flow expects to be supplied at RunTurn
+	// time (via TurnRequest.Inputs), as opposed to being produced by an agent
+	// in the flow. Validate treats these as external producers: an agent
+	// consuming one of these needs no in-flow producer for it. Optional; a flow
+	// that declares nothing is unaffected.
+	Inputs    []string
 	Agents    []FlowAgentEntry // ordered; index 0 is the lead
 	CreatedAt time.Time
 }
@@ -1488,6 +1520,19 @@ type FlowRegistry interface {
 	// agent entries — a lightweight index for an editor.
 	List(ctx context.Context, owner, category string) ([]*FlowRecord, error)
 	Delete(ctx context.Context, owner, slug string, version int) error
+	// Validate checks a flow's variable wiring against the current registry
+	// state WITHOUT persisting anything, so an editor can call it before Create.
+	//
+	// It resolves each agent's declared input variables (its user template's
+	// Prompt.Variables) and confirms every one is satisfiable, then checks that
+	// producer names are unique. Returns nil when the wiring is sound, or an
+	// ErrFlowInvalid joining every problem found (dangling variable, duplicate
+	// producer, unknown referenced agent). Create runs the self-contained subset
+	// of these checks; Validate runs the full resolving check.
+	//
+	// A flow whose agents declare no input variables passes trivially, so this
+	// is a no-op for flows that do not opt into wiring.
+	Validate(ctx context.Context, r *FlowRecord) error
 }
     FlowRegistry resolves and manages persisted flows (agent maps). owner is an
     opaque scope ("" = global). On Get/Latest, version 0 resolves to the latest
