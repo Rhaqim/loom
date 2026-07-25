@@ -357,7 +357,9 @@ Agents/prompts are immutable, so a read-through cache in front of the DB is safe
 loom.New(loom.Config{ /* ... */ Cache: loom.NewInProcessCache(), CacheTTL: 24 * time.Hour })
 ```
 `Cache` is an interface — back it with Redis/etc. `CacheTTL` 0 uses the 24h default. Nil Cache
-disables caching (every RunStep hits the DB).
+disables caching (every RunStep hits the DB). If the `Cache` is shared with the application's
+own keys, set `Config.CacheKeyPrefix` (default `"loom"`) to namespace loom's entries and avoid
+collisions — e.g. `CacheKeyPrefix: "myapp:loom"`.
 
 The cache covers BOTH shapes of read:
 - **Version-pinned** records (`Get(owner, slug, concreteVersion)`, `GetByID`) — immutable, so

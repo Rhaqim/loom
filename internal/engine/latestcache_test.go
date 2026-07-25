@@ -223,3 +223,69 @@ func TestLatestCache_DisabledByNegativeTTL(t *testing.T) {
 		t.Fatalf("versioned cache was disabled too: %v", err)
 	}
 }
+
+// CacheKeyPrefix namespaces loom's keys so a client-provided shared cache
+// cannot cross-serve: two engines with different prefixes over the SAME cache
+// must not see each other's entries, and neither may collide with a key the
+// application itself wrote.
+func TestCacheKeyPrefix_IsolatesSharedCache(t *testing.T) {
+	ctx := context.Background()
+	shared := NewInProcessCache()
+
+	newEngine := func(keyPrefix string) (*Engine, *sql.DB) {
+		db, err := sql.Open("sqlite", "file:ckp_"+uuid.NewString()+"?mode=memory&cache=shared")
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.SetMaxOpenConns(1)
+		if err := schema.NewLoader(schema.DialectSQLite).Apply(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+		e, err := New(Config{
+			DB: db, Dialect: DialectSQLite,
+			Generators:     map[string]Generator{"g": okGen{}},
+			Cache:          shared,
+			CacheKeyPrefix: keyPrefix,
+			LatestCacheTTL: time.Minute,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e, db
+	}
+
+	// Two independent apps, one shared cache backend, distinct prefixes.
+	appA, _ := newEngine("appA:loom")
+	appB, _ := newEngine("appB:loom")
+
+	if err := appA.Agents().Create(ctx, &Agent{Slug: "a", Version: 1, Modal: ModalityText, GeneratorSlug: "g"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := appB.Agents().Create(ctx, &Agent{Slug: "a", Version: 7, Modal: ModalityText, GeneratorSlug: "g"}); err != nil {
+		t.Fatal(err)
+	}
+	// Prime both latest pointers into the shared cache.
+	ga, err := appA.Agents().Latest(ctx, "", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gb, err := appB.Agents().Latest(ctx, "", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ga.Version != 1 || gb.Version != 7 {
+		t.Fatalf("cross-served across prefixes: A=v%d (want 1), B=v%d (want 7)", ga.Version, gb.Version)
+	}
+
+	// The prefix really is in the stored key: a value the application wrote
+	// under its own namespace is untouched by loom, and loom's key is findable
+	// under the configured prefix.
+	appKey := "appA:loom:agent-latest:loom_::a"
+	if _, ok := shared.Get(ctx, appKey); !ok {
+		t.Fatalf("expected loom to have written key %q under the configured prefix", appKey)
+	}
+	// A default-prefixed engine writes under "loom:", provably a different key.
+	if _, ok := shared.Get(ctx, "loom:agent-latest:loom_::a"); ok {
+		t.Fatal("found a default-prefixed key; the CacheKeyPrefix was not applied")
+	}
+}

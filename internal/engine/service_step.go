@@ -416,7 +416,7 @@ func (s *stepService) buildGenerateRequest(
 	// Load system prompt — cached by UUID.
 	systemPrompt := ""
 	if agent.SystemPromptID != uuid.Nil {
-		spKey := cacheKey("prompt-id", s.e.prefix, agent.SystemPromptID.String(), 0)
+		spKey := s.e.cacheKey("prompt-id", agent.SystemPromptID.String(), 0)
 		var sp *Prompt
 		if cached, ok := cacheGet[Prompt](ctx, s.e.cache, spKey); ok {
 			sp = cached
@@ -445,7 +445,7 @@ func (s *stepService) buildGenerateRequest(
 	// Load and render user template — cached by UUID.
 	userPrompt := ""
 	if agent.UserTemplateID != uuid.Nil {
-		utKey := cacheKey("prompt-id", s.e.prefix, agent.UserTemplateID.String(), 0)
+		utKey := s.e.cacheKey("prompt-id", agent.UserTemplateID.String(), 0)
 		var ut *Prompt
 		if cached, ok := cacheGet[Prompt](ctx, s.e.cache, utKey); ok {
 			ut = cached

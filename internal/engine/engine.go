@@ -51,6 +51,12 @@ type Config struct {
 	// cache, or supply any implementation of the Cache interface (Redis, etc.).
 	// A nil Cache disables caching — every RunStep hits the database directly.
 	Cache Cache
+	// CacheKeyPrefix is the leading namespace on every cache key loom writes
+	// (default "loom"). Set it when the Cache is shared with the application's
+	// own keys so loom's entries cannot collide with theirs — e.g. "myapp:loom".
+	// The schema prefix is always appended after it, so distinct engines stay
+	// distinct regardless.
+	CacheKeyPrefix string
 	// CacheTTL is how long cached immutable objects (agents, prompts) live.
 	// Zero uses the default (24h). Since these records are versioned and never
 	// mutated, a long TTL is safe; set a shorter one only if your cache backend
@@ -103,14 +109,15 @@ func (noopLogger) Error(string, ...any) {}
 
 // Engine is the central object applications interact with.
 type Engine struct {
-	cfg        Config
-	db         *sql.DB
-	prefix     string
-	generators map[string]Generator
-	hooks      *hookBus
-	log        Logger
-	cache      Cache
-	cacheTTL   time.Duration
+	cfg            Config
+	db             *sql.DB
+	prefix         string
+	generators     map[string]Generator
+	hooks          *hookBus
+	log            Logger
+	cache          Cache
+	cacheTTL       time.Duration
+	cacheKeyPrefix string
 	// latestCacheTTL is the resolved TTL for mutable latest/active pointers.
 	// A negative value means latest/active caching is disabled.
 	latestCacheTTL time.Duration
@@ -178,6 +185,10 @@ func New(cfg Config) (*Engine, error) {
 	if latestCacheTTL == 0 {
 		latestCacheTTL = defaultLatestCacheTTL
 	}
+	cacheKeyPrefix := cfg.CacheKeyPrefix
+	if cacheKeyPrefix == "" {
+		cacheKeyPrefix = defaultCacheKeyPrefix
+	}
 	gens := make(map[string]Generator)
 	maps.Copy(gens, cfg.Generators)
 
@@ -188,6 +199,7 @@ func New(cfg Config) (*Engine, error) {
 		generators:     gens,
 		cache:          cfg.Cache,
 		cacheTTL:       cacheTTL,
+		cacheKeyPrefix: cacheKeyPrefix,
 		latestCacheTTL: latestCacheTTL,
 		hooks:          newHookBus(),
 		log:            log,

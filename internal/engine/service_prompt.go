@@ -17,7 +17,7 @@ func (s *promptService) Get(ctx context.Context, owner, slug string, version int
 	// Cache check — prompts are immutable after creation. The key carries owner:
 	// slugs are unique only within one, so an unowned key would leak a record
 	// across tenants.
-	key := cacheKeyOwned("prompt", s.e.prefix, owner, slug, version)
+	key := s.e.cacheKeyOwned("prompt", owner, slug, version)
 	if p, ok := cacheGet[Prompt](ctx, s.e.cache, key); ok {
 		return p, nil
 	}
@@ -31,7 +31,7 @@ func (s *promptService) Get(ctx context.Context, owner, slug string, version int
 
 func (s *promptService) Latest(ctx context.Context, owner, slug string) (*Prompt, error) {
 	// Mutable pointer: short latest TTL, evicted on Create. See agentService.Latest.
-	key := cacheKeyOwnedLatest("prompt-latest", s.e.prefix, owner, slug)
+	key := s.e.cacheKeyOwnedLatest("prompt-latest", owner, slug)
 	return cachedLatest(ctx, s.e, key, func() (*Prompt, error) {
 		return queryPromptLatest(ctx, s.e.db, s.e.prefix, owner, slug)
 	})
@@ -39,7 +39,7 @@ func (s *promptService) Latest(ctx context.Context, owner, slug string) (*Prompt
 
 // GetByID is deliberately not owner-scoped — see PromptRegistry.GetByID.
 func (s *promptService) GetByID(ctx context.Context, id uuid.UUID) (*Prompt, error) {
-	key := cacheKey("prompt-id", s.e.prefix, id.String(), 0)
+	key := s.e.cacheKey("prompt-id", id.String(), 0)
 	if p, ok := cacheGet[Prompt](ctx, s.e.cache, key); ok {
 		return p, nil
 	}
@@ -62,7 +62,7 @@ func (s *promptService) Create(ctx context.Context, p *Prompt) error {
 		return err
 	}
 	// A new version may be the newest; evict the stale latest pointer.
-	cacheDelete(ctx, s.e.cache, cacheKeyOwnedLatest("prompt-latest", s.e.prefix, p.Owner, p.Slug))
+	cacheDelete(ctx, s.e.cache, s.e.cacheKeyOwnedLatest("prompt-latest", p.Owner, p.Slug))
 	return nil
 }
 
@@ -88,11 +88,11 @@ func (s *promptService) Delete(ctx context.Context, owner, slug string, version 
 	if err := sqlDeletePrompt(ctx, s.e.db, s.e.prefix, owner, slug, version); err != nil {
 		return err
 	}
-	cacheDelete(ctx, s.e.cache, cacheKeyOwned("prompt", s.e.prefix, owner, slug, version))
+	cacheDelete(ctx, s.e.cache, s.e.cacheKeyOwned("prompt", owner, slug, version))
 	// Deleting the newest version moves the latest pointer, so evict it too.
-	cacheDelete(ctx, s.e.cache, cacheKeyOwnedLatest("prompt-latest", s.e.prefix, owner, slug))
+	cacheDelete(ctx, s.e.cache, s.e.cacheKeyOwnedLatest("prompt-latest", owner, slug))
 	if id != uuid.Nil {
-		cacheDelete(ctx, s.e.cache, cacheKey("prompt-id", s.e.prefix, id.String(), 0))
+		cacheDelete(ctx, s.e.cache, s.e.cacheKey("prompt-id", id.String(), 0))
 	}
 	return nil
 }

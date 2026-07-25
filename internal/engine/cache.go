@@ -45,19 +45,27 @@ const defaultCacheTTL = 24 * time.Hour
 // bounds that staleness. It is deliberately short.
 const defaultLatestCacheTTL = 5 * time.Second
 
+// defaultCacheKeyPrefix is the leading namespace on every cache key loom
+// writes. It is configurable (Config.CacheKeyPrefix) because the Cache is
+// supplied by the embedder and may be shared with the application's own keys —
+// a fixed namespace could collide with theirs. Every key builder below leads
+// with e.cacheKeyPrefix, then the schema prefix, so two engines with different
+// SchemaPrefix or CacheKeyPrefix never share entries.
+const defaultCacheKeyPrefix = "loom"
+
 // cacheKeyOwnedLatest formats the key for an owner-scoped "latest/active"
 // pointer — a resolution with no fixed version. It carries no version component
 // (that is the whole point: the pointer moves), but keeps owner for the same
 // tenant-isolation reason cacheKeyOwned documents.
-func cacheKeyOwnedLatest(kind, prefix, owner, slug string) string {
-	return fmt.Sprintf("loom:%s:%s:%s:%s", kind, prefix, owner, slug)
+func (e *Engine) cacheKeyOwnedLatest(kind, owner, slug string) string {
+	return fmt.Sprintf("%s:%s:%s:%s:%s", e.cacheKeyPrefix, kind, e.prefix, owner, slug)
 }
 
-// cacheKey formats a cache key for a given kind, prefix, slug, and version. Use
-// it only for globally unique addresses (a row UUID); anything addressed by slug
-// is owner-scoped and must use cacheKeyOwned.
-func cacheKey(kind, prefix, slug string, version int) string {
-	return fmt.Sprintf("loom:%s:%s:%s:%d", kind, prefix, slug, version)
+// cacheKey formats a cache key for a given kind, slug, and version. Use it only
+// for globally unique addresses (a row UUID); anything addressed by slug is
+// owner-scoped and must use cacheKeyOwned.
+func (e *Engine) cacheKey(kind, slug string, version int) string {
+	return fmt.Sprintf("%s:%s:%s:%s:%d", e.cacheKeyPrefix, kind, e.prefix, slug, version)
 }
 
 // cacheKeyOwned formats a cache key for a record addressed by owner+slug+version.
@@ -65,8 +73,8 @@ func cacheKey(kind, prefix, slug string, version int) string {
 // key without it would serve one tenant's agent/prompt to another — the cache
 // silently defeating the SQL owner filter. "" (the global scope) is just another
 // owner value here.
-func cacheKeyOwned(kind, prefix, owner, slug string, version int) string {
-	return fmt.Sprintf("loom:%s:%s:%s:%s:%d", kind, prefix, owner, slug, version)
+func (e *Engine) cacheKeyOwned(kind, owner, slug string, version int) string {
+	return fmt.Sprintf("%s:%s:%s:%s:%s:%d", e.cacheKeyPrefix, kind, e.prefix, owner, slug, version)
 }
 
 // cacheGet attempts to deserialise a cached value into dst.

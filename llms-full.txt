@@ -357,7 +357,9 @@ Agents/prompts are immutable, so a read-through cache in front of the DB is safe
 loom.New(loom.Config{ /* ... */ Cache: loom.NewInProcessCache(), CacheTTL: 24 * time.Hour })
 ```
 `Cache` is an interface — back it with Redis/etc. `CacheTTL` 0 uses the 24h default. Nil Cache
-disables caching (every RunStep hits the DB).
+disables caching (every RunStep hits the DB). If the `Cache` is shared with the application's
+own keys, set `Config.CacheKeyPrefix` (default `"loom"`) to namespace loom's entries and avoid
+collisions — e.g. `CacheKeyPrefix: "myapp:loom"`.
 
 The cache covers BOTH shapes of read:
 - **Version-pinned** records (`Get(owner, slug, concreteVersion)`, `GetByID`) — immutable, so
@@ -1094,6 +1096,12 @@ type Config struct {
 	// cache, or supply any implementation of the Cache interface (Redis, etc.).
 	// A nil Cache disables caching — every RunStep hits the database directly.
 	Cache Cache
+	// CacheKeyPrefix is the leading namespace on every cache key loom writes
+	// (default "loom"). Set it when the Cache is shared with the application's
+	// own keys so loom's entries cannot collide with theirs — e.g. "myapp:loom".
+	// The schema prefix is always appended after it, so distinct engines stay
+	// distinct regardless.
+	CacheKeyPrefix string
 	// CacheTTL is how long cached immutable objects (agents, prompts) live.
 	// Zero uses the default (24h). Since these records are versioned and never
 	// mutated, a long TTL is safe; set a shorter one only if your cache backend
