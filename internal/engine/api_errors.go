@@ -131,6 +131,12 @@ var ErrDuplicateSlug = errors.New("loom: duplicate slug+version")
 // write would clobber theirs (optimistic-concurrency conflict).
 var ErrSessionConflict = errors.New("loom: session update conflict")
 
+// ErrMissingVariables is returned by RunStep when the user template's prompt
+// declares required input variables (Prompt.Variables) and one or more were not
+// supplied in StepRequest.Inputs. The wrapped message lists the missing names.
+// A prompt that declares no variables never triggers this.
+var ErrMissingVariables = errors.New("loom: missing required template variables")
+
 // ErrSessionPinned is returned by Purge when the target session is pinned.
 // Pinning marks data as protected, so an irreversible delete requires the
 // explicit ForcePurge instead.

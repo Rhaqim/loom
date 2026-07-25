@@ -7,6 +7,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -824,3 +825,100 @@ func TestAsk12_TurnStepsAreConsecutive(t *testing.T) {
 		}
 	}
 }
+
+// --- §2.2 (declaration-only): Prompt.Variables enforced at render ---
+
+func TestVars_DeclaredVariableMustBeSupplied(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "vars", map[string]Generator{"g": okGen{}}, PollerConfig{})
+
+	// A user template that requires two inputs and declares them.
+	sys := &Prompt{Slug: "sys", Version: 1, Kind: PromptKindSystem, Body: "sys"}
+	if err := e.Prompts().Create(ctx, sys); err != nil {
+		t.Fatal(err)
+	}
+	ut := &Prompt{
+		Slug: "ut", Version: 1, Kind: PromptKindUserTemplate,
+		Body:      "Hello {{.Inputs.name}}, you are in {{.Inputs.room}}.",
+		Variables: []string{"name", "room"},
+	}
+	if err := e.Prompts().Create(ctx, ut); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Agents().Create(ctx, &Agent{
+		Slug: "a", Version: 1, Modal: ModalityText, GeneratorSlug: "g",
+		SystemPromptID: sys.ID, UserTemplateID: ut.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sess := &Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+
+	// Missing "room" — must fail with ErrMissingVariables naming it, NOT render
+	// an empty room.
+	_, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a", Inputs: map[string]any{"name": "Ada"}})
+	if !errors.Is(err, ErrMissingVariables) {
+		t.Fatalf("missing variable: err = %v, want ErrMissingVariables", err)
+	}
+	if err == nil || !contains(err.Error(), "room") {
+		t.Fatalf("error %v should name the missing variable 'room'", err)
+	}
+
+	// All supplied — succeeds.
+	if _, err := e.RunStep(ctx, sess, StepRequest{
+		AgentSlug: "a", Inputs: map[string]any{"name": "Ada", "room": "cellar"},
+	}); err != nil {
+		t.Fatalf("all variables supplied: %v", err)
+	}
+}
+
+// A key present with an empty or nil value counts as supplied — the caller made
+// a deliberate choice; only an ABSENT key is the forgotten/misspelled case.
+func TestVars_PresentButEmptyIsSupplied(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "vars_empty", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	sys := &Prompt{Slug: "s", Version: 1, Kind: PromptKindSystem, Body: "s"}
+	_ = e.Prompts().Create(ctx, sys)
+	ut := &Prompt{Slug: "u", Version: 1, Kind: PromptKindUserTemplate,
+		Body: "[{{.Inputs.note}}]", Variables: []string{"note"}}
+	_ = e.Prompts().Create(ctx, ut)
+	if err := e.Agents().Create(ctx, &Agent{Slug: "a", Version: 1, Modal: ModalityText,
+		GeneratorSlug: "g", SystemPromptID: sys.ID, UserTemplateID: ut.ID}); err != nil {
+		t.Fatal(err)
+	}
+	sess := &Session{PlatformID: "p"}
+	_ = e.Sessions().Create(ctx, sess)
+
+	if _, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a", Inputs: map[string]any{"note": ""}}); err != nil {
+		t.Fatalf("empty-string value should satisfy the declaration: %v", err)
+	}
+	if _, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a", Inputs: map[string]any{"note": nil}}); err != nil {
+		t.Fatalf("nil value (key present) should satisfy the declaration: %v", err)
+	}
+}
+
+// A prompt that declares nothing behaves exactly as before — no enforcement.
+func TestVars_UndeclaredIsBackwardCompatible(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "vars_compat", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	sys := &Prompt{Slug: "s", Version: 1, Kind: PromptKindSystem, Body: "s"}
+	_ = e.Prompts().Create(ctx, sys)
+	// References an input but declares no Variables — renders empty, no error,
+	// as it always did.
+	ut := &Prompt{Slug: "u", Version: 1, Kind: PromptKindUserTemplate,
+		Body: "Hi {{.Inputs.name}}"}
+	_ = e.Prompts().Create(ctx, ut)
+	if err := e.Agents().Create(ctx, &Agent{Slug: "a", Version: 1, Modal: ModalityText,
+		GeneratorSlug: "g", SystemPromptID: sys.ID, UserTemplateID: ut.ID}); err != nil {
+		t.Fatal(err)
+	}
+	sess := &Session{PlatformID: "p"}
+	_ = e.Sessions().Create(ctx, sess)
+	if _, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a"}); err != nil {
+		t.Fatalf("undeclared template must not enforce: %v", err)
+	}
+}
+
+func contains(s, sub string) bool { return strings.Contains(s, sub) }

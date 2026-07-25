@@ -461,7 +461,7 @@ func (s *stepService) buildGenerateRequest(
 		// appending to session.History / writing session.State right now.
 		var err error
 		s.e.mu.RLock()
-		userPrompt, err = renderTemplate(ut.Body, session, action, req.Inputs, req.Params)
+		userPrompt, err = renderTemplate(ut.Body, session, action, req.Inputs, req.Params, ut.Variables)
 		s.e.mu.RUnlock()
 		if err != nil {
 			return GenerateRequest{}, fmt.Errorf("render user template: %w", err)

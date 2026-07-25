@@ -674,6 +674,12 @@ var ErrDuplicateSlug = engine.ErrDuplicateSlug
 // write would clobber theirs (optimistic-concurrency conflict).
 var ErrSessionConflict = engine.ErrSessionConflict
 
+// ErrMissingVariables is returned by RunStep when the user template's prompt
+// declares required input variables (Prompt.Variables) and one or more were not
+// supplied in StepRequest.Inputs. The wrapped message lists the missing names.
+// A prompt that declares no variables never triggers this.
+var ErrMissingVariables = engine.ErrMissingVariables
+
 // ErrSessionPinned is returned by Purge when the target session is pinned.
 // Pinning marks data as protected, so an irreversible delete requires the
 // explicit ForcePurge instead.

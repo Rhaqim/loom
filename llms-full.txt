@@ -121,6 +121,13 @@ input), `{{.Vars.x}}` (session `State.Vars`), `{{.Inputs.x}}` (per-step inputs /
 lead output), `{{.Params.x}}` (tuning knobs), and a minimal `{{.Session}}` view
 (ID/PlatformID/Tags/State — NOT Metadata or History). `{{template}}`/`{{define}}` are rejected.
 
+A user-template `Prompt` may declare required inputs in `Prompt.Variables []string`. When
+non-empty, `RunStep` rejects a step whose `StepRequest.Inputs` omits any declared name with
+`loom.ErrMissingVariables` (naming the missing ones) rather than rendering it empty and sending
+the model a malformed prompt. A key present with any value — including `nil` or `""` — counts as
+supplied; only an ABSENT key fails. Declaring nothing enforces nothing, so it is opt-in per
+prompt and existing prompts are unaffected.
+
 ## Actions (user input into a step)
 
 `loom.Action{Kind, Payload, Metadata}`. Kinds and typical payloads:
@@ -591,6 +598,9 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
 - "Per-user API keys / model routing" → pass `StepRequest.Overrides{"api_key":..., "model":...}`
   and read them in a custom generator; built-in openai/anthropic honor `Overrides["base_url"]`
   ONLY if the URL is allowlisted via `WithAllowedBaseURLs(...)` (security: prevents key exfil).
+- "Require a template's inputs / catch a missing variable" → set `Prompt.Variables` to the
+  input names it needs; a step missing one fails with `ErrMissingVariables` instead of rendering
+  empty.
 - "Force JSON output" → attach a `ResponseFormat` (via a reusable `ResponseFormatRecord` or an
   inline schema on the agent) and register `loom.SchemaValidationPostHook()`.
 - "Stream to a client" → set `StepRequest.OnChunk` (or `TurnRequest.OnChunk` for a turn's lead).
@@ -694,6 +704,12 @@ var ErrGeneratorNotRegistered = errors.New("loom: generator not registered")
 var ErrInvalidConfig = errors.New("loom: invalid config")
     ErrInvalidConfig is returned by New when the Config is missing a required
     field or is otherwise unusable. Wrapped errors carry the specific reason.
+
+var ErrMissingVariables = errors.New("loom: missing required template variables")
+    ErrMissingVariables is returned by RunStep when the user template's prompt
+    declares required input variables (Prompt.Variables) and one or more were
+    not supplied in StepRequest.Inputs. The wrapped message lists the missing
+    names. A prompt that declares no variables never triggers this.
 
 var ErrNotFound = errors.New("loom: not found")
     ErrNotFound is returned when a requested entity does not exist. Errors from
@@ -1751,14 +1767,20 @@ type PreHook func(ctx context.Context, req *StepRequest) error
     (return ErrSkip), or annotate the state. Hooks run in registration order.
 
 type Prompt struct {
-	ID        uuid.UUID
-	Slug      string // human-readable identifier, e.g. "opening-author"
-	Owner     string // opaque app-owned scope ("" = global)
-	Version   int    // monotonically increasing; editing creates a new version
-	Kind      PromptKind
-	Category  string   // platform-defined grouping
-	Body      string   // raw template text
-	Variables []string // documented input variable names
+	ID       uuid.UUID
+	Slug     string // human-readable identifier, e.g. "opening-author"
+	Owner    string // opaque app-owned scope ("" = global)
+	Version  int    // monotonically increasing; editing creates a new version
+	Kind     PromptKind
+	Category string // platform-defined grouping
+	Body     string // raw template text
+	// Variables declares the input variable names this template REQUIRES. When
+	// non-empty, RunStep rejects a step whose StepRequest.Inputs is missing any
+	// of them with ErrMissingVariables, instead of rendering the missing input
+	// as empty and sending the model a malformed prompt. Empty (the default)
+	// enforces nothing, so existing prompts are unaffected. Only meaningful on a
+	// user template — a system prompt is used verbatim and interpolates no inputs.
+	Variables []string
 	Metadata  map[string]any
 	CreatedAt time.Time
 	Notes     string // design rationale, change notes
