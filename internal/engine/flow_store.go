@@ -57,6 +57,71 @@ type FlowAgentEntry struct {
 	MaxRetries int
 }
 
+// FlowPlan is a flow's resolved wiring, for inspection and visualization — the
+// same producer/consumer graph RunTurn executes and Flows().Validate checks,
+// exposed as data. Unlike Validate it does NOT reject a bad flow: it represents
+// the problems (unresolved inputs are edges of source "unresolved"; a cycle
+// fills Cyclic) so a UI can render exactly why a flow is broken. A flow is valid
+// iff no edge has source FlowEdgeUnresolved and Cyclic is empty.
+type FlowPlan struct {
+	// Nodes in execution order: the lead (Layer 0) first, then followers by
+	// dependency layer.
+	Nodes []FlowPlanNode
+	// Edges describe every input variable a node consumes and where it resolves
+	// from — the arrows a diagram draws.
+	Edges []FlowPlanEdge
+	// Layers is the number of follower dependency layers (0 with no followers).
+	Layers int
+	// Inputs the flow declares it receives from the caller (FlowRecord.Inputs).
+	// The implicit "action" input is always available in addition to these.
+	Inputs []string
+	// Cyclic names followers that could not be placed in a layer because they
+	// form a dependency cycle; empty for a valid flow.
+	Cyclic []string
+}
+
+// FlowPlanNode is one agent in a plan, with what it produces and consumes.
+type FlowPlanNode struct {
+	AgentSlug    string
+	AgentVersion int
+	IsLead       bool
+	// Layer is 0 for the lead and 1..Layers for a follower (its execution
+	// layer). A cyclic follower is placed after the last real layer.
+	Layer int
+	// OutputKey is the name this agent's output is exposed under ("" = it
+	// produces no consumable output).
+	OutputKey string
+	// Consumes is the input variable names this agent's user template declares
+	// (its Prompt.Variables).
+	Consumes []string
+}
+
+// FlowEdgeSource says where a consumed variable comes from.
+type FlowEdgeSource string
+
+const (
+	// FlowEdgeAgent — produced by another agent (the edge's From).
+	FlowEdgeAgent FlowEdgeSource = "agent"
+	// FlowEdgeInput — supplied by the caller (a flow input or the implicit
+	// "action").
+	FlowEdgeInput FlowEdgeSource = "input"
+	// FlowEdgeUnresolved — nothing produces it and it is not a declared input: a
+	// broken wire (the lead consuming an agent output also lands here, since the
+	// lead runs first).
+	FlowEdgeUnresolved FlowEdgeSource = "unresolved"
+)
+
+// FlowPlanEdge is one consumed variable flowing into a node.
+type FlowPlanEdge struct {
+	// To is the consuming agent's slug; Var is the variable that flows.
+	To  string
+	Var string
+	// Source classifies the origin; From is the producing agent's slug only when
+	// Source == FlowEdgeAgent.
+	Source FlowEdgeSource
+	From   string
+}
+
 // Flow builds the runtime Flow from the record: the first entry is the lead, the
 // rest are followers, preserving order.
 func (r *FlowRecord) Flow() Flow {
@@ -127,6 +192,11 @@ type FlowRegistry interface {
 	// A flow whose agents declare no input variables passes trivially, so this
 	// is a no-op for flows that do not opt into wiring.
 	Validate(ctx context.Context, r *FlowRecord) error
+	// Plan returns the flow's resolved wiring — nodes, edges, execution layers,
+	// and any dependency cycle — for inspection and visualization. It is what
+	// Validate checks and RunTurn executes, exposed as data, and does not error
+	// on a bad flow (it represents the problems). See FlowPlan.
+	Plan(ctx context.Context, r *FlowRecord) (*FlowPlan, error)
 }
 
 // flowService implements FlowRegistry.
@@ -341,6 +411,98 @@ func (s *flowService) Validate(ctx context.Context, r *FlowRecord) error {
 		return fmt.Errorf("%w: %w", ErrFlowInvalid, errors.Join(errs...))
 	}
 	return nil
+}
+
+func (s *flowService) Plan(ctx context.Context, r *FlowRecord) (*FlowPlan, error) {
+	if len(r.Agents) == 0 {
+		return nil, fmt.Errorf("%w: needs at least one agent (the lead)", ErrFlowInvalid)
+	}
+
+	// Resolve every agent's consumed variables best-effort: a missing agent
+	// yields no edges but still appears as a node, so Plan renders a partially
+	// broken flow rather than failing (Validate is the authoritative check).
+	consumes := make([][]string, len(r.Agents))
+	for i, e := range r.Agents {
+		consumes[i] = s.e.userTemplateVars(ctx, r.Owner, e.AgentSlug, e.AgentVersion)
+	}
+
+	lead := r.Agents[0]
+	leadKey := leadOutputKey(lead)
+	followers := r.Agents[1:]
+
+	// producer[outputKey] = producing agent slug (lead + followers).
+	producer := map[string]string{}
+	if leadKey != "" {
+		producer[leadKey] = lead.AgentSlug
+	}
+	for _, f := range followers {
+		if f.OutputKey != "" {
+			producer[f.OutputKey] = f.AgentSlug
+		}
+	}
+	external := map[string]bool{"action": true}
+	for _, in := range r.Inputs {
+		external[in] = true
+	}
+
+	// Layer each follower.
+	fKeys := make([]string, len(followers))
+	fConsumes := make([][]string, len(followers))
+	for i, f := range followers {
+		fKeys[i] = f.OutputKey
+		fConsumes[i] = consumes[i+1]
+	}
+	layers, cyclic := topoLayers(fKeys, fConsumes)
+	layerOf := make([]int, len(followers))
+	for _, li := range cyclic {
+		layerOf[li] = len(layers) + 1 // cyclic followers run after the last real layer
+	}
+	for li, layer := range layers {
+		for _, idx := range layer {
+			layerOf[idx] = li + 1 // followers occupy layers 1..N; the lead is 0
+		}
+	}
+
+	plan := &FlowPlan{Layers: len(layers), Inputs: append([]string(nil), r.Inputs...)}
+	plan.Nodes = append(plan.Nodes, FlowPlanNode{
+		AgentSlug: lead.AgentSlug, AgentVersion: lead.AgentVersion,
+		IsLead: true, Layer: 0, OutputKey: leadKey, Consumes: consumes[0],
+	})
+	for i, f := range followers {
+		plan.Nodes = append(plan.Nodes, FlowPlanNode{
+			AgentSlug: f.AgentSlug, AgentVersion: f.AgentVersion,
+			Layer: layerOf[i], OutputKey: f.OutputKey, Consumes: consumes[i+1],
+		})
+	}
+	for _, idx := range cyclic {
+		plan.Cyclic = append(plan.Cyclic, followers[idx].AgentSlug)
+	}
+
+	// One edge per consumed variable, classified by where it resolves from. The
+	// classification matches Validate exactly, so an edge is FlowEdgeUnresolved
+	// precisely when Validate would report that consumption as a problem.
+	for i, e := range r.Agents {
+		isLead := i == 0
+		for _, name := range consumes[i] {
+			edge := FlowPlanEdge{To: e.AgentSlug, Var: name}
+			from, ok := producer[name]
+			switch {
+			case external[name]:
+				edge.Source = FlowEdgeInput
+			case ok && !isLead && from != e.AgentSlug:
+				// A follower reading the lead's or a sibling's output. Ordering
+				// is handled by layering; a cycle shows up in plan.Cyclic.
+				edge.Source = FlowEdgeAgent
+				edge.From = from
+			default:
+				// Nothing produces it, a self-reference, or the lead consuming an
+				// agent output (the lead runs first) — all broken wires.
+				edge.Source = FlowEdgeUnresolved
+			}
+			plan.Edges = append(plan.Edges, edge)
+		}
+	}
+	return plan, nil
 }
 
 // agentConsumes resolves the input-variable names an agent's user template
