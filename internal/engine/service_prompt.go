@@ -30,7 +30,11 @@ func (s *promptService) Get(ctx context.Context, owner, slug string, version int
 }
 
 func (s *promptService) Latest(ctx context.Context, owner, slug string) (*Prompt, error) {
-	return queryPromptLatest(ctx, s.e.db, s.e.prefix, owner, slug)
+	// Mutable pointer: short latest TTL, evicted on Create. See agentService.Latest.
+	key := cacheKeyOwnedLatest("prompt-latest", s.e.prefix, owner, slug)
+	return cachedLatest(ctx, s.e, key, func() (*Prompt, error) {
+		return queryPromptLatest(ctx, s.e.db, s.e.prefix, owner, slug)
+	})
 }
 
 // GetByID is deliberately not owner-scoped — see PromptRegistry.GetByID.
@@ -54,7 +58,12 @@ func (s *promptService) Create(ctx context.Context, p *Prompt) error {
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = time.Now()
 	}
-	return insertPrompt(ctx, s.e.db, s.e.prefix, p)
+	if err := insertPrompt(ctx, s.e.db, s.e.prefix, p); err != nil {
+		return err
+	}
+	// A new version may be the newest; evict the stale latest pointer.
+	cacheDelete(ctx, s.e.cache, cacheKeyOwnedLatest("prompt-latest", s.e.prefix, p.Owner, p.Slug))
+	return nil
 }
 
 func (s *promptService) List(ctx context.Context, owner string, kind PromptKind, category string) ([]*Prompt, error) {
@@ -80,6 +89,8 @@ func (s *promptService) Delete(ctx context.Context, owner, slug string, version 
 		return err
 	}
 	cacheDelete(ctx, s.e.cache, cacheKeyOwned("prompt", s.e.prefix, owner, slug, version))
+	// Deleting the newest version moves the latest pointer, so evict it too.
+	cacheDelete(ctx, s.e.cache, cacheKeyOwnedLatest("prompt-latest", s.e.prefix, owner, slug))
 	if id != uuid.Nil {
 		cacheDelete(ctx, s.e.cache, cacheKey("prompt-id", s.e.prefix, id.String(), 0))
 	}

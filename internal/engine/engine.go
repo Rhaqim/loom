@@ -56,6 +56,18 @@ type Config struct {
 	// mutated, a long TTL is safe; set a shorter one only if your cache backend
 	// requires eviction.
 	CacheTTL time.Duration
+	// LatestCacheTTL is how long a "latest/active" resolution is cached — the
+	// hot-path reads Latest / LatestActive (and Get / RunTurnBySlug with
+	// version 0) make when running at the current published version rather than
+	// a pinned one. Unlike CacheTTL's targets this pointer is mutable, so it is
+	// evicted on every Create / SetActive; the TTL is only a backstop for an
+	// eviction that cannot reach another engine instance's cache.
+	//
+	// Zero uses the default (5s). A NEGATIVE value disables latest/active
+	// caching while leaving versioned caching on — set it when even seconds of
+	// cross-instance staleness after a publish is unacceptable. Only consulted
+	// when Cache is non-nil.
+	LatestCacheTTL time.Duration
 	// Pricing maps model id → per-million-token price for accurate cost tracking.
 	// Generators report their model on Result metadata ("model"); a model not in
 	// the table falls back to DefaultPrice. Nil disables per-model pricing (the
@@ -91,16 +103,19 @@ func (noopLogger) Error(string, ...any) {}
 
 // Engine is the central object applications interact with.
 type Engine struct {
-	cfg          Config
-	db           *sql.DB
-	prefix       string
-	generators   map[string]Generator
-	hooks        *hookBus
-	log          Logger
-	cache        Cache
-	cacheTTL     time.Duration
-	pricing      map[string]ModelPrice
-	defaultPrice *ModelPrice
+	cfg        Config
+	db         *sql.DB
+	prefix     string
+	generators map[string]Generator
+	hooks      *hookBus
+	log        Logger
+	cache      Cache
+	cacheTTL   time.Duration
+	// latestCacheTTL is the resolved TTL for mutable latest/active pointers.
+	// A negative value means latest/active caching is disabled.
+	latestCacheTTL time.Duration
+	pricing        map[string]ModelPrice
+	defaultPrice   *ModelPrice
 
 	agents          *agentService
 	prompts         *promptService
@@ -157,20 +172,27 @@ func New(cfg Config) (*Engine, error) {
 	if cacheTTL <= 0 {
 		cacheTTL = defaultCacheTTL
 	}
+	// Zero means "use the default"; a negative value is preserved as the
+	// disable signal (see cachedLatest).
+	latestCacheTTL := cfg.LatestCacheTTL
+	if latestCacheTTL == 0 {
+		latestCacheTTL = defaultLatestCacheTTL
+	}
 	gens := make(map[string]Generator)
 	maps.Copy(gens, cfg.Generators)
 
 	e := &Engine{
-		cfg:          cfg,
-		db:           cfg.DB,
-		prefix:       prefix,
-		generators:   gens,
-		cache:        cfg.Cache,
-		cacheTTL:     cacheTTL,
-		hooks:        newHookBus(),
-		log:          log,
-		pricing:      cfg.Pricing,
-		defaultPrice: cfg.DefaultPrice,
+		cfg:            cfg,
+		db:             cfg.DB,
+		prefix:         prefix,
+		generators:     gens,
+		cache:          cfg.Cache,
+		cacheTTL:       cacheTTL,
+		latestCacheTTL: latestCacheTTL,
+		hooks:          newHookBus(),
+		log:            log,
+		pricing:        cfg.Pricing,
+		defaultPrice:   cfg.DefaultPrice,
 	}
 
 	e.prompts = &promptService{e: e}

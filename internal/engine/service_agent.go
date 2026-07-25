@@ -35,7 +35,13 @@ func (s *agentService) Get(ctx context.Context, owner, slug string, version int)
 }
 
 func (s *agentService) Latest(ctx context.Context, owner, slug string) (*Agent, error) {
-	return queryAgentLatest(ctx, s.e.db, s.e.prefix, owner, slug)
+	// Latest is a mutable pointer (Create moves it), so it uses the short latest
+	// TTL and is evicted on Create — unlike the version-pinned Get above, which
+	// caches immutably.
+	key := cacheKeyOwnedLatest("agent-latest", s.e.prefix, owner, slug)
+	return cachedLatest(ctx, s.e, key, func() (*Agent, error) {
+		return queryAgentLatest(ctx, s.e.db, s.e.prefix, owner, slug)
+	})
 }
 
 // GetByID is deliberately not owner-scoped — see AgentRegistry.GetByID.
@@ -59,7 +65,13 @@ func (s *agentService) Create(ctx context.Context, a *Agent) error {
 	if a.CreatedAt.IsZero() {
 		a.CreatedAt = time.Now()
 	}
-	return insertAgent(ctx, s.e.db, s.e.prefix, a)
+	if err := insertAgent(ctx, s.e.db, s.e.prefix, a); err != nil {
+		return err
+	}
+	// A new version may be the newest, so the cached "latest" pointer for this
+	// owner+slug is now potentially stale — evict it.
+	cacheDelete(ctx, s.e.cache, cacheKeyOwnedLatest("agent-latest", s.e.prefix, a.Owner, a.Slug))
+	return nil
 }
 
 func (s *agentService) List(ctx context.Context, owner, category string) ([]*Agent, error) {
@@ -85,6 +97,8 @@ func (s *agentService) Delete(ctx context.Context, owner, slug string, version i
 		return err
 	}
 	cacheDelete(ctx, s.e.cache, cacheKeyOwned("agent", s.e.prefix, owner, slug, version))
+	// Deleting the newest version moves the latest pointer, so evict it too.
+	cacheDelete(ctx, s.e.cache, cacheKeyOwnedLatest("agent-latest", s.e.prefix, owner, slug))
 	if id != uuid.Nil {
 		cacheDelete(ctx, s.e.cache, cacheKey("agent-id", s.e.prefix, id.String(), 0))
 	}

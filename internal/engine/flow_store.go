@@ -130,7 +130,14 @@ func (s *flowService) Create(ctx context.Context, r *FlowRecord) error {
 	for i := range r.Agents {
 		r.Agents[i].Position = i
 	}
-	return sqlInsertFlow(ctx, s.e.db, s.e.prefix, r)
+	if err := sqlInsertFlow(ctx, s.e.db, s.e.prefix, r); err != nil {
+		return err
+	}
+	// An active new version can become the latest-active, so evict the pointer.
+	// A draft (IsActive false) does not move it, but evicting anyway is cheap
+	// and keeps the rule "any write to this slug evicts" simple.
+	cacheDelete(ctx, s.e.cache, cacheKeyOwnedLatest("flow-active", s.e.prefix, r.Owner, r.Slug))
+	return nil
 }
 
 func (s *flowService) Get(ctx context.Context, owner, slug string, version int) (*FlowRecord, error) {
@@ -150,14 +157,26 @@ func (s *flowService) Latest(ctx context.Context, owner, slug string) (*FlowReco
 }
 
 func (s *flowService) LatestActive(ctx context.Context, owner, slug string) (*FlowRecord, error) {
-	return sqlQueryFlowLatestActive(ctx, s.e.db, s.e.prefix, owner, slug)
+	// Flows are otherwise uncached; the serving resolver (also what version 0
+	// and RunTurnBySlug use) is the hot read, so it caches the active pointer
+	// under the short latest TTL, evicted on SetActive / Create / Delete.
+	key := cacheKeyOwnedLatest("flow-active", s.e.prefix, owner, slug)
+	return cachedLatest(ctx, s.e, key, func() (*FlowRecord, error) {
+		return sqlQueryFlowLatestActive(ctx, s.e.db, s.e.prefix, owner, slug)
+	})
 }
 
 func (s *flowService) SetActive(ctx context.Context, owner, slug string, version int) error {
 	if version < 1 {
 		return fmt.Errorf("loom: set active flow %q: an explicit version >= 1 is required", slug)
 	}
-	return sqlSetFlowActive(ctx, s.e.db, s.e.prefix, owner, slug, version)
+	if err := sqlSetFlowActive(ctx, s.e.db, s.e.prefix, owner, slug, version); err != nil {
+		return err
+	}
+	// SetActive is the publish/rollback pointer move, so the cached active
+	// resolution is now stale by definition — evict it.
+	cacheDelete(ctx, s.e.cache, cacheKeyOwnedLatest("flow-active", s.e.prefix, owner, slug))
+	return nil
 }
 
 func (s *flowService) List(ctx context.Context, owner, category string) ([]*FlowRecord, error) {
@@ -168,7 +187,12 @@ func (s *flowService) Delete(ctx context.Context, owner, slug string, version in
 	if version < 1 {
 		return fmt.Errorf("loom: delete flow %q: an explicit version >= 1 is required", slug)
 	}
-	return sqlDeleteFlow(ctx, s.e.db, s.e.prefix, owner, slug, version)
+	if err := sqlDeleteFlow(ctx, s.e.db, s.e.prefix, owner, slug, version); err != nil {
+		return err
+	}
+	// Deleting the active version moves the pointer, so evict it.
+	cacheDelete(ctx, s.e.cache, cacheKeyOwnedLatest("flow-active", s.e.prefix, owner, slug))
+	return nil
 }
 
 // RunTurnBySlug loads a persisted flow (owner/slug/version; version 0 = latest)

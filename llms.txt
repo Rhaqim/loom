@@ -359,6 +359,21 @@ loom.New(loom.Config{ /* ... */ Cache: loom.NewInProcessCache(), CacheTTL: 24 * 
 `Cache` is an interface — back it with Redis/etc. `CacheTTL` 0 uses the 24h default. Nil Cache
 disables caching (every RunStep hits the DB).
 
+The cache covers BOTH shapes of read:
+- **Version-pinned** records (`Get(owner, slug, concreteVersion)`, `GetByID`) — immutable, so
+  cached for `CacheTTL`.
+- **Latest/active pointers** (`Agents().Latest`, `Prompts().Latest`, `Flows().LatestActive`,
+  and `Get`/`RunTurnBySlug` with `version 0`) — the reads an embedder running "at latest"
+  actually makes. These are mutable, so they cache for the short `LatestCacheTTL` (default 5s)
+  and are **evicted on every write** to that slug (`Create`, `Flows().SetActive`, `Delete`).
+
+`LatestCacheTTL` 0 uses the 5s default; a NEGATIVE value disables latest/active caching while
+keeping version-pinned caching. Eviction is in-process, so on a single instance a publish takes
+effect immediately; across MULTIPLE engine instances sharing a cache, another instance's copy
+is only bounded by `LatestCacheTTL` — lower it (or go negative) if seconds of post-publish
+staleness is unacceptable. Every latest key includes the owner, so one tenant's latest is never
+served to another.
+
 ## Shutdown (`Engine.Close`)
 
 The engine owns background work — the async poller started by `StartPoller` — so shut it down
