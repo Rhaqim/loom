@@ -674,6 +674,19 @@ var ErrDuplicateSlug = engine.ErrDuplicateSlug
 // write would clobber theirs (optimistic-concurrency conflict).
 var ErrSessionConflict = engine.ErrSessionConflict
 
+// ErrMissingVariables is returned by RunStep when the user template's prompt
+// declares required input variables (Prompt.Variables) and one or more were not
+// supplied in StepRequest.Inputs. The wrapped message lists the missing names.
+// A prompt that declares no variables never triggers this.
+var ErrMissingVariables = engine.ErrMissingVariables
+
+// ErrFlowInvalid is returned by Flows().Validate (and Create's self-contained
+// checks) when a flow's variable wiring is inconsistent — a duplicate producer,
+// a consumed variable with no producer, or (until layered execution lands) a
+// cross-follower dependency. Wrapped errors describe each problem; several may
+// be joined so an author sees all of them at once.
+var ErrFlowInvalid = engine.ErrFlowInvalid
+
 // ErrSessionPinned is returned by Purge when the target session is pinned.
 // Pinning marks data as protected, so an irreversible delete requires the
 // explicit ForcePurge instead.

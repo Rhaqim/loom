@@ -108,6 +108,7 @@ func postgresStatements(p string) []string {
 			version     INT NOT NULL,
 			category    TEXT NOT NULL DEFAULT '',
 			is_active   INT NOT NULL DEFAULT 1,
+			inputs      JSONB NOT NULL DEFAULT '[]',
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE (owner, slug, version)
 		)`, p),
@@ -354,6 +355,7 @@ func sqliteStatements(p string) []string {
 			version     INTEGER NOT NULL,
 			category    TEXT NOT NULL DEFAULT '',
 			is_active   INTEGER NOT NULL DEFAULT 1,
+			inputs      TEXT NOT NULL DEFAULT '[]',
 			created_at  DATETIME NOT NULL,
 			UNIQUE (owner, slug, version)
 		)`, p),

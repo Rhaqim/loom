@@ -416,7 +416,7 @@ func (s *stepService) buildGenerateRequest(
 	// Load system prompt — cached by UUID.
 	systemPrompt := ""
 	if agent.SystemPromptID != uuid.Nil {
-		spKey := cacheKey("prompt-id", s.e.prefix, agent.SystemPromptID.String(), 0)
+		spKey := s.e.cacheKey("prompt-id", agent.SystemPromptID.String(), 0)
 		var sp *Prompt
 		if cached, ok := cacheGet[Prompt](ctx, s.e.cache, spKey); ok {
 			sp = cached
@@ -445,7 +445,7 @@ func (s *stepService) buildGenerateRequest(
 	// Load and render user template — cached by UUID.
 	userPrompt := ""
 	if agent.UserTemplateID != uuid.Nil {
-		utKey := cacheKey("prompt-id", s.e.prefix, agent.UserTemplateID.String(), 0)
+		utKey := s.e.cacheKey("prompt-id", agent.UserTemplateID.String(), 0)
 		var ut *Prompt
 		if cached, ok := cacheGet[Prompt](ctx, s.e.cache, utKey); ok {
 			ut = cached
@@ -461,7 +461,7 @@ func (s *stepService) buildGenerateRequest(
 		// appending to session.History / writing session.State right now.
 		var err error
 		s.e.mu.RLock()
-		userPrompt, err = renderTemplate(ut.Body, session, action, req.Inputs, req.Params)
+		userPrompt, err = renderTemplate(ut.Body, session, action, req.Inputs, req.Params, ut.Variables)
 		s.e.mu.RUnlock()
 		if err != nil {
 			return GenerateRequest{}, fmt.Errorf("render user template: %w", err)

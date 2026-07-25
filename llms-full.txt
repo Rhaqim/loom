@@ -121,6 +121,13 @@ input), `{{.Vars.x}}` (session `State.Vars`), `{{.Inputs.x}}` (per-step inputs /
 lead output), `{{.Params.x}}` (tuning knobs), and a minimal `{{.Session}}` view
 (ID/PlatformID/Tags/State — NOT Metadata or History). `{{template}}`/`{{define}}` are rejected.
 
+A user-template `Prompt` may declare required inputs in `Prompt.Variables []string`. When
+non-empty, `RunStep` rejects a step whose `StepRequest.Inputs` omits any declared name with
+`loom.ErrMissingVariables` (naming the missing ones) rather than rendering it empty and sending
+the model a malformed prompt. A key present with any value — including `nil` or `""` — counts as
+supplied; only an ABSENT key fails. Declaring nothing enforces nothing, so it is opt-in per
+prompt and existing prompts are unaffected.
+
 ## Actions (user input into a step)
 
 `loom.Action{Kind, Payload, Metadata}`. Kinds and typical payloads:
@@ -357,7 +364,24 @@ Agents/prompts are immutable, so a read-through cache in front of the DB is safe
 loom.New(loom.Config{ /* ... */ Cache: loom.NewInProcessCache(), CacheTTL: 24 * time.Hour })
 ```
 `Cache` is an interface — back it with Redis/etc. `CacheTTL` 0 uses the 24h default. Nil Cache
-disables caching (every RunStep hits the DB).
+disables caching (every RunStep hits the DB). If the `Cache` is shared with the application's
+own keys, set `Config.CacheKeyPrefix` (default `"loom"`) to namespace loom's entries and avoid
+collisions — e.g. `CacheKeyPrefix: "myapp:loom"`.
+
+The cache covers BOTH shapes of read:
+- **Version-pinned** records (`Get(owner, slug, concreteVersion)`, `GetByID`) — immutable, so
+  cached for `CacheTTL`.
+- **Latest/active pointers** (`Agents().Latest`, `Prompts().Latest`, `Flows().LatestActive`,
+  and `Get`/`RunTurnBySlug` with `version 0`) — the reads an embedder running "at latest"
+  actually makes. These are mutable, so they cache for the short `LatestCacheTTL` (default 5s)
+  and are **evicted on every write** to that slug (`Create`, `Flows().SetActive`, `Delete`).
+
+`LatestCacheTTL` 0 uses the 5s default; a NEGATIVE value disables latest/active caching while
+keeping version-pinned caching. Eviction is in-process, so on a single instance a publish takes
+effect immediately; across MULTIPLE engine instances sharing a cache, another instance's copy
+is only bounded by `LatestCacheTTL` — lower it (or go negative) if seconds of post-publish
+staleness is unacceptable. Every latest key includes the owner, so one tenant's latest is never
+served to another.
 
 ## Shutdown (`Engine.Close`)
 
@@ -545,6 +569,28 @@ inactive version still fails with "not active" — that is a caller mistake, not
 several versions are active (the default, since `Create` does not deactivate siblings) the
 highest wins, which is the historical behaviour.
 
+### Validating a flow's variable wiring
+
+A flow's agents can declare data dependencies by variable name: an agent *produces* under its
+`FlowAgent.OutputKey` and *consumes* the inputs its user-template `Prompt.Variables` declares.
+`FlowRecord.Inputs []string` names the variables the flow expects to receive at `RunTurn` time
+(as opposed to being produced by an agent).
+
+`Flows().Validate(ctx, *FlowRecord)` checks that wiring against the current registry WITHOUT
+persisting — call it in an editor before `Create`. It returns `loom.ErrFlowInvalid` (joining
+every problem) when a consumed variable has no producer, a producer name is duplicated, or a
+referenced agent is missing. `Create` runs the self-contained subset (duplicate/colliding
+producer names) automatically; a flow that declares no variables passes trivially, so this is a
+no-op for flows that don't opt into wiring.
+
+Execution is dependency-**layered**: a follower whose template consumes another follower's
+`OutputKey` runs after that producer and receives its output; followers within a layer run
+concurrently, and a flow with no cross-follower dependencies is a single layer (the historical
+all-concurrent fan-out). So a follower may consume the lead, a declared input, OR another
+follower — as long as the follower graph is acyclic. `Validate` rejects a cycle at publish time
+(and the lead, which runs first, may consume only declared inputs). Design and rationale:
+`28-Variable-Producer-Consumer.md`.
+
 ## Schema & migrations (IMPORTANT gotcha)
 
 `schema.NewLoader(dialect).Apply(ctx, db)` creates tables on a fresh DB and runs ordered
@@ -574,6 +620,9 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
 - "Per-user API keys / model routing" → pass `StepRequest.Overrides{"api_key":..., "model":...}`
   and read them in a custom generator; built-in openai/anthropic honor `Overrides["base_url"]`
   ONLY if the URL is allowlisted via `WithAllowedBaseURLs(...)` (security: prevents key exfil).
+- "Require a template's inputs / catch a missing variable" → set `Prompt.Variables` to the
+  input names it needs; a step missing one fails with `ErrMissingVariables` instead of rendering
+  empty.
 - "Force JSON output" → attach a `ResponseFormat` (via a reusable `ResponseFormatRecord` or an
   inline schema on the agent) and register `loom.SchemaValidationPostHook()`.
 - "Stream to a client" → set `StepRequest.OnChunk` (or `TurnRequest.OnChunk` for a turn's lead).
@@ -669,6 +718,13 @@ var ErrDuplicateSlug = errors.New("loom: duplicate slug+version")
     ErrDuplicateSlug is returned when an agent or prompt slug+version already
     exists.
 
+var ErrFlowInvalid = errors.New("loom: invalid flow")
+    ErrFlowInvalid is returned by Flows().Validate (and Create's self-contained
+    checks) when a flow's variable wiring is inconsistent — a duplicate
+    producer, a consumed variable with no producer, or (until layered execution
+    lands) a cross-follower dependency. Wrapped errors describe each problem;
+    several may be joined so an author sees all of them at once.
+
 var ErrGeneratorNotRegistered = errors.New("loom: generator not registered")
     ErrGeneratorNotRegistered is returned when a step references a generator
     slug that was never registered with the engine. Wrapped errors name the
@@ -677,6 +733,12 @@ var ErrGeneratorNotRegistered = errors.New("loom: generator not registered")
 var ErrInvalidConfig = errors.New("loom: invalid config")
     ErrInvalidConfig is returned by New when the Config is missing a required
     field or is otherwise unusable. Wrapped errors carry the specific reason.
+
+var ErrMissingVariables = errors.New("loom: missing required template variables")
+    ErrMissingVariables is returned by RunStep when the user template's prompt
+    declares required input variables (Prompt.Variables) and one or more were
+    not supplied in StepRequest.Inputs. The wrapped message lists the missing
+    names. A prompt that declares no variables never triggers this.
 
 var ErrNotFound = errors.New("loom: not found")
     ErrNotFound is returned when a requested entity does not exist. Errors from
@@ -1079,11 +1141,29 @@ type Config struct {
 	// cache, or supply any implementation of the Cache interface (Redis, etc.).
 	// A nil Cache disables caching — every RunStep hits the database directly.
 	Cache Cache
+	// CacheKeyPrefix is the leading namespace on every cache key loom writes
+	// (default "loom"). Set it when the Cache is shared with the application's
+	// own keys so loom's entries cannot collide with theirs — e.g. "myapp:loom".
+	// The schema prefix is always appended after it, so distinct engines stay
+	// distinct regardless.
+	CacheKeyPrefix string
 	// CacheTTL is how long cached immutable objects (agents, prompts) live.
 	// Zero uses the default (24h). Since these records are versioned and never
 	// mutated, a long TTL is safe; set a shorter one only if your cache backend
 	// requires eviction.
 	CacheTTL time.Duration
+	// LatestCacheTTL is how long a "latest/active" resolution is cached — the
+	// hot-path reads Latest / LatestActive (and Get / RunTurnBySlug with
+	// version 0) make when running at the current published version rather than
+	// a pinned one. Unlike CacheTTL's targets this pointer is mutable, so it is
+	// evicted on every Create / SetActive; the TTL is only a backstop for an
+	// eviction that cannot reach another engine instance's cache.
+	//
+	// Zero uses the default (5s). A NEGATIVE value disables latest/active
+	// caching while leaving versioned caching on — set it when even seconds of
+	// cross-instance staleness after a publish is unacceptable. Only consulted
+	// when Cache is non-nil.
+	LatestCacheTTL time.Duration
 	// Pricing maps model id → per-million-token price for accurate cost tracking.
 	// Generators report their model on Result metadata ("model"); a model not in
 	// the table falls back to DefaultPrice. Nil disables per-model pricing (the
@@ -1284,10 +1364,19 @@ func (e *Engine) RunStep(ctx context.Context, session *Session, req StepRequest)
 func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest) (*Turn, error)
     RunTurn executes a Flow against a session: it runs the lead agent
     (optionally streaming), injects the lead's text output into the shared
-    Inputs, then runs all follower agents concurrently. Every resulting step
-    is persisted and tagged with the same turn ID. A follower failure does
-    not abort the turn — its error is recorded on the Turn but siblings still
-    complete.
+    Inputs, then runs the follower agents. Every resulting step is persisted and
+    tagged with the same turn ID. A follower failure does not abort the turn —
+    its error is recorded on the Turn but siblings still complete.
+
+    Followers run in dependency LAYERS: a follower that consumes another
+    follower's output (its user template declares the sibling's OutputKey in
+    Prompt.Variables) runs in a later layer, after that producer, and receives
+    its output under the producer's OutputKey. Followers within a layer run
+    concurrently, and a flow with no cross-follower dependencies is a single
+    layer — identical to the historical all-concurrent fan-out. Validate the
+    wiring with Flows().Validate; a dependency cycle is rejected there, and if
+    an in-code flow still contains one, the cyclic followers run last and fail
+    on their missing input rather than deadlocking.
 
     A non-nil error means the lead step failed; it is the lead's RunStep error
     (see RunStep for the error contract) wrapped with the turn and agent slug.
@@ -1393,12 +1482,18 @@ type FlowAgentEntry struct {
     FlowAgentEntry is one agent's slot in a persisted flow.
 
 type FlowRecord struct {
-	ID        uuid.UUID
-	Owner     string // opaque app-owned scope; "" = global
-	Slug      string
-	Version   int
-	Category  string
-	IsActive  bool
+	ID       uuid.UUID
+	Owner    string // opaque app-owned scope; "" = global
+	Slug     string
+	Version  int
+	Category string
+	IsActive bool
+	// Inputs names the variables this flow expects to be supplied at RunTurn
+	// time (via TurnRequest.Inputs), as opposed to being produced by an agent
+	// in the flow. Validate treats these as external producers: an agent
+	// consuming one of these needs no in-flow producer for it. Optional; a flow
+	// that declares nothing is unaffected.
+	Inputs    []string
 	Agents    []FlowAgentEntry // ordered; index 0 is the lead
 	CreatedAt time.Time
 }
@@ -1437,6 +1532,19 @@ type FlowRegistry interface {
 	// agent entries — a lightweight index for an editor.
 	List(ctx context.Context, owner, category string) ([]*FlowRecord, error)
 	Delete(ctx context.Context, owner, slug string, version int) error
+	// Validate checks a flow's variable wiring against the current registry
+	// state WITHOUT persisting anything, so an editor can call it before Create.
+	//
+	// It resolves each agent's declared input variables (its user template's
+	// Prompt.Variables) and confirms every one is satisfiable, then checks that
+	// producer names are unique. Returns nil when the wiring is sound, or an
+	// ErrFlowInvalid joining every problem found (dangling variable, duplicate
+	// producer, unknown referenced agent). Create runs the self-contained subset
+	// of these checks; Validate runs the full resolving check.
+	//
+	// A flow whose agents declare no input variables passes trivially, so this
+	// is a no-op for flows that do not opt into wiring.
+	Validate(ctx context.Context, r *FlowRecord) error
 }
     FlowRegistry resolves and manages persisted flows (agent maps). owner is an
     opaque scope ("" = global). On Get/Latest, version 0 resolves to the latest
@@ -1716,14 +1824,20 @@ type PreHook func(ctx context.Context, req *StepRequest) error
     (return ErrSkip), or annotate the state. Hooks run in registration order.
 
 type Prompt struct {
-	ID        uuid.UUID
-	Slug      string // human-readable identifier, e.g. "opening-author"
-	Owner     string // opaque app-owned scope ("" = global)
-	Version   int    // monotonically increasing; editing creates a new version
-	Kind      PromptKind
-	Category  string   // platform-defined grouping
-	Body      string   // raw template text
-	Variables []string // documented input variable names
+	ID       uuid.UUID
+	Slug     string // human-readable identifier, e.g. "opening-author"
+	Owner    string // opaque app-owned scope ("" = global)
+	Version  int    // monotonically increasing; editing creates a new version
+	Kind     PromptKind
+	Category string // platform-defined grouping
+	Body     string // raw template text
+	// Variables declares the input variable names this template REQUIRES. When
+	// non-empty, RunStep rejects a step whose StepRequest.Inputs is missing any
+	// of them with ErrMissingVariables, instead of rendering the missing input
+	// as empty and sending the model a malformed prompt. Empty (the default)
+	// enforces nothing, so existing prompts are unaffected. Only meaningful on a
+	// user template — a system prompt is used verbatim and interpolates no inputs.
+	Variables []string
 	Metadata  map[string]any
 	CreatedAt time.Time
 	Notes     string // design rationale, change notes

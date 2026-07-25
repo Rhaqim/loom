@@ -12,14 +12,20 @@ import (
 
 // Prompt is a versioned, categorized text template stored in the database.
 type Prompt struct {
-	ID        uuid.UUID
-	Slug      string // human-readable identifier, e.g. "opening-author"
-	Owner     string // opaque app-owned scope ("" = global)
-	Version   int    // monotonically increasing; editing creates a new version
-	Kind      PromptKind
-	Category  string   // platform-defined grouping
-	Body      string   // raw template text
-	Variables []string // documented input variable names
+	ID       uuid.UUID
+	Slug     string // human-readable identifier, e.g. "opening-author"
+	Owner    string // opaque app-owned scope ("" = global)
+	Version  int    // monotonically increasing; editing creates a new version
+	Kind     PromptKind
+	Category string // platform-defined grouping
+	Body     string // raw template text
+	// Variables declares the input variable names this template REQUIRES. When
+	// non-empty, RunStep rejects a step whose StepRequest.Inputs is missing any
+	// of them with ErrMissingVariables, instead of rendering the missing input
+	// as empty and sending the model a malformed prompt. Empty (the default)
+	// enforces nothing, so existing prompts are unaffected. Only meaningful on a
+	// user template — a system prompt is used verbatim and interpolates no inputs.
+	Variables []string
 	Metadata  map[string]any
 	CreatedAt time.Time
 	Notes     string // design rationale, change notes

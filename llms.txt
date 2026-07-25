@@ -121,6 +121,13 @@ input), `{{.Vars.x}}` (session `State.Vars`), `{{.Inputs.x}}` (per-step inputs /
 lead output), `{{.Params.x}}` (tuning knobs), and a minimal `{{.Session}}` view
 (ID/PlatformID/Tags/State — NOT Metadata or History). `{{template}}`/`{{define}}` are rejected.
 
+A user-template `Prompt` may declare required inputs in `Prompt.Variables []string`. When
+non-empty, `RunStep` rejects a step whose `StepRequest.Inputs` omits any declared name with
+`loom.ErrMissingVariables` (naming the missing ones) rather than rendering it empty and sending
+the model a malformed prompt. A key present with any value — including `nil` or `""` — counts as
+supplied; only an ABSENT key fails. Declaring nothing enforces nothing, so it is opt-in per
+prompt and existing prompts are unaffected.
+
 ## Actions (user input into a step)
 
 `loom.Action{Kind, Payload, Metadata}`. Kinds and typical payloads:
@@ -357,7 +364,24 @@ Agents/prompts are immutable, so a read-through cache in front of the DB is safe
 loom.New(loom.Config{ /* ... */ Cache: loom.NewInProcessCache(), CacheTTL: 24 * time.Hour })
 ```
 `Cache` is an interface — back it with Redis/etc. `CacheTTL` 0 uses the 24h default. Nil Cache
-disables caching (every RunStep hits the DB).
+disables caching (every RunStep hits the DB). If the `Cache` is shared with the application's
+own keys, set `Config.CacheKeyPrefix` (default `"loom"`) to namespace loom's entries and avoid
+collisions — e.g. `CacheKeyPrefix: "myapp:loom"`.
+
+The cache covers BOTH shapes of read:
+- **Version-pinned** records (`Get(owner, slug, concreteVersion)`, `GetByID`) — immutable, so
+  cached for `CacheTTL`.
+- **Latest/active pointers** (`Agents().Latest`, `Prompts().Latest`, `Flows().LatestActive`,
+  and `Get`/`RunTurnBySlug` with `version 0`) — the reads an embedder running "at latest"
+  actually makes. These are mutable, so they cache for the short `LatestCacheTTL` (default 5s)
+  and are **evicted on every write** to that slug (`Create`, `Flows().SetActive`, `Delete`).
+
+`LatestCacheTTL` 0 uses the 5s default; a NEGATIVE value disables latest/active caching while
+keeping version-pinned caching. Eviction is in-process, so on a single instance a publish takes
+effect immediately; across MULTIPLE engine instances sharing a cache, another instance's copy
+is only bounded by `LatestCacheTTL` — lower it (or go negative) if seconds of post-publish
+staleness is unacceptable. Every latest key includes the owner, so one tenant's latest is never
+served to another.
 
 ## Shutdown (`Engine.Close`)
 
@@ -545,6 +569,28 @@ inactive version still fails with "not active" — that is a caller mistake, not
 several versions are active (the default, since `Create` does not deactivate siblings) the
 highest wins, which is the historical behaviour.
 
+### Validating a flow's variable wiring
+
+A flow's agents can declare data dependencies by variable name: an agent *produces* under its
+`FlowAgent.OutputKey` and *consumes* the inputs its user-template `Prompt.Variables` declares.
+`FlowRecord.Inputs []string` names the variables the flow expects to receive at `RunTurn` time
+(as opposed to being produced by an agent).
+
+`Flows().Validate(ctx, *FlowRecord)` checks that wiring against the current registry WITHOUT
+persisting — call it in an editor before `Create`. It returns `loom.ErrFlowInvalid` (joining
+every problem) when a consumed variable has no producer, a producer name is duplicated, or a
+referenced agent is missing. `Create` runs the self-contained subset (duplicate/colliding
+producer names) automatically; a flow that declares no variables passes trivially, so this is a
+no-op for flows that don't opt into wiring.
+
+Execution is dependency-**layered**: a follower whose template consumes another follower's
+`OutputKey` runs after that producer and receives its output; followers within a layer run
+concurrently, and a flow with no cross-follower dependencies is a single layer (the historical
+all-concurrent fan-out). So a follower may consume the lead, a declared input, OR another
+follower — as long as the follower graph is acyclic. `Validate` rejects a cycle at publish time
+(and the lead, which runs first, may consume only declared inputs). Design and rationale:
+`28-Variable-Producer-Consumer.md`.
+
 ## Schema & migrations (IMPORTANT gotcha)
 
 `schema.NewLoader(dialect).Apply(ctx, db)` creates tables on a fresh DB and runs ordered
@@ -574,6 +620,9 @@ Set the DSN via `LOOM_DSN` env (preferred), `--dsn-file <path>`, or `--dsn <stri
 - "Per-user API keys / model routing" → pass `StepRequest.Overrides{"api_key":..., "model":...}`
   and read them in a custom generator; built-in openai/anthropic honor `Overrides["base_url"]`
   ONLY if the URL is allowlisted via `WithAllowedBaseURLs(...)` (security: prevents key exfil).
+- "Require a template's inputs / catch a missing variable" → set `Prompt.Variables` to the
+  input names it needs; a step missing one fails with `ErrMissingVariables` instead of rendering
+  empty.
 - "Force JSON output" → attach a `ResponseFormat` (via a reusable `ResponseFormatRecord` or an
   inline schema on the agent) and register `loom.SchemaValidationPostHook()`.
 - "Stream to a client" → set `StepRequest.OnChunk` (or `TurnRequest.OnChunk` for a turn's lead).

@@ -11,7 +11,9 @@ package enginetest
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	loom "github.com/rhaqim/loom"
@@ -338,5 +340,177 @@ func TestHeaderResumeStepIndex_Postgres(t *testing.T) {
 		if _, found, err := e.Sessions().StateAt(ctx, sess.ID, i); err != nil || !found {
 			t.Fatalf("no checkpoint at index %d: found=%v err=%v", i, found, err)
 		}
+	}
+}
+
+// TestLatestCache_Postgres confirms the latest/active pointer cache and its
+// eviction behave on Postgres — the caching is Go-level, but this proves it
+// composes with real registry writes and stays owner-scoped end to end.
+func TestLatestCache_Postgres(t *testing.T) {
+	dsn := os.Getenv("LOOM_DSN")
+	if dsn == "" {
+		t.Skip("LOOM_DSN not set — skipping integration test")
+	}
+	ctx := context.Background()
+	db := openTestDB(t)
+	e, err := loom.New(loom.Config{
+		DB: db, Dialect: loom.DialectPostgres,
+		Generators:     map[string]loom.Generator{"echo": echo.New("[test]")},
+		Cache:          loom.NewInProcessCache(),
+		LatestCacheTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	slug := tenantSlug("lc")
+	if err := e.Agents().Create(ctx, &loom.Agent{
+		Slug: slug, Version: 1, Modal: loom.ModalityText, GeneratorSlug: "echo",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Prime, then insert v2 out-of-band so only a cache hit could still say v1.
+	if got, err := e.Agents().Latest(ctx, "", slug); err != nil || got.Version != 1 {
+		t.Fatalf("Latest = v%d err=%v, want v1", got.Version, err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO loom_agents (slug, owner, version, modality, generator_slug) VALUES ($1,'',2,'text','echo')`,
+		slug); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := e.Agents().Latest(ctx, "", slug); err != nil || got.Version != 1 {
+		t.Fatalf("Latest after out-of-band insert = v%d, want cached v1", got.Version)
+	}
+	// Create v3 through the service evicts; the pointer advances.
+	if err := e.Agents().Create(ctx, &loom.Agent{
+		Slug: slug, Version: 3, Modal: loom.ModalityText, GeneratorSlug: "echo",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := e.Agents().Latest(ctx, "", slug); err != nil || got.Version != 3 {
+		t.Fatalf("Latest after Create(v3) = v%d, want 3 (no eviction)", got.Version)
+	}
+
+	// Owner isolation: a different owner must not resolve via the cached entry.
+	if _, err := e.Agents().Latest(ctx, "other", slug); !errors.Is(err, loom.ErrNotFound) {
+		t.Fatalf("Latest(other) = %v, want ErrNotFound (cache not owner-scoped)", err)
+	}
+}
+
+// TestFlowValidate_Postgres confirms Flow.Inputs persists (migration 8 column)
+// and Flows().Validate resolves each agent's declared variables end to end on
+// Postgres — the wiring the phase-1 producer/consumer work adds.
+func TestFlowValidate_Postgres(t *testing.T) {
+	ctx := context.Background()
+	e := newTestEngine(t)
+
+	leadSlug := tenantSlug("lead")
+	folSlug := tenantSlug("fol")
+
+	// Follower consumes the lead's output; lead consumes an external input.
+	mkAgent := func(slug string, vars []string) {
+		ut := &loom.Prompt{Slug: slug + "-ut", Version: 1, Kind: loom.PromptKindUserTemplate,
+			Body: "x", Variables: vars}
+		if err := e.Prompts().Create(ctx, ut); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Agents().Create(ctx, &loom.Agent{
+			Slug: slug, Version: 1, Modal: loom.ModalityText, GeneratorSlug: "echo",
+			UserTemplateID: ut.ID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkAgent(leadSlug, []string{"topic"})
+	mkAgent(folSlug, []string{"Lead"})
+
+	rec := &loom.FlowRecord{
+		Slug: tenantSlug("flow"), Version: 1, IsActive: true,
+		Inputs: []string{"topic"},
+		Agents: []loom.FlowAgentEntry{
+			{AgentSlug: leadSlug, OutputKey: "Lead"},
+			{AgentSlug: folSlug, OutputKey: "Fol"},
+		},
+	}
+	if err := e.Flows().Validate(ctx, rec); err != nil {
+		t.Fatalf("valid wiring rejected on Postgres: %v", err)
+	}
+	if err := e.Flows().Create(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	// Inputs survive the round-trip through the migration-8 column.
+	got, err := e.Flows().Get(ctx, "", rec.Slug, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Inputs) != 1 || got.Inputs[0] != "topic" {
+		t.Fatalf("Inputs round-trip on Postgres = %v, want [topic]", got.Inputs)
+	}
+
+	// A dangling consumed variable is rejected.
+	bad := &loom.FlowRecord{
+		Slug: tenantSlug("bad"), Version: 1, IsActive: true,
+		Agents: []loom.FlowAgentEntry{{AgentSlug: leadSlug, OutputKey: "Lead"}},
+	}
+	if err := e.Flows().Validate(ctx, bad); !errors.Is(err, loom.ErrFlowInvalid) {
+		t.Fatalf("dangling variable on Postgres: err = %v, want ErrFlowInvalid", err)
+	}
+}
+
+// TestLayeredExecution_Postgres proves a follower that consumes a sibling's
+// output runs after it and receives that output, end to end on Postgres.
+func TestLayeredExecution_Postgres(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	// No-prefix echo so an agent's output is exactly its rendered template.
+	e, err := loom.New(loom.Config{
+		DB: db, Dialect: loom.DialectPostgres,
+		Generators: map[string]loom.Generator{"echo": echo.New("")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leadS := tenantSlug("lead")
+	f1S := tenantSlug("f1")
+	f2S := tenantSlug("f2")
+	mk := func(slug, body string, vars []string) {
+		ut := &loom.Prompt{Slug: slug + "-ut", Version: 1, Kind: loom.PromptKindUserTemplate,
+			Body: body, Variables: vars}
+		if err := e.Prompts().Create(ctx, ut); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Agents().Create(ctx, &loom.Agent{
+			Slug: slug, Version: 1, Modal: loom.ModalityText, GeneratorSlug: "echo",
+			UserTemplateID: ut.ID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(leadS, "LEAD", nil)
+	mk(f1S, "F1OUT", nil)
+	mk(f2S, "{{.Inputs.F1}}", []string{"F1"}) // consumes f1's output
+
+	sess := &loom.Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	flow := loom.Flow{
+		Slug: "t",
+		Lead: loom.FlowAgent{AgentSlug: leadS, OutputKey: "Lead"},
+		Followers: []loom.FlowAgent{
+			{AgentSlug: f1S, OutputKey: "F1"},
+			{AgentSlug: f2S, OutputKey: "F2"},
+		},
+	}
+	turn, err := e.RunTurn(ctx, sess, loom.TurnRequest{Flow: flow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ferr := turn.Errors[f2S]; ferr != nil {
+		t.Fatalf("f2 errored — it did not run after f1 on Postgres: %v", ferr)
+	}
+	if got := loom.ResultText(turn.Followers[f2S].Result); got != "F1OUT" {
+		t.Fatalf("f2 output = %q, want %q (did not receive f1's output)", got, "F1OUT")
 	}
 }

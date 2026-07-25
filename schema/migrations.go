@@ -215,6 +215,22 @@ func migrations() []Migration {
 				return addColumnIfMissing(ctx, tx, d, p+"response_formats", "category", "TEXT NOT NULL DEFAULT ''")
 			},
 		},
+		{
+			// Flows gained an `inputs` column declaring the variables they
+			// receive at RunTurn time, for the variable producer/consumer
+			// wiring (Flows().Validate). The default '[]' reproduces the
+			// prior behaviour — a flow that declares no external inputs — so
+			// existing rows are unaffected. JSONB on Postgres, TEXT on SQLite.
+			Version: 8,
+			Name:    "flow-inputs",
+			Up: func(ctx context.Context, tx *sql.Tx, p string, d Dialect) error {
+				def := "JSONB NOT NULL DEFAULT '[]'"
+				if d == DialectSQLite {
+					def = "TEXT NOT NULL DEFAULT '[]'"
+				}
+				return addColumnIfMissing(ctx, tx, d, p+"flows", "inputs", def)
+			},
+		},
 	}
 }
 

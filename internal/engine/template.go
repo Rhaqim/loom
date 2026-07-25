@@ -51,9 +51,17 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 // and any panic during execution are all bounded: a hostile or malformed
 // template (e.g. one that recurses via {{template}} into a stack overflow, or
 // expands without bound) degrades to an error rather than crashing the process.
-func renderTemplate(body string, session *Session, action *Action, inputs, params map[string]any) (out string, err error) {
+func renderTemplate(body string, session *Session, action *Action, inputs, params map[string]any, declared []string) (out string, err error) {
 	if len(body) > maxTemplateBodyBytes {
 		return "", fmt.Errorf("loom: template body exceeds %d bytes", maxTemplateBodyBytes)
+	}
+	// A prompt that declares required input variables must have every one of
+	// them supplied before it renders. Without this a template referencing an
+	// input the caller forgot (or misspelled) renders it as empty and the model
+	// silently receives a malformed prompt. Declaring nothing keeps the old
+	// behaviour exactly, so this is opt-in per prompt.
+	if missing := missingVars(declared, inputs); len(missing) > 0 {
+		return "", fmt.Errorf("%w: %v", ErrMissingVariables, missing)
 	}
 	// text/template executes with the caller's stack; a self-recursive template
 	// definition can overflow it. Recover so one bad template cannot take down
@@ -101,6 +109,24 @@ func renderTemplate(body string, session *Session, action *Action, inputs, param
 // treeHasTemplateInvocation reports whether the parse tree contains a
 // {{template}} action, which (via self- or mutual-invocation) is the vector for
 // unbounded template recursion.
+// missingVars returns the declared variable names that are absent from inputs,
+// in declaration order. A name is satisfied by being a key in inputs (any
+// value, including nil or ""): a caller that supplies the key has made a
+// deliberate choice, whereas an absent key is the forgotten/misspelled case
+// this guards against. Returns nil when nothing is declared or all are present.
+func missingVars(declared []string, inputs map[string]any) []string {
+	if len(declared) == 0 {
+		return nil
+	}
+	var missing []string
+	for _, name := range declared {
+		if _, ok := inputs[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
 func treeHasTemplateInvocation(t *parse.Tree) bool {
 	if t == nil || t.Root == nil {
 		return false

@@ -90,7 +90,7 @@ func (s *responseFormatService) Get(ctx context.Context, owner, slug string, ver
 	if version == 0 {
 		return s.Latest(ctx, owner, slug)
 	}
-	key := cacheKeyOwned("rf", s.e.prefix, owner, slug, version)
+	key := s.e.cacheKeyOwned("rf", owner, slug, version)
 	if r, ok := cacheGet[ResponseFormatRecord](ctx, s.e.cache, key); ok {
 		return r, nil
 	}
@@ -109,7 +109,7 @@ func (s *responseFormatService) Latest(ctx context.Context, owner, slug string) 
 
 // GetByID is deliberately not owner-scoped — see ResponseFormatRegistry.GetByID.
 func (s *responseFormatService) GetByID(ctx context.Context, id uuid.UUID) (*ResponseFormatRecord, error) {
-	key := cacheKey("rf-id", s.e.prefix, id.String(), 0)
+	key := s.e.cacheKey("rf-id", id.String(), 0)
 	if r, ok := cacheGet[ResponseFormatRecord](ctx, s.e.cache, key); ok {
 		return r, nil
 	}
@@ -140,9 +140,9 @@ func (s *responseFormatService) Delete(ctx context.Context, owner, slug string, 
 	if err := sqlDeleteResponseFormat(ctx, s.e.db, s.e.prefix, owner, slug, version); err != nil {
 		return err
 	}
-	cacheDelete(ctx, s.e.cache, cacheKeyOwned("rf", s.e.prefix, owner, slug, version))
+	cacheDelete(ctx, s.e.cache, s.e.cacheKeyOwned("rf", owner, slug, version))
 	if id != uuid.Nil {
-		cacheDelete(ctx, s.e.cache, cacheKey("rf-id", s.e.prefix, id.String(), 0))
+		cacheDelete(ctx, s.e.cache, s.e.cacheKey("rf-id", id.String(), 0))
 	}
 	return nil
 }
