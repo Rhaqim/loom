@@ -456,3 +456,61 @@ func TestFlowValidate_Postgres(t *testing.T) {
 		t.Fatalf("dangling variable on Postgres: err = %v, want ErrFlowInvalid", err)
 	}
 }
+
+// TestLayeredExecution_Postgres proves a follower that consumes a sibling's
+// output runs after it and receives that output, end to end on Postgres.
+func TestLayeredExecution_Postgres(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	// No-prefix echo so an agent's output is exactly its rendered template.
+	e, err := loom.New(loom.Config{
+		DB: db, Dialect: loom.DialectPostgres,
+		Generators: map[string]loom.Generator{"echo": echo.New("")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leadS := tenantSlug("lead")
+	f1S := tenantSlug("f1")
+	f2S := tenantSlug("f2")
+	mk := func(slug, body string, vars []string) {
+		ut := &loom.Prompt{Slug: slug + "-ut", Version: 1, Kind: loom.PromptKindUserTemplate,
+			Body: body, Variables: vars}
+		if err := e.Prompts().Create(ctx, ut); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Agents().Create(ctx, &loom.Agent{
+			Slug: slug, Version: 1, Modal: loom.ModalityText, GeneratorSlug: "echo",
+			UserTemplateID: ut.ID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(leadS, "LEAD", nil)
+	mk(f1S, "F1OUT", nil)
+	mk(f2S, "{{.Inputs.F1}}", []string{"F1"}) // consumes f1's output
+
+	sess := &loom.Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	flow := loom.Flow{
+		Slug: "t",
+		Lead: loom.FlowAgent{AgentSlug: leadS, OutputKey: "Lead"},
+		Followers: []loom.FlowAgent{
+			{AgentSlug: f1S, OutputKey: "F1"},
+			{AgentSlug: f2S, OutputKey: "F2"},
+		},
+	}
+	turn, err := e.RunTurn(ctx, sess, loom.TurnRequest{Flow: flow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ferr := turn.Errors[f2S]; ferr != nil {
+		t.Fatalf("f2 errored — it did not run after f1 on Postgres: %v", ferr)
+	}
+	if got := loom.ResultText(turn.Followers[f2S].Result); got != "F1OUT" {
+		t.Fatalf("f2 output = %q, want %q (did not receive f1's output)", got, "F1OUT")
+	}
+}

@@ -278,14 +278,21 @@ func (s *flowService) Validate(ctx context.Context, r *FlowRecord) error {
 	}
 	leadKey := leadOutputKey(r.Agents[0])
 
-	// The set of names produced only by a follower — used to give a precise
-	// message when a consumer depends on a sibling, which layered execution does
-	// not run yet (see 28-Variable-Producer-Consumer.md, phase 2).
+	// Names a follower produces — a valid source for another follower, since
+	// layered execution runs a producer before its consumer (acyclicity is
+	// checked below). The lead cannot consume a follower (it runs first).
 	followerProduces := map[string]bool{}
 	for _, e := range r.Agents[1:] {
 		if e.OutputKey != "" {
 			followerProduces[e.OutputKey] = true
 		}
+	}
+
+	followers := r.Agents[1:]
+	followerConsumed := make([][]string, len(followers))
+	followerKeys := make([]string, len(followers))
+	for i, e := range followers {
+		followerKeys[i] = e.OutputKey
 	}
 
 	for i, e := range r.Agents {
@@ -295,18 +302,23 @@ func (s *flowService) Validate(ctx context.Context, r *FlowRecord) error {
 			errs = append(errs, err)
 			continue
 		}
+		if !isLead {
+			followerConsumed[i-1] = consumed
+		}
 		for _, name := range consumed {
 			switch {
 			case external[name]:
 				// Supplied at RunTurn time.
 			case !isLead && name == leadKey:
 				// A follower may read the lead's output.
-			case followerProduces[name]:
-				// Produced, but only by a sibling follower. The lead cannot
-				// consume a follower at all; a follower consuming another
-				// follower needs layered execution, which is not enabled yet.
+			case !isLead && followerProduces[name]:
+				// A follower consuming a sibling — valid; ordering handled by
+				// layered execution, cycles caught below.
+			case isLead && (name == leadKey || followerProduces[name]):
+				// The lead runs first: it cannot consume its own output or a
+				// follower's.
 				errs = append(errs, fmt.Errorf(
-					"agent %q consumes %q, produced only by a follower — cross-follower wiring is not executed yet (phase 2)",
+					"lead agent %q consumes %q, but the lead runs first and can read only declared flow inputs",
 					e.AgentSlug, name))
 			default:
 				errs = append(errs, fmt.Errorf(
@@ -315,6 +327,16 @@ func (s *flowService) Validate(ctx context.Context, r *FlowRecord) error {
 			}
 		}
 	}
+
+	// Followers must be orderable — a dependency cycle cannot be scheduled.
+	if _, cyclic := topoLayers(followerKeys, followerConsumed); len(cyclic) > 0 {
+		names := make([]string, len(cyclic))
+		for i, idx := range cyclic {
+			names[i] = followers[idx].AgentSlug
+		}
+		errs = append(errs, fmt.Errorf("followers form a dependency cycle: %v", names))
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("%w: %w", ErrFlowInvalid, errors.Join(errs...))
 	}

@@ -583,10 +583,13 @@ referenced agent is missing. `Create` runs the self-contained subset (duplicate/
 producer names) automatically; a flow that declares no variables passes trivially, so this is a
 no-op for flows that don't opt into wiring.
 
-Current execution is still lead → all-followers-concurrent, so a follower may consume the lead
-or a declared input, but **not another follower** — `Validate` flags a cross-follower dependency
-as not-yet-executed. Layered execution that runs dependent followers in order is a planned
-follow-up (see `28-Variable-Producer-Consumer.md`).
+Execution is dependency-**layered**: a follower whose template consumes another follower's
+`OutputKey` runs after that producer and receives its output; followers within a layer run
+concurrently, and a flow with no cross-follower dependencies is a single layer (the historical
+all-concurrent fan-out). So a follower may consume the lead, a declared input, OR another
+follower — as long as the follower graph is acyclic. `Validate` rejects a cycle at publish time
+(and the lead, which runs first, may consume only declared inputs). Design and rationale:
+`28-Variable-Producer-Consumer.md`.
 
 ## Schema & migrations (IMPORTANT gotcha)
 

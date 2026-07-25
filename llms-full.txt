@@ -583,10 +583,13 @@ referenced agent is missing. `Create` runs the self-contained subset (duplicate/
 producer names) automatically; a flow that declares no variables passes trivially, so this is a
 no-op for flows that don't opt into wiring.
 
-Current execution is still lead → all-followers-concurrent, so a follower may consume the lead
-or a declared input, but **not another follower** — `Validate` flags a cross-follower dependency
-as not-yet-executed. Layered execution that runs dependent followers in order is a planned
-follow-up (see `28-Variable-Producer-Consumer.md`).
+Execution is dependency-**layered**: a follower whose template consumes another follower's
+`OutputKey` runs after that producer and receives its output; followers within a layer run
+concurrently, and a flow with no cross-follower dependencies is a single layer (the historical
+all-concurrent fan-out). So a follower may consume the lead, a declared input, OR another
+follower — as long as the follower graph is acyclic. `Validate` rejects a cycle at publish time
+(and the lead, which runs first, may consume only declared inputs). Design and rationale:
+`28-Variable-Producer-Consumer.md`.
 
 ## Schema & migrations (IMPORTANT gotcha)
 
@@ -1361,10 +1364,19 @@ func (e *Engine) RunStep(ctx context.Context, session *Session, req StepRequest)
 func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest) (*Turn, error)
     RunTurn executes a Flow against a session: it runs the lead agent
     (optionally streaming), injects the lead's text output into the shared
-    Inputs, then runs all follower agents concurrently. Every resulting step
-    is persisted and tagged with the same turn ID. A follower failure does
-    not abort the turn — its error is recorded on the Turn but siblings still
-    complete.
+    Inputs, then runs the follower agents. Every resulting step is persisted and
+    tagged with the same turn ID. A follower failure does not abort the turn —
+    its error is recorded on the Turn but siblings still complete.
+
+    Followers run in dependency LAYERS: a follower that consumes another
+    follower's output (its user template declares the sibling's OutputKey in
+    Prompt.Variables) runs in a later layer, after that producer, and receives
+    its output under the producer's OutputKey. Followers within a layer run
+    concurrently, and a flow with no cross-follower dependencies is a single
+    layer — identical to the historical all-concurrent fan-out. Validate the
+    wiring with Flows().Validate; a dependency cycle is rejected there, and if
+    an in-code flow still contains one, the cyclic followers run last and fail
+    on their missing input rather than deadlocking.
 
     A non-nil error means the lead step failed; it is the lead's RunStep error
     (see RunStep for the error contract) wrapped with the turn and agent slug.

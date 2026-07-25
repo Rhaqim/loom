@@ -1008,13 +1008,34 @@ func TestFlowValidate_DanglingConsumedVariable(t *testing.T) {
 	}
 }
 
-func TestFlowValidate_CrossFollowerNotYetSupported(t *testing.T) {
+// Phase 2: an ACYCLIC cross-follower dependency is now valid (f2 consumes f1).
+func TestFlowValidate_CrossFollowerAcyclicIsValid(t *testing.T) {
 	ctx := context.Background()
 	e, _ := reproEngine(t, "fv_cross", map[string]Generator{"g": okGen{}}, PollerConfig{})
-	// f2 consumes f1's output — a sibling follower dependency (phase 2).
 	mustAgent(t, e, "lead", "g")
 	agentWithVars(t, e, "f1", nil)
 	agentWithVars(t, e, "f2", []string{"F1"})
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Agents: []FlowAgentEntry{
+			{AgentSlug: "lead", OutputKey: "Lead"},
+			{AgentSlug: "f1", OutputKey: "F1"},
+			{AgentSlug: "f2", OutputKey: "F2"},
+		},
+	}
+	if err := e.Flows().Validate(ctx, rec); err != nil {
+		t.Fatalf("acyclic cross-follower wiring rejected: %v", err)
+	}
+}
+
+// Phase 2: a dependency CYCLE among followers is rejected.
+func TestFlowValidate_CycleRejected(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "fv_cycle", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	mustAgent(t, e, "lead", "g")
+	agentWithVars(t, e, "f1", []string{"F2"}) // f1 consumes f2
+	agentWithVars(t, e, "f2", []string{"F1"}) // f2 consumes f1
 
 	rec := &FlowRecord{
 		Slug: "f", Version: 1, IsActive: true,
@@ -1028,8 +1049,31 @@ func TestFlowValidate_CrossFollowerNotYetSupported(t *testing.T) {
 	if !errors.Is(err, ErrFlowInvalid) {
 		t.Fatalf("err = %v, want ErrFlowInvalid", err)
 	}
-	if err == nil || !strings.Contains(err.Error(), "cross-follower") {
-		t.Fatalf("error %v should explain cross-follower wiring is not yet executed", err)
+	if err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("error %v should name the dependency cycle", err)
+	}
+}
+
+// The lead runs first, so it cannot consume a follower's output.
+func TestFlowValidate_LeadCannotConsumeFollower(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "fv_lead", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	agentWithVars(t, e, "lead", []string{"F1"}) // lead consumes a follower's output
+	agentWithVars(t, e, "f1", nil)
+
+	rec := &FlowRecord{
+		Slug: "f", Version: 1, IsActive: true,
+		Agents: []FlowAgentEntry{
+			{AgentSlug: "lead", OutputKey: "Lead"},
+			{AgentSlug: "f1", OutputKey: "F1"},
+		},
+	}
+	err := e.Flows().Validate(ctx, rec)
+	if !errors.Is(err, ErrFlowInvalid) {
+		t.Fatalf("err = %v, want ErrFlowInvalid", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "lead") {
+		t.Fatalf("error %v should explain the lead cannot consume a follower", err)
 	}
 }
 
