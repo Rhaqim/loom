@@ -245,6 +245,14 @@ type VideoResult = engine.VideoResult
 // AudioResult is the output from an audio-modality generator.
 type AudioResult = engine.AudioResult
 
+// Model3DResult is the output from a 3D-model generator. URL should normally
+// reference a binary glTF (.glb) asset, the portable format consumed by web
+// renderers such as Three.js. PreviewImage is an optional rendered thumbnail.
+// The common fields capture the properties a renderer needs to choose and load
+// the asset; applications can retain provider-specific data in their own asset
+// catalog keyed by URL or ResultID.
+type Model3DResult = engine.Model3DResult
+
 // WorldDelta is a single structured operation applied to a procedural world.
 type WorldDelta = engine.WorldDelta
 
@@ -268,6 +276,10 @@ var NewVideoResult = engine.NewVideoResult
 // format is the MIME type or extension (e.g. "audio/mpeg", "mp3").
 // durationSec is the audio length in seconds.
 var NewAudioResult = engine.NewAudioResult
+
+// NewModel3DResult creates a ready Model3DResult. format is the file format or
+// MIME type (for example "model/gltf-binary" or "glb").
+var NewModel3DResult = engine.NewModel3DResult
 
 // NewPendingResult creates a pending Result for async generators.
 var NewPendingResult = engine.NewPendingResult
@@ -350,6 +362,11 @@ const ModalityImage = engine.ModalityImage
 const ModalityVideo = engine.ModalityVideo
 
 const ModalityAudio = engine.ModalityAudio
+
+// ModalityModel3D is a generated, renderable 3D asset (normally a GLB).
+// It is distinct from ModalityWorld, which carries logical world-state
+// deltas rather than a model file.
+const ModalityModel3D = engine.ModalityModel3D
 
 const ModalityWorld = engine.ModalityWorld
 

@@ -76,6 +76,15 @@ func marshalResultForStorage(r Result) ([]byte, error) {
 			"duration_sec": v.DurationSec,
 			"format":       v.Format,
 		})
+	case *Model3DResult:
+		return json.Marshal(map[string]any{
+			"url":           v.URL,
+			"format":        v.Format,
+			"preview_image": v.PreviewImage,
+			"prompt":        v.Prompt,
+			"poly_count":    v.PolyCount,
+			"rigged":        v.Rigged,
+		})
 	case *WorldResult:
 		return json.Marshal(map[string]any{"deltas": v.Deltas})
 	case *StructuredResult:
@@ -112,6 +121,11 @@ func unmarshalResult(modal Modality, status ResultStatus, payload []byte) Result
 	case ModalityAudio:
 		r := &AudioResult{URL: str("url"), DurationSec: fnum("duration_sec"), Format: str("format")}
 		r.modal, r.status, r.meta = ModalityAudio, status, map[string]any{}
+		return r
+	case ModalityModel3D:
+		r := &Model3DResult{URL: str("url"), Format: str("format"), PreviewImage: str("preview_image"), Prompt: str("prompt"), PolyCount: num("poly_count")}
+		r.Rigged, _ = m["rigged"].(bool)
+		r.modal, r.status, r.meta = ModalityModel3D, status, map[string]any{}
 		return r
 	case ModalityWorld:
 		r := &WorldResult{}

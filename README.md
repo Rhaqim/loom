@@ -13,7 +13,7 @@ Loom handles the infrastructure — session management, versioned agents and pro
 
 | | |
 |---|---|
-| **Modality-agnostic** | Text, image, video, and structured output in one pipeline |
+| **Modality-agnostic** | Text, image, video, audio, 3D assets, and structured output in one pipeline |
 | **Versioned agents & prompts** | Slug + version addressing; swap models without touching session history |
 | **Session branching & replay** | Fork at any step; explore alternatives; GC stale branches automatically |
 | **Hook bus** | Pre- and post-hooks for validation, retry logic, and content filtering |
