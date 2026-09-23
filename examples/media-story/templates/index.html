@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Media Story — Loom</title>
+  <style>
+    body { max-width: 850px; margin: 3rem auto; padding: 0 1rem; background: #121019; color: #eee8d7; font: 16px system-ui; }
+    textarea, select, button { width: 100%; box-sizing: border-box; margin: .4rem 0 1rem; padding: .7rem; border-radius: 5px; }
+    textarea, select { background: #211c2b; color: inherit; border: 1px solid #51465f; } button { background: #bd9151; border: 0; font-weight: bold; cursor: pointer; }
+    .card { margin-top: 1.5rem; padding: 1.2rem; background: #211c2b; border-left: 4px solid #bd9151; } .error { color: #ffaaaa; }
+    img { max-width: 100%; height: auto; } pre { overflow-x: auto; white-space: pre-wrap; } a { color: #e6c985; }
+  </style>
+</head>
+<body>
+  <h1>{{.Title}}</h1>
+  <p>A Loom-backed media narrative demo. Select an agent/model and generate one modality for the current scene.</p>
+  <form method="post" action="/generate">
+    <label for="agent">Agent / model</label>
+    <select id="agent" name="agent">{{range .Agents}}<option value="{{.Slug}}" {{if eq $.Selected .Slug}}selected{{end}}>{{.Name}} — {{.Modality}} / {{.Model}}</option>{{end}}</select>
+    <label for="prompt">Scene prompt</label>
+    <textarea id="prompt" name="prompt" rows="5">{{.Prompt}}</textarea>
+    <button type="submit">Generate modality</button>
+  </form>
+  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+  {{with .Output}}<section class="card"><h2>{{.Agent.Name}} — {{.Agent.Modality}}</h2>
+    {{if .Pending}}<p>Generation is pending. Loom has persisted the provider task and its poller will resolve it in the background.</p>{{end}}
+    {{if .Text}}<p>{{.Text}}</p>{{end}}
+    {{if .Preview}}<img src="{{.Preview}}" alt="Generated preview">{{end}}
+    {{if .URL}}<p><a href="{{.URL}}" target="_blank" rel="noreferrer">Open generated asset</a></p>{{end}}
+    {{if .World}}<pre>{{range .World}}{{printf "%+v\n" .}}{{end}}</pre>{{end}}
+  </section>{{end}}
+</body>
+</html>

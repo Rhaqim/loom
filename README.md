@@ -533,6 +533,7 @@ loom/
 │   ├── anthropic/      # Anthropic Messages API (sync + streaming)
 │   ├── replicate/      # async image generation
 │   ├── runway/         # async video generation
+│   ├── meshy/          # async text/image-to-3D generation
 │   └── echo/           # echo stub (testing, no API key needed)
 ├── judge/              # RubricJudge, PairwiseJudge, ConstraintJudge
 ├── gc/                 # background branch GC worker
@@ -540,11 +541,12 @@ loom/
 ├── cmd/loom-cli/       # CLI: migrate, seed, test
 ├── scripts/            # gen-llms-full.sh
 ├── docs/               # design/architecture notes
-└── examples/           # each has its own go.mod
+└── examples/
     ├── quickstart/     # smallest possible program
     ├── story/          # minimal single-agent example
     ├── dnd/            # full D&D solo experience
     ├── storyapi/       # HTTP API with auth, sessions, streaming
+    ├── media-story/    # Go-template multi-modality narrative server
     └── conexus-loom/   # multi-agent, multimodal session via RunTurn (zero-setup)
 ```
 
