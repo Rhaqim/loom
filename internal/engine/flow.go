@@ -59,6 +59,42 @@ type FlowAgent struct {
 	// each agent can receive its own user_prompt / values while still seeing the
 	// lead's output. Nil leaves the shared Inputs untouched.
 	Inputs map[string]any
+	// When, on a FOLLOWER, decides whether this agent runs at all this turn. It
+	// is consulted after the lead settles (and, for a layered follower, after
+	// its producers), with the inputs this agent would have received. Returning
+	// false skips the follower: no step is opened, no generator is called, and
+	// the slug is recorded on Turn.Skipped.
+	//
+	// Nil — the default — always runs, which is the historical behaviour.
+	//
+	// This is the cost lever the evaluation subsystem pays for: one cheap
+	// classification deciding whether a full generation happens. An error from
+	// the gate is recorded on Turn.Errors and the follower is skipped, so a
+	// broken gate degrades to a missing follower rather than a failed turn.
+	//
+	// EXPERIMENTAL: this field is part of the opt-in evaluator work and may
+	// change shape. It is inert unless set.
+	When func(ctx context.Context, g FollowerGate) (bool, error)
+}
+
+// FollowerGate is what a FlowAgent.When gate is given to decide on. It carries
+// the turn's state at the moment the follower would start.
+//
+// EXPERIMENTAL.
+type FollowerGate struct {
+	// Agent is the follower being gated.
+	Agent FlowAgent
+	// Session is the session the turn runs against.
+	Session *Session
+	// Lead is the lead agent's settled step. Its output is the usual thing to
+	// gate on — read it with ResultText(g.Lead.Result).
+	Lead *Step
+	// Inputs are exactly the inputs this follower would receive, including the
+	// lead's output under its OutputKey and any earlier layer's outputs. It is
+	// this follower's own copy; mutating it affects nothing.
+	Inputs map[string]any
+	// TurnID identifies the turn, for correlating gate decisions with steps.
+	TurnID uuid.UUID
 }
 
 // Flow declares a turn as a lead agent plus parallel followers.
@@ -114,6 +150,12 @@ type Turn struct {
 	Errors    map[string]error // keyed by follower AgentSlug (failures only)
 	Steps     []*Step          // lead first, then followers (completion order)
 	Messages  []Message        // everything published on the turn's Bus
+	// Skipped names the followers a FlowAgent.When gate declined to run, in
+	// completion order. They are neither successes nor failures: no step
+	// exists, and none was attempted. Empty unless a flow uses gates.
+	//
+	// EXPERIMENTAL, alongside FlowAgent.When.
+	Skipped []string
 }
 
 // RunTurn executes a Flow against a session: it runs the lead agent (optionally
@@ -279,6 +321,47 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 				}
 			}
 		}()
+		// This follower's own copy of the inputs, built once and shared by the
+		// gate and the step so the gate decides on exactly what the agent would
+		// have received.
+		in := agentInputs(inputs, f.Inputs)
+
+		// Gate: an opt-in check that can skip this follower entirely. A skip is
+		// not a failure — no step is opened and nothing is recorded in
+		// turn.Errors — so a caller distinguishes "we chose not to run this"
+		// from "this ran and broke" by looking at Skipped rather than Errors.
+		if f.When != nil {
+			run, gerr := f.When(ctx, FollowerGate{
+				Agent:   f,
+				Session: session,
+				Lead:    leadStep,
+				Inputs:  in,
+				TurnID:  turnID,
+			})
+			if gerr != nil {
+				// A gate that cannot decide must not silently pick one way.
+				// Report it and skip, so the failure is visible on the turn
+				// while the rest of the fan-out still completes.
+				gerr = fmt.Errorf("loom: follower %q gate: %w", f.AgentSlug, gerr)
+				mu.Lock()
+				turn.Errors[f.AgentSlug] = gerr
+				turn.Skipped = append(turn.Skipped, f.AgentSlug)
+				mu.Unlock()
+				e.log.Error("turn follower gate failed", "turn_id", turnID, "agent", f.AgentSlug, "err", gerr)
+				if req.OnStep != nil {
+					fired = true
+					req.OnStep(role, nil, gerr)
+				}
+				return
+			}
+			if !run {
+				mu.Lock()
+				turn.Skipped = append(turn.Skipped, f.AgentSlug)
+				mu.Unlock()
+				return
+			}
+		}
+
 		step, ferr := e.steps.run(ctx, session, StepRequest{
 			AgentSlug:    f.AgentSlug,
 			AgentVersion: f.AgentVersion,
@@ -290,7 +373,7 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 			RetryMode:            f.RetryMode,
 			MaxRetries:           f.MaxRetries,
 			SystemPromptOverride: promptRefOf(f.SystemPrompt),
-			Inputs:               agentInputs(inputs, f.Inputs),
+			Inputs:               in,
 			Params:               mergeParams(req.Params, f.Params),
 			Overrides:            pickOverrides(f.Overrides, req.Overrides),
 			GeneratorOverride:    f.GeneratorOverride,

@@ -23,6 +23,8 @@ import (
 	"github.com/rhaqim/conexus-loom/engine"
 	"github.com/rhaqim/conexus-loom/narrative"
 	loom "github.com/rhaqim/loom"
+	"github.com/rhaqim/loom/evaluator/stub"
+	"github.com/rhaqim/loom/evaluator/typesafe"
 	"github.com/rhaqim/loom/generator/echo"
 	"github.com/rhaqim/loom/generator/openai"
 	"github.com/rhaqim/loom/schema"
@@ -54,6 +56,9 @@ func main() {
 
 	// Provider selection — the live seam.
 	gen, realProvider := pickGenerator(log)
+	// The decision seam, independent of the generation one: an Evaluator can be
+	// configured with any generator, and nil simply leaves the feature off.
+	evalr := pickEvaluator(log)
 
 	le, err := loom.New(loom.Config{
 		DB:         db,
@@ -62,6 +67,7 @@ func main() {
 		Logger:     log,
 		Generators: map[string]loom.Generator{narrative.GenText: gen},
 		Pricing:    adapters.OpenAIPricing(), // per-model cost; unknown models fall back
+		Evaluator:  evalr,                    // experimental; nil = subsystem off
 	})
 	must(err)
 
@@ -85,6 +91,8 @@ func main() {
 		Versions:        versions,
 		StoryVersion:    storyVersion,
 		ValidateSchemas: realProvider,
+		SemanticQuality: evalr != nil,
+		MinProseQuality: 1.0, // below "competent but flat" goes back to the Author
 	})
 
 	// transcript: optional investor-facing record (see transcript.go).
@@ -225,6 +233,30 @@ func pickGenerator(log adapters.StdLogger) (loom.Generator, bool) {
 		}
 		return gen, true
 	}
+}
+
+// pickEvaluator returns the Evaluator backing the semantic quality gate, or nil
+// to leave the EXPERIMENTAL subsystem off entirely.
+//
+// TYPESAFE_API_KEY selects the real thing. CONEXUS_EVALUATOR=stub forces the
+// offline stub, whose canned answers keep a gated pipeline running end to end
+// with no credentials — the evaluator-side counterpart to CONEXUS_PROVIDER=stub.
+func pickEvaluator(log adapters.StdLogger) loom.Evaluator {
+	switch adapters.Getenv("CONEXUS_EVALUATOR", "") {
+	case "off":
+		return nil
+	case "stub":
+		log.Info("evaluator", "stub", "note", "offline canned answers; no gate will fire")
+		return stub.New()
+	}
+	key := os.Getenv("TYPESAFE_API_KEY")
+	if key == "" {
+		// Silent: the evaluation subsystem is opt-in, so its absence is the
+		// normal case and not worth a warning on every run.
+		return nil
+	}
+	log.Info("evaluator", "typesafe", "model", typesafe.DefaultModel)
+	return typesafe.New(key)
 }
 
 func isNum(s string, max int) bool {

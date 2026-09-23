@@ -20,6 +20,7 @@ Loom handles the infrastructure — session management, versioned agents and pro
 | **Cost tracking & budgets** | Per-step token/USD recording; time-windowed budget enforcement |
 | **Judge subsystem** | Rubric scoring, pairwise comparison, and binary constraints via LLM |
 | **Test harness** | YAML-driven test plans, variant matrices, parallel execution, assertion DSL |
+| **Evaluations** *(experimental)* | Typed yes/no, pick-one and rate questions answered as calibrated probabilities — gate retries, skip followers, back the judges |
 | **Multiple generators** | OpenAI, Anthropic, Replicate (images), Runway (video), plus an echo stub |
 | **Postgres + SQLite** | Idempotent schema loader; bring your own `*sql.DB` |
 
@@ -406,6 +407,79 @@ result, _ := pair.Compare(ctx, judge.PairwiseRequest{
 // result.Winner == "A" | "B" | "tie"
 ```
 
+### Evaluations (experimental)
+
+A `Generator` **produces** content. An `Evaluator` **decides** things about it — the
+counterpart loom was missing. It answers typed questions as calibrated probabilities
+that code branches on, with every question evaluated independently in one round trip:
+
+- **Noul** — a yes/no proposition, as a probability in 0..1
+- **Choice** — pick one option from a named set, with the full distribution
+- **Score** — rate against an ordered rubric, weighted across levels
+
+> **Opt-in and additive.** With `Config.Evaluator` unset, `Evaluate` returns
+> `ErrEvaluatorNotConfigured`, every gate is inert, and no existing behaviour changes.
+> The API is experimental and may change shape in a future minor release.
+
+```go
+import (
+    "github.com/rhaqim/loom/evaluator"
+    "github.com/rhaqim/loom/evaluator/typesafe" // TypeSafe System One (the Jev model)
+    // "github.com/rhaqim/loom/evaluator/stub"  // deterministic, offline
+)
+
+e, _ := loom.New(loom.Config{ /* ... */ Evaluator: typesafe.New(os.Getenv("TYPESAFE_API_KEY")) })
+
+// One call, three independent questions.
+eval, _ := e.Evaluate(ctx, prose, map[string]loom.EvalQuestion{
+    "cliched": loom.EvalNoul("Does this lean on stock clichés?"),
+    "intent":  loom.EvalChoice("What is the player trying to do?", map[string]any{
+        "explore": "Move or look around",
+        "fight":   "Attack something",
+        "talk":    "Address a character",
+    }),
+    "quality": loom.EvalScore("Rate the prose",
+        "generic filler", "competent but flat", "vivid and specific", "genuinely striking"),
+})
+```
+
+**Gate a retry on the numbers.** `EvalGate` turns answers into accept / retry / reject,
+feeding the reason to the next attempt as an ordinary `RetryAnnotation`. It fails **open**
+by default, so an outage in the decision layer degrades quality rather than taking the
+product down:
+
+```go
+e.Hooks().RegisterPost("quality", e.EvalGate(loom.EvalGateConfig{
+    Agents:    []string{"author"},
+    Questions: buildQuestions,
+    Decide: func(a loom.EvalAnswers) loom.EvalDecision {
+        switch {
+        case a.Yes("cliched", 0.7):
+            return loom.EvalDecision{Verdict: loom.EvalRetry, Reason: "rewrite without clichés"}
+        case a.Score("quality") < 1:
+            return loom.EvalDecision{Verdict: loom.EvalRetry, Reason: "be specific and concrete"}
+        }
+        return loom.EvalDecision{Verdict: loom.EvalAccept}
+    },
+}))
+```
+
+**Skip a whole follower.** `FlowAgent.When` is the cost lever — one cheap classification
+deciding whether a full generation happens. A skipped follower opens no step and calls no
+generator; its slug lands on `Turn.Skipped` (not `Turn.Errors` — a skip is neither a
+success nor a failure). A nil `When` always runs.
+
+**Back the existing judges with it.** The adapters satisfy the same interfaces, so it is a
+swap rather than a migration — and the reported confidence becomes a real property of a
+probability distribution instead of a number a model asserted about itself:
+
+```go
+ev := typesafe.New(key)
+e.Judges().Register("quality", evaluator.NewRubricJudge("quality", ev))
+e.Judges().Register("rules",   evaluator.NewConstraintJudge("rules", ev))
+e.Judges().Register("pick",    evaluator.NewPairwiseJudge("pick", ev))
+```
+
 ### Test harness
 
 Write test plans in code or YAML. The harness runs all variants in parallel:
@@ -535,6 +609,9 @@ loom/
 │   ├── runway/         # async video generation
 │   └── echo/           # echo stub (testing, no API key needed)
 ├── judge/              # RubricJudge, PairwiseJudge, ConstraintJudge
+├── evaluator/          # EXPERIMENTAL decision primitive (Noul / Choice / Score)
+│   ├── typesafe/       #   TypeSafe System One (the Jev model)
+│   └── stub/           #   deterministic stub (tests, offline, no API key needed)
 ├── gc/                 # background branch GC worker
 ├── harness/            # TestPlan, VariantMatrix, Assertion DSL, parallel runner
 ├── cmd/loom-cli/       # CLI: migrate, seed, test

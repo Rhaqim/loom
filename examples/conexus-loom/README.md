@@ -67,6 +67,39 @@ at the end. The whole feature is isolated in
 [cmd/play/transcript.go](cmd/play/transcript.go) and guarded by nil checks, so you
 can drop it later by removing the lines marked `// transcript`.
 
+## Semantic quality gate (experimental)
+
+The Quality Engine has two tiers. `narrative/quality.go` is the deterministic one:
+Slop Bans (21 hard-coded cliché phrases) and a Staleness Detector (word-trigram
+Jaccard). It is free and catches what it can name.
+
+`narrative/semantic.go` is the second tier, built on loom's experimental
+[evaluation subsystem](../../README.md#evaluations-experimental). It asks three
+questions about each draft in **one** call — is it cliché, does it retell the last
+scene, how good is the prose (0..3 rubric) — and turns the answers into a retry with
+guidance. It catches what the first tier structurally cannot: the clichés nobody
+listed, and a scene rewritten in new words that tells the same story (the tests in
+`narrative/semantic_test.go` assert exactly that gap).
+
+It also makes the verdict **graded** rather than binary: a merely flat draft ships,
+a generic one goes back.
+
+```bash
+# On, against the real model:
+TYPESAFE_API_KEY=... go run ./cmd/play
+
+# On, fully offline (canned answers; no gate fires):
+CONEXUS_PROVIDER=stub CONEXUS_EVALUATOR=stub go run ./cmd/play
+
+# Off — and off is the default with no key set:
+CONEXUS_EVALUATOR=off go run ./cmd/play
+```
+
+The layering is the point: **loom owns the mechanism** (the `Evaluator` interface,
+the batched call, `EvalGate` turning answers into retries) and knows nothing about
+fiction. **This example owns the questions** — what "slop", "stale" and "good prose"
+mean here. Questions are prompts, and prompts have always lived in `narrative/`.
+
 ## How it maps to Conexus (and what changed)
 
 | Conexus monorepo | here | engine |
@@ -82,6 +115,7 @@ can drop it later by removing the lines marked `// transcript`.
 | per-user model prefs | `ports.AIPreferences` | per-request override seam |
 | telemetry | `ports.Logger` | — |
 | `ai.ExecuteWithRetry`, cost, branching | — | **free from loom** |
+| — (new) | [narrative/semantic.go](narrative/semantic.go) | loom `EvalGate` + `Evaluator` *(experimental)* |
 
 The difference from the small `conexus-loom` demo: this is a full, layered project
 (`domain` / `ports` / `adapters` / `narrative` / `migration` / `engine` / `cmd`),

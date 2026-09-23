@@ -174,6 +174,13 @@ var ErrInvalidConfig = errors.New("loom: invalid config")
 // that was never registered with the engine. Wrapped errors name the slug.
 var ErrGeneratorNotRegistered = errors.New("loom: generator not registered")
 
+// ErrEvaluatorNotConfigured is returned by Engine.Evaluate when the application
+// has not opted into the EXPERIMENTAL evaluation subsystem by setting
+// Config.Evaluator. It is deliberately distinct from an evaluation failure so a
+// caller can tell "the feature is off" from "the question could not be
+// answered" and fall back to its pre-evaluator behaviour in the first case.
+var ErrEvaluatorNotConfigured = errors.New("loom: evaluator not configured")
+
 // GenerationErrorKind classifies why a generator failed to produce a result, so
 // applications can react differently (e.g. retry transport failures but surface
 // provider rejections to the user).

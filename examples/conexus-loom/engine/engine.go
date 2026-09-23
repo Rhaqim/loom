@@ -38,6 +38,19 @@ type Config struct {
 	// the Staleness Detector) on the Author. Leave false for the offline stub
 	// (its fixed prose would trip the bans); enable for real providers.
 	QualityEngine bool
+	// SemanticQuality registers the EXPERIMENTAL evaluator-backed quality gate
+	// on the Author (narrative.SemanticQualityGate): the same job as
+	// QualityEngine, asked as questions rather than matched as strings, so it
+	// catches the clichés nobody listed and the repetition that reuses no
+	// words.
+	//
+	// It is inert unless the loom engine also has an Evaluator configured, so
+	// setting it without one changes nothing.
+	SemanticQuality bool
+	// MinProseQuality is the weighted score below which the semantic gate sends
+	// a draft back, on narrative's 0..3 prose rubric. Zero leaves the graded
+	// tier off and keeps only the two yes/no gates.
+	MinProseQuality float64
 }
 
 // Conexus is the application engine.
@@ -67,6 +80,13 @@ func New(cfg Config) *Conexus {
 		// the previous turn, asking loom to retry with guidance.
 		cfg.Loom.Hooks().RegisterPost("slop-bans", narrative.SlopBanHook())
 		cfg.Loom.Hooks().RegisterPost("staleness", narrative.StalenessHook(0))
+	}
+	if cfg.SemanticQuality {
+		// The semantic tier. Registered AFTER the deterministic hooks on
+		// purpose: the string checks are free, so let them catch what they can
+		// before spending a call on the questions they cannot ask.
+		cfg.Loom.Hooks().RegisterPost("semantic-quality",
+			narrative.SemanticQualityGate(cfg.Loom, cfg.MinProseQuality))
 	}
 	return c
 }

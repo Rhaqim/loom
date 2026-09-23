@@ -408,6 +408,74 @@ outruns the deadline. Step costs are not at risk either way: they commit with th
 `e.Judges()` provides rubric scoring, pairwise comparison, and binary constraints via an LLM.
 See `github.com/rhaqim/loom/judge` and the README for `ScoreRequest`/`PairwiseRequest`.
 
+## Evaluations (EXPERIMENTAL, opt-in)
+
+An `Evaluator` is the decision counterpart to a `Generator`: a `Generator` PRODUCES content, an
+`Evaluator` DECIDES things about it. It answers typed questions — `EvalNoul` (yes/no, as a
+probability), `EvalChoice` (pick one, with the full distribution), `EvalScore` (rate against an
+ordered rubric) — in ONE round trip, with every question evaluated independently.
+
+**It is entirely opt-in.** With `Config.Evaluator` unset, `e.Evaluate` returns
+`ErrEvaluatorNotConfigured`, every gate is inert, and no other code path changes. The API may
+change shape in a future minor release.
+
+```go
+import "github.com/rhaqim/loom/evaluator/typesafe"   // TypeSafe System One (Jev)
+// import "github.com/rhaqim/loom/evaluator/stub"    // offline / tests
+
+e, _ := loom.New(loom.Config{ /* ... */ Evaluator: typesafe.New(os.Getenv("TYPESAFE_API_KEY")) })
+
+eval, err := e.Evaluate(ctx, prose, map[string]loom.EvalQuestion{
+    "cliched": loom.EvalNoul("Does this lean on stock clichés?"),
+    "intent":  loom.EvalChoice("What is the player trying to do?", map[string]any{
+        "explore": "Move or look around", "fight": "Attack something", "talk": "Address a character"}),
+    "quality": loom.EvalScore("Rate the prose",
+        "generic filler", "competent but flat", "vivid and specific", "genuinely striking"),
+})
+eval.Answers.Yes("cliched", 0.7)   // miss-safe: an unanswered question reads as a zero value
+eval.Answers.Choice("intent")
+eval.Answers.Score("quality")
+```
+
+Ask everything one decision needs in a SINGLE call — independence is the property this exists
+for, and splitting a decision across calls throws it away.
+
+**Gate a retry on the answers** with `e.EvalGate`, which turns them into accept / retry / reject
+and feeds the reason to the next attempt as an ordinary `RetryAnnotation`:
+
+```go
+e.Hooks().RegisterPost("quality", e.EvalGate(loom.EvalGateConfig{
+    Agents:    []string{"author"},          // scope it; an unnamed agent is never evaluated
+    Questions: func(*loom.StepRequest, loom.Result) map[string]loom.EvalQuestion { return qs },
+    Decide: func(a loom.EvalAnswers) loom.EvalDecision {
+        if a.Yes("cliched", 0.7) {
+            return loom.EvalDecision{Verdict: loom.EvalRetry, Reason: "rewrite without clichés"}
+        }
+        return loom.EvalDecision{Verdict: loom.EvalAccept}
+    },
+}))
+```
+Returning no questions from `Questions` skips the evaluation entirely (no call, no cost).
+The gate **fails open** by default — if the evaluator errors, the result passes through — so an
+outage in the decision layer degrades quality rather than taking the product down. Set
+`FailClosed: true` only for a rule you would rather serve nothing than violate.
+
+**Skip a whole follower** with `FlowAgent.When`, the real cost lever: one cheap classification
+deciding whether a full generation happens. Returning false opens no step and calls no
+generator; the slug lands on `Turn.Skipped` (not `Turn.Errors` — a skip is neither a success nor
+a failure). A nil `When` always runs, which is the historical behaviour.
+
+**Back the existing judges with it** — the adapters satisfy the same interfaces, so this is a
+swap, not a migration, and the confidence becomes a real property of the distribution rather
+than a number a model asserted:
+
+```go
+ev := typesafe.New(key)
+e.Judges().Register("quality", evaluator.NewRubricJudge("quality", ev))   // → EvalScore per dimension
+e.Judges().Register("rules",   evaluator.NewConstraintJudge("rules", ev)) // → EvalNoul
+e.Judges().Register("pick",    evaluator.NewPairwiseJudge("pick", ev))    // → EvalChoice A/B/tie
+```
+
 ## Sessions: branching & replay, GC
 
 - Fork at a step: `branch, _ := e.Sessions().Fork(ctx, sess.ID, stepIndex)` — parent untouched.
@@ -713,6 +781,15 @@ code should depend on that facade, never on this package directly.
 
 CONSTANTS
 
+const EvalChoiceType = evaluator.TypeChoice
+    EvalChoiceType picks one option from a named set.
+
+const EvalNoulType = evaluator.TypeNoul
+    EvalNoulType is a yes/no question answered as a probability in 0..1.
+
+const EvalScoreType = evaluator.TypeScore
+    EvalScoreType rates the state against an ordered rubric of levels.
+
 const TargetPlatformID = "platform_id"
     TargetPlatformID is the BudgetTarget.Kind for per-user budgets.
 
@@ -725,6 +802,14 @@ VARIABLES
 var ErrDuplicateSlug = errors.New("loom: duplicate slug+version")
     ErrDuplicateSlug is returned when an agent or prompt slug+version already
     exists.
+
+var ErrEvaluatorNotConfigured = errors.New("loom: evaluator not configured")
+    ErrEvaluatorNotConfigured is returned by Engine.Evaluate when the
+    application has not opted into the EXPERIMENTAL evaluation subsystem by
+    setting Config.Evaluator. It is deliberately distinct from an evaluation
+    failure so a caller can tell "the feature is off" from "the question could
+    not be answered" and fall back to its pre-evaluator behaviour in the first
+    case.
 
 var ErrFlowInvalid = errors.New("loom: invalid flow")
     ErrFlowInvalid is returned by Flows().Validate (and Create's self-contained
@@ -784,6 +869,30 @@ var ErrSessionPinned = errors.New("loom: session is pinned")
 
 var ErrSkip = skipError{reason: "step cancelled by pre-hook"}
     ErrSkip cancels the current step when returned from a pre-hook.
+
+var EvalChoice = evaluator.Choice
+    EvalChoice builds a question that picks one option from a map of option name
+    to description. EXPERIMENTAL.
+
+var EvalChoiceOf = evaluator.ChoiceOf
+    EvalChoiceOf builds a Choice over bare option names with no descriptions.
+    EXPERIMENTAL.
+
+var EvalNoul = evaluator.Noul
+    EvalNoul builds a yes/no question. EXPERIMENTAL.
+
+var EvalNoulWith = evaluator.NoulWith
+    EvalNoulWith builds a yes/no question that spells out what a yes and a
+    no mean. Describing both sides is the cheapest way to sharpen a vague
+    proposition. EXPERIMENTAL.
+
+var EvalScore = evaluator.Score
+    EvalScore builds a rubric question over ordered levels, lowest first.
+    EXPERIMENTAL.
+
+var EvalScoreOf = evaluator.ScoreOf
+    EvalScoreOf builds a rubric question whose levels are structured values
+    rather than plain strings. EXPERIMENTAL.
 
 
 FUNCTIONS
@@ -1191,6 +1300,19 @@ type Config struct {
 	// LLM. When set, a PromptRef.File must resolve (after symlink evaluation) to a
 	// path inside this root, or the read is rejected.
 	PromptFileRoot string
+	// Evaluator enables the EXPERIMENTAL evaluation subsystem: a decision
+	// primitive that answers typed questions (yes/no, pick-one, rate) about a
+	// state as calibrated probabilities, as the counterpart to a Generator's
+	// content production. See internal/engine/api_evaluator.go and the
+	// evaluator package.
+	//
+	// It is entirely opt-in. Nil — the default — leaves every engine code path
+	// exactly as it was: Engine.Evaluate returns ErrEvaluatorNotConfigured, no
+	// gate or hook consults an evaluator, and judges keep whatever backing the
+	// application registered. Set it to opt in; the engine still calls it only
+	// where the application wires it (EvalGate, FlowAgent.When, or an
+	// evaluator-backed judge).
+	Evaluator Evaluator
 }
     Config is the top-level engine configuration.
 
@@ -1298,6 +1420,71 @@ func (e *Engine) Close(ctx context.Context) error
 
 func (e *Engine) Cost() CostManager
     Cost returns the cost manager.
+
+func (e *Engine) EvalGate(cfg EvalGateConfig) PostHook
+    EvalGate returns a PostHook that evaluates a step's result and turns the
+    answers into accept / retry / reject.
+
+    With no Evaluator configured the hook is inert: it passes every result
+    through untouched, so registering it unconditionally is safe and the feature
+    can be switched on later by setting Config.Evaluator alone.
+
+    A typical registration — one call, three independent questions, one policy:
+
+        e.Hooks().RegisterPost("quality", e.EvalGate(loom.EvalGateConfig{
+            Agents: []string{"author"},
+            State: func(req *loom.StepRequest, res loom.Result) any {
+                return map[string]any{
+                    "draft":    loom.ResultText(res),
+                    "previous": req.Session.State.Vars["last_prose"],
+                }
+            },
+            Questions: func(*loom.StepRequest, loom.Result) map[string]loom.EvalQuestion {
+                return map[string]loom.EvalQuestion{
+                    "cliched": loom.EvalNoul("Does `draft` lean on stock clichés?"),
+                    "repeats": loom.EvalNoul("Does `draft` repeat the events of `previous` without advancing?"),
+                    "quality": loom.EvalScore("Rate the prose in `draft`",
+                        "generic filler", "competent but flat", "vivid and specific", "genuinely striking"),
+                }
+            },
+            Decide: func(a loom.EvalAnswers) loom.EvalDecision {
+                switch {
+                case a.Yes("repeats", 0.7):
+                    return loom.EvalDecision{Verdict: loom.EvalRetry,
+                        Reason: "this scene repeats the previous one; advance the story"}
+                case a.Yes("cliched", 0.7):
+                    return loom.EvalDecision{Verdict: loom.EvalRetry,
+                        Reason: "rewrite without stock clichés"}
+                case a.Score("quality") < 1:
+                    return loom.EvalDecision{Verdict: loom.EvalRetry,
+                        Reason: "the prose is flat; be specific and concrete"}
+                }
+                return loom.EvalDecision{Verdict: loom.EvalAccept}
+            },
+        }))
+
+    EXPERIMENTAL.
+
+func (e *Engine) Evaluate(ctx context.Context, state any, questions map[string]EvalQuestion) (Evaluation, error)
+    Evaluate asks the configured Evaluator a set of typed questions about state,
+    returning one answer per question.
+
+    The questions are evaluated independently, so ask everything the decision
+    needs in ONE call rather than several: that is the property the subsystem
+    exists for, and splitting a decision across calls throws it away.
+
+    It returns ErrEvaluatorNotConfigured when no Evaluator is configured, so a
+    caller can distinguish "the feature is off" from "the evaluation failed" and
+    fall back accordingly.
+
+    EXPERIMENTAL.
+
+func (e *Engine) Evaluator() Evaluator
+    Evaluator returns the configured Evaluator, or nil when none is set. Use it
+    to check whether the experimental subsystem is available before registering
+    a gate that depends on it.
+
+    EXPERIMENTAL.
 
 func (e *Engine) Flows() FlowRegistry
     Flows returns the persisted-flow (agent map) registry.
@@ -1407,6 +1594,13 @@ func (e *Engine) RunTurnBySlug(ctx context.Context, session *Session, owner, slu
 func (e *Engine) Sessions() SessionRegistry
     Sessions returns the session registry.
 
+func (e *Engine) SetEvaluator(ev Evaluator)
+    SetEvaluator installs or replaces the engine's Evaluator at runtime,
+    mirroring RegisterGenerator. Pass nil to remove it, which returns the engine
+    to its unconfigured behaviour.
+
+    EXPERIMENTAL.
+
 func (e *Engine) StartPoller(ctx context.Context)
     StartPoller starts the background async-result poller. It is a no-op if
     AsyncPoller.Workers == 0 in the config.
@@ -1428,6 +1622,134 @@ type EstimateRequest struct {
 	Modal   Modality
 }
     EstimateRequest is the input to Cost().Estimate().
+
+type EvalAnswer = evaluator.Answer
+    EvalAnswer is the result of one EvalQuestion. Which fields carry meaning
+    depends on its type; the accessors (Yes, Is, Level, Certain) read the right
+    one.
+
+    EXPERIMENTAL.
+
+type EvalAnswers = evaluator.Answers
+    EvalAnswers maps each question id to its answer. Its accessors are
+    miss-safe, so a gate written against a question that was never answered
+    fails open rather than panicking mid-turn.
+
+    EXPERIMENTAL.
+
+type EvalDecision struct {
+	// Verdict is what to do with the result.
+	Verdict EvalVerdict
+	// Reason explains the verdict. On EvalRetry it becomes the retry
+	// annotation the next attempt sees, so write it as an instruction to the
+	// model ("this scene repeats the previous one; move the story forward"),
+	// not as a log line about the model.
+	Reason string
+	// Forbidden lists phrases or patterns the next attempt must avoid. Carried
+	// on the retry annotation; ignored for other verdicts.
+	Forbidden []string
+}
+    EvalDecision is the outcome of a gate policy.
+
+    EXPERIMENTAL.
+
+type EvalGateConfig struct {
+	// Agents restricts the gate to these agent slugs. Empty means every agent,
+	// which is rarely what you want: a gate that asks an author's quality
+	// questions about a JSON extractor's output wastes a call and may fire
+	// nonsense. Name the agents.
+	Agents []string
+
+	// Questions builds the question set for one step. Returning nil or an empty
+	// map skips the evaluation entirely — no call is made and no cost is
+	// incurred — which is how a gate cheaply opts out of the steps it does not
+	// care about (a first turn with no previous scene to compare against, say).
+	// Required.
+	Questions func(req *StepRequest, res Result) map[string]EvalQuestion
+
+	// State builds the value the questions are asked about. Nil uses the
+	// result's text. Supply it when the questions need more than the output —
+	// the action that prompted it, the previous turn, the session's facts — and
+	// return a map so each question can refer to the part it is about by name.
+	State func(req *StepRequest, res Result) any
+
+	// Decide turns the answers into a verdict. Required.
+	//
+	// It receives miss-safe answers, so reading a question that was not
+	// answered yields a zero value rather than a panic. Draw the thresholds
+	// here and keep them in one place: this function is the whole policy, and
+	// it is the thing you will tune.
+	Decide func(EvalAnswers) EvalDecision
+
+	// OnEvaluation observes every evaluation that ran, before the decision is
+	// applied. Use it for cost accounting (Evaluation.Usage) and for logging
+	// the numbers a threshold was drawn against. Optional; it must not block.
+	OnEvaluation func(req *StepRequest, eval Evaluation)
+
+	// FailClosed makes an evaluation ERROR fail the step. The default (false)
+	// fails open: if the evaluator is unreachable or errors, the result passes
+	// through as though the gate were not registered, so an outage in the
+	// decision layer degrades quality rather than taking the product down.
+	// Set it only for gates enforcing a rule you would rather serve nothing
+	// than violate.
+	FailClosed bool
+}
+    EvalGateConfig configures the post-hook returned by Engine.EvalGate.
+
+    EXPERIMENTAL.
+
+type EvalOutcome = evaluator.Outcome
+    EvalOutcome is one option or rubric level with its probability, as returned
+    by EvalAnswer.Ranked.
+
+    EXPERIMENTAL.
+
+type EvalQuestion = evaluator.Question
+    EvalQuestion is one typed question about an evaluated state. Build them with
+    EvalNoul, EvalChoice and EvalScore rather than by hand.
+
+    EXPERIMENTAL.
+
+type EvalType = evaluator.Type
+    EvalType identifies the shape of an EvalQuestion.
+
+    EXPERIMENTAL.
+
+type EvalUsage = evaluator.Usage
+    EvalUsage reports the tokens an evaluation consumed.
+
+    EXPERIMENTAL.
+
+type EvalVerdict int
+    EvalVerdict is what a gate decides about a result.
+
+    EXPERIMENTAL.
+
+const (
+	// EvalAccept passes the result through unchanged. The zero value, so a
+	// Decide that falls off the end accepts rather than blocking the turn.
+	EvalAccept EvalVerdict = iota
+	// EvalRetry sends the result back for another attempt, carrying the
+	// decision's Reason and Forbidden list to the generator as a retry
+	// annotation — the same path a hand-written validation hook uses.
+	EvalRetry
+	// EvalReject fails the step outright with the decision's Reason. Use it for
+	// a violation no retry will fix (a safety refusal, a hard policy breach);
+	// prefer EvalRetry for quality problems, which usually do improve.
+	EvalReject
+)
+type Evaluation = evaluator.Evaluation
+    Evaluation is the result of one Evaluate call: the answers, the model that
+    produced them, and the token usage.
+
+    EXPERIMENTAL.
+
+type Evaluator = evaluator.Evaluator
+    Evaluator answers typed questions about a state, returning calibrated
+    answers rather than prose. See the evaluator package for the full contract
+    and for the typesafe (TypeSafe System One / Jev) and stub implementations.
+
+    EXPERIMENTAL.
 
 type Flow struct {
 	Slug      string
@@ -1468,6 +1790,22 @@ type FlowAgent struct {
 	// each agent can receive its own user_prompt / values while still seeing the
 	// lead's output. Nil leaves the shared Inputs untouched.
 	Inputs map[string]any
+	// When, on a FOLLOWER, decides whether this agent runs at all this turn. It
+	// is consulted after the lead settles (and, for a layered follower, after
+	// its producers), with the inputs this agent would have received. Returning
+	// false skips the follower: no step is opened, no generator is called, and
+	// the slug is recorded on Turn.Skipped.
+	//
+	// Nil — the default — always runs, which is the historical behaviour.
+	//
+	// This is the cost lever the evaluation subsystem pays for: one cheap
+	// classification deciding whether a full generation happens. An error from
+	// the gate is recorded on Turn.Errors and the follower is skipped, so a
+	// broken gate degrades to a missing follower rather than a failed turn.
+	//
+	// EXPERIMENTAL: this field is part of the opt-in evaluator work and may
+	// change shape. It is inert unless set.
+	When func(ctx context.Context, g FollowerGate) (bool, error)
 }
     FlowAgent is one agent participating in a turn.
 
@@ -1627,6 +1965,26 @@ type FlowRegistry interface {
     opaque scope ("" = global). On Get/Latest, version 0 resolves to the latest
     version; Create and Delete require an explicit version >= 1. Edits create a
     new version (like agents/prompts); Delete removes a specific version.
+
+type FollowerGate struct {
+	// Agent is the follower being gated.
+	Agent FlowAgent
+	// Session is the session the turn runs against.
+	Session *Session
+	// Lead is the lead agent's settled step. Its output is the usual thing to
+	// gate on — read it with ResultText(g.Lead.Result).
+	Lead *Step
+	// Inputs are exactly the inputs this follower would receive, including the
+	// lead's output under its OutputKey and any earlier layer's outputs. It is
+	// this follower's own copy; mutating it affects nothing.
+	Inputs map[string]any
+	// TurnID identifies the turn, for correlating gate decisions with steps.
+	TurnID uuid.UUID
+}
+    FollowerGate is what a FlowAgent.When gate is given to decide on. It carries
+    the turn's state at the moment the follower would start.
+
+    EXPERIMENTAL.
 
 type FreeText struct {
 	Body string
@@ -2534,6 +2892,12 @@ type Turn struct {
 	Errors    map[string]error // keyed by follower AgentSlug (failures only)
 	Steps     []*Step          // lead first, then followers (completion order)
 	Messages  []Message        // everything published on the turn's Bus
+	// Skipped names the followers a FlowAgent.When gate declined to run, in
+	// completion order. They are neither successes nor failures: no step
+	// exists, and none was attempted. Empty unless a flow uses gates.
+	//
+	// EXPERIMENTAL, alongside FlowAgent.When.
+	Skipped []string
 }
     Turn is the result of RunTurn: the lead step plus follower steps, all
     sharing a single turn ID (recorded on each Step's Diagnostics as "turn_id").

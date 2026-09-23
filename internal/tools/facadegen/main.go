@@ -37,7 +37,8 @@ var sectionOrder = []string{
 	"engine.go", "api_session.go", "api_agent.go", "api_prompt.go",
 	"responseformat.go", "api_action.go", "api_step.go", "api_result.go",
 	"api_generator.go", "api_modality.go", "flow.go", "flow_store.go",
-	"hook.go", "schemahook.go", "judges.go", "api_cost.go", "api_budget.go",
+	"hook.go", "schemahook.go", "judges.go", "api_evaluator.go", "evalgate.go",
+	"api_cost.go", "api_budget.go",
 	"cache.go", "bus.go", "pricing.go", "gc_service.go", "poller.go",
 	"query.go", "api_errors.go",
 }
@@ -46,6 +47,8 @@ var sectionOrder = []string{
 // a title derived from the filename.
 var sectionTitle = map[string]string{
 	"engine.go":         "Engine, configuration & core types",
+	"api_evaluator.go":  "Evaluation (experimental)",
+	"evalgate.go":       "Evaluation gates (experimental)",
 	"api_session.go":    "Sessions & state",
 	"api_agent.go":      "Agents",
 	"api_prompt.go":     "Prompts",

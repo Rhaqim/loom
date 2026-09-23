@@ -362,6 +362,12 @@ const ModalityStructured = engine.ModalityStructured
 // FlowAgent is one agent participating in a turn.
 type FlowAgent = engine.FlowAgent
 
+// FollowerGate is what a FlowAgent.When gate is given to decide on. It carries
+// the turn's state at the moment the follower would start.
+//
+// EXPERIMENTAL.
+type FollowerGate = engine.FollowerGate
+
 // Flow declares a turn as a lead agent plus parallel followers.
 type Flow = engine.Flow
 
@@ -500,6 +506,125 @@ var NewLLMPairwiseJudge = engine.NewLLMPairwiseJudge
 // GeneratorCompleter adapts a text Generator to judge.Completer so engine
 // generators can back real judges. The generator must return a TextResult.
 var GeneratorCompleter = engine.GeneratorCompleter
+
+////////////////////////////////////////////////////////////////////////////////
+// Evaluation (experimental)
+////////////////////////////////////////////////////////////////////////////////
+
+// Evaluator answers typed questions about a state, returning calibrated
+// answers rather than prose. See the evaluator package for the full contract
+// and for the typesafe (TypeSafe System One / Jev) and stub implementations.
+//
+// EXPERIMENTAL.
+type Evaluator = engine.Evaluator
+
+// EvalQuestion is one typed question about an evaluated state. Build them with
+// EvalNoul, EvalChoice and EvalScore rather than by hand.
+//
+// EXPERIMENTAL.
+type EvalQuestion = engine.EvalQuestion
+
+// EvalAnswer is the result of one EvalQuestion. Which fields carry meaning
+// depends on its type; the accessors (Yes, Is, Level, Certain) read the right
+// one.
+//
+// EXPERIMENTAL.
+type EvalAnswer = engine.EvalAnswer
+
+// EvalAnswers maps each question id to its answer. Its accessors are miss-safe,
+// so a gate written against a question that was never answered fails open
+// rather than panicking mid-turn.
+//
+// EXPERIMENTAL.
+type EvalAnswers = engine.EvalAnswers
+
+// Evaluation is the result of one Evaluate call: the answers, the model that
+// produced them, and the token usage.
+//
+// EXPERIMENTAL.
+type Evaluation = engine.Evaluation
+
+// EvalUsage reports the tokens an evaluation consumed.
+//
+// EXPERIMENTAL.
+type EvalUsage = engine.EvalUsage
+
+// EvalOutcome is one option or rubric level with its probability, as returned
+// by EvalAnswer.Ranked.
+//
+// EXPERIMENTAL.
+type EvalOutcome = engine.EvalOutcome
+
+// EvalType identifies the shape of an EvalQuestion.
+//
+// EXPERIMENTAL.
+type EvalType = engine.EvalType
+
+// EvalNoulType is a yes/no question answered as a probability in 0..1.
+const EvalNoulType = engine.EvalNoulType
+
+// EvalChoiceType picks one option from a named set.
+const EvalChoiceType = engine.EvalChoiceType
+
+// EvalScoreType rates the state against an ordered rubric of levels.
+const EvalScoreType = engine.EvalScoreType
+
+// EvalNoul builds a yes/no question. EXPERIMENTAL.
+var EvalNoul = engine.EvalNoul
+
+// EvalNoulWith builds a yes/no question that spells out what a yes and a no
+// mean. Describing both sides is the cheapest way to sharpen a vague
+// proposition. EXPERIMENTAL.
+var EvalNoulWith = engine.EvalNoulWith
+
+// EvalChoice builds a question that picks one option from a map of option name
+// to description. EXPERIMENTAL.
+var EvalChoice = engine.EvalChoice
+
+// EvalChoiceOf builds a Choice over bare option names with no descriptions.
+// EXPERIMENTAL.
+var EvalChoiceOf = engine.EvalChoiceOf
+
+// EvalScore builds a rubric question over ordered levels, lowest first.
+// EXPERIMENTAL.
+var EvalScore = engine.EvalScore
+
+// EvalScoreOf builds a rubric question whose levels are structured values
+// rather than plain strings. EXPERIMENTAL.
+var EvalScoreOf = engine.EvalScoreOf
+
+////////////////////////////////////////////////////////////////////////////////
+// Evaluation gates (experimental)
+////////////////////////////////////////////////////////////////////////////////
+
+// EvalVerdict is what a gate decides about a result.
+//
+// EXPERIMENTAL.
+type EvalVerdict = engine.EvalVerdict
+
+// EvalAccept passes the result through unchanged. The zero value, so a
+// Decide that falls off the end accepts rather than blocking the turn.
+const EvalAccept = engine.EvalAccept
+
+// EvalRetry sends the result back for another attempt, carrying the
+// decision's Reason and Forbidden list to the generator as a retry
+// annotation — the same path a hand-written validation hook uses.
+const EvalRetry = engine.EvalRetry
+
+// EvalReject fails the step outright with the decision's Reason. Use it for
+// a violation no retry will fix (a safety refusal, a hard policy breach);
+// prefer EvalRetry for quality problems, which usually do improve.
+const EvalReject = engine.EvalReject
+
+// EvalDecision is the outcome of a gate policy.
+//
+// EXPERIMENTAL.
+type EvalDecision = engine.EvalDecision
+
+// EvalGateConfig configures the post-hook returned by Engine.EvalGate.
+//
+// EXPERIMENTAL.
+type EvalGateConfig = engine.EvalGateConfig
 
 ////////////////////////////////////////////////////////////////////////////////
 // Cost tracking
@@ -745,6 +870,13 @@ var ErrInvalidConfig = engine.ErrInvalidConfig
 // ErrGeneratorNotRegistered is returned when a step references a generator slug
 // that was never registered with the engine. Wrapped errors name the slug.
 var ErrGeneratorNotRegistered = engine.ErrGeneratorNotRegistered
+
+// ErrEvaluatorNotConfigured is returned by Engine.Evaluate when the application
+// has not opted into the EXPERIMENTAL evaluation subsystem by setting
+// Config.Evaluator. It is deliberately distinct from an evaluation failure so a
+// caller can tell "the feature is off" from "the question could not be
+// answered" and fall back to its pre-evaluator behaviour in the first case.
+var ErrEvaluatorNotConfigured = engine.ErrEvaluatorNotConfigured
 
 // GenerationErrorKind classifies why a generator failed to produce a result, so
 // applications can react differently (e.g. retry transport failures but surface
