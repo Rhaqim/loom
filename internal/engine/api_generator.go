@@ -22,7 +22,8 @@ type GenerateParams struct {
 	FrequencyPenalty float64
 	PresencePenalty  float64
 	Seed             int
-	// Image / video specific
+	// Image / video / 3D-asset specific. Providers may use Extra for their
+	// native settings such as mesh resolution, style, rigging, or topology.
 	Width       int
 	Height      int
 	DurationSec float64
