@@ -482,6 +482,8 @@ func ResultText(r Result) string {
 		return v.Prompt
 	case *VideoResult:
 		return v.PreviewImage
+	case *Model3DResult:
+		return v.Prompt
 	}
 	return ""
 }

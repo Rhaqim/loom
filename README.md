@@ -13,14 +13,14 @@ Loom handles the infrastructure — session management, versioned agents and pro
 
 | | |
 |---|---|
-| **Modality-agnostic** | Text, image, video, and structured output in one pipeline |
+| **Modality-agnostic** | Text, image, video, audio, 3D assets, and structured output in one pipeline |
 | **Versioned agents & prompts** | Slug + version addressing; swap models without touching session history |
 | **Session branching & replay** | Fork at any step; explore alternatives; GC stale branches automatically |
 | **Hook bus** | Pre- and post-hooks for validation, retry logic, and content filtering |
 | **Cost tracking & budgets** | Per-step token/USD recording; time-windowed budget enforcement |
 | **Judge subsystem** | Rubric scoring, pairwise comparison, and binary constraints via LLM |
 | **Test harness** | YAML-driven test plans, variant matrices, parallel execution, assertion DSL |
-| **Multiple generators** | OpenAI, Anthropic, Replicate (images), Runway (video), plus an echo stub |
+| **Multiple generators** | OpenAI, Anthropic, Meshy (3D), Replicate (images), Runway (video), plus an echo stub |
 | **Postgres + SQLite** | Idempotent schema loader; bring your own `*sql.DB` |
 
 ---
@@ -533,6 +533,7 @@ loom/
 │   ├── anthropic/      # Anthropic Messages API (sync + streaming)
 │   ├── replicate/      # async image generation
 │   ├── runway/         # async video generation
+│   ├── meshy/          # async text/image-to-3D generation
 │   └── echo/           # echo stub (testing, no API key needed)
 ├── judge/              # RubricJudge, PairwiseJudge, ConstraintJudge
 ├── gc/                 # background branch GC worker
@@ -540,11 +541,12 @@ loom/
 ├── cmd/loom-cli/       # CLI: migrate, seed, test
 ├── scripts/            # gen-llms-full.sh
 ├── docs/               # design/architecture notes
-└── examples/           # each has its own go.mod
+└── examples/
     ├── quickstart/     # smallest possible program
     ├── story/          # minimal single-agent example
     ├── dnd/            # full D&D solo experience
     ├── storyapi/       # HTTP API with auth, sessions, streaming
+    ├── media-story/    # Go-template multi-modality narrative server
     └── conexus-loom/   # multi-agent, multimodal session via RunTurn (zero-setup)
 ```
 
