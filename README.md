@@ -20,7 +20,7 @@ Loom handles the infrastructure — session management, versioned agents and pro
 | **Cost tracking & budgets** | Per-step token/USD recording; time-windowed budget enforcement |
 | **Judge subsystem** | Rubric scoring, pairwise comparison, and binary constraints via LLM |
 | **Test harness** | YAML-driven test plans, variant matrices, parallel execution, assertion DSL |
-| **Multiple generators** | OpenAI, Anthropic, Replicate (images), Runway (video), plus an echo stub |
+| **Multiple generators** | OpenAI, Anthropic, Meshy (3D), Replicate (images), Runway (video), plus an echo stub |
 | **Postgres + SQLite** | Idempotent schema loader; bring your own `*sql.DB` |
 
 ---
