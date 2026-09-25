@@ -93,6 +93,9 @@ func main() {
 		ValidateSchemas: realProvider,
 		SemanticQuality: evalr != nil,
 		MinProseQuality: 1.0, // below "competent but flat" goes back to the Author
+		// One correction is useful; repeated evaluator false positives should
+		// not end an interactive story. Use -verbose to inspect each answer.
+		SemanticQualityRetryLimit: 1,
 	})
 
 	// transcript: optional investor-facing record (see transcript.go).

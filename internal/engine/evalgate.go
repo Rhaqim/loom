@@ -197,7 +197,23 @@ func (e *Engine) EvalGate(cfg EvalGateConfig) PostHook {
 			cfg.OnEvaluation(req, eval)
 		}
 
-		switch d := cfg.Decide(eval.Answers); d.Verdict {
+		d := cfg.Decide(eval.Answers)
+		// Evaluation output is otherwise transient: it is deliberately not a
+		// persisted Step Result. Log the typed response here so an application
+		// using a verbose Logger can see exactly which probability/score caused
+		// a gate to retry or reject, without logging the evaluated draft itself.
+		e.log.Info("eval gate response",
+			"agent", req.AgentSlug,
+			"attempt", req.Attempt(),
+			"model", eval.Model,
+			"answers", eval.Answers,
+			"input_tokens", eval.Usage.InputTokens,
+			"output_tokens", eval.Usage.OutputTokens,
+			"verdict", d.Verdict,
+			"reason", d.Reason,
+		)
+
+		switch d.Verdict {
 		case EvalRetry:
 			return nil, ErrRetryWith(RetryAnnotation{Reason: d.Reason, Forbidden: d.Forbidden})
 		case EvalReject:

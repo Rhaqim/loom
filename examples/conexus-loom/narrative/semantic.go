@@ -1,6 +1,8 @@
 package narrative
 
 import (
+	"context"
+
 	loom "github.com/rhaqim/loom"
 )
 
@@ -57,7 +59,16 @@ var proseLevels = []string{
 // The hook is inert on an engine with no Evaluator configured, so registering it
 // unconditionally is safe — see loom's EvalGate.
 func SemanticQualityGate(e *loom.Engine, minQuality float64) loom.PostHook {
-	return e.EvalGate(loom.EvalGateConfig{
+	return SemanticQualityGateWithRetryLimit(e, minQuality, -1)
+}
+
+// SemanticQualityGateWithRetryLimit is SemanticQualityGate with a per-gate
+// retry cap. A negative limit preserves normal Loom retry behaviour. Once the
+// cap is reached, the latest draft is accepted: this protects an interactive
+// story from a persistently over-sensitive evaluator while preserving the
+// evaluator response in verbose logs for threshold tuning.
+func SemanticQualityGateWithRetryLimit(e *loom.Engine, minQuality float64, retryLimit int) loom.PostHook {
+	gate := e.EvalGate(loom.EvalGateConfig{
 		Agents: []string{AgentAuthor},
 
 		// The questions are asked about the draft AND the previous scene, as
@@ -120,4 +131,14 @@ func SemanticQualityGate(e *loom.Engine, minQuality float64) loom.PostHook {
 			return loom.EvalDecision{Verdict: loom.EvalAccept}
 		},
 	})
+	if retryLimit < 0 {
+		return gate
+	}
+	return func(ctx context.Context, req *loom.StepRequest, res loom.Result) (loom.Result, error) {
+		out, err := gate(ctx, req, res)
+		if loom.IsRetry(err) && req.Attempt() >= retryLimit {
+			return res, nil
+		}
+		return out, err
+	}
 }

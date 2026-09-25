@@ -218,6 +218,13 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		errors.As(hookErr, &rerr)
 		ann := rerr.Annotation
 		diagnostics[fmt.Sprintf("retry_%d_reason", attempt+1)] = ann.Reason
+		s.e.log.Info("step retry",
+			"agent", agent.Slug,
+			"attempt", attempt+1,
+			"max_retries", maxRetries,
+			"reason", ann.Reason,
+			"forbidden", ann.Forbidden,
+		)
 
 		if keepBest {
 			diagnostics[fmt.Sprintf("attempt_%d_score", attempt)] = rerr.Score
