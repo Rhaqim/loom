@@ -58,6 +58,25 @@ func SlopBanHook(banned ...string) loom.PostHook {
 	}
 }
 
+// MaxWordsHook keeps Author scenes within a reader-friendly budget. The retry
+// annotation is also injected into the next generation attempt, so providers
+// that only follow prompts still receive the concrete limit. A hard token cap
+// belongs in the Flow; this hook catches models that ignore it.
+func MaxWordsHook(max int) loom.PostHook {
+	return func(_ context.Context, req *loom.StepRequest, res loom.Result) (loom.Result, error) {
+		if max <= 0 || req.AgentSlug != AgentAuthor {
+			return res, nil
+		}
+		words := len(strings.Fields(loom.ResultText(res)))
+		if words > max {
+			return nil, loom.ErrRetryWith(loom.RetryAnnotation{
+				Reason: fmt.Sprintf("the scene is %d words; rewrite it as 350–500 words and never exceed %d words", words, max),
+			})
+		}
+		return res, nil
+	}
+}
+
 // StalenessHook rejects Author prose that overlaps the previous turn's prose by
 // at least threshold (word-trigram Jaccard), asking loom to retry with guidance
 // to advance the story. threshold <= 0 defaults to 0.7.

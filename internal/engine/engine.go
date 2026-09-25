@@ -93,6 +93,19 @@ type Config struct {
 	// LLM. When set, a PromptRef.File must resolve (after symlink evaluation) to a
 	// path inside this root, or the read is rejected.
 	PromptFileRoot string
+	// Evaluator enables the EXPERIMENTAL evaluation subsystem: a decision
+	// primitive that answers typed questions (yes/no, pick-one, rate) about a
+	// state as calibrated probabilities, as the counterpart to a Generator's
+	// content production. See internal/engine/api_evaluator.go and the
+	// evaluator package.
+	//
+	// It is entirely opt-in. Nil — the default — leaves every engine code path
+	// exactly as it was: Engine.Evaluate returns ErrEvaluatorNotConfigured, no
+	// gate or hook consults an evaluator, and judges keep whatever backing the
+	// application registered. Set it to opt in; the engine still calls it only
+	// where the application wires it (EvalGate, FlowAgent.When, or an
+	// evaluator-backed judge).
+	Evaluator Evaluator
 }
 
 // Logger is the minimal logging interface the engine uses.
@@ -123,6 +136,10 @@ type Engine struct {
 	latestCacheTTL time.Duration
 	pricing        map[string]ModelPrice
 	defaultPrice   *ModelPrice
+	// evaluator backs the experimental evaluation subsystem; nil when the
+	// application has not opted in. Guarded by mu so SetEvaluator can replace it
+	// at runtime alongside a running turn, as RegisterGenerator does.
+	evaluator Evaluator
 
 	agents          *agentService
 	prompts         *promptService
@@ -205,6 +222,7 @@ func New(cfg Config) (*Engine, error) {
 		log:            log,
 		pricing:        cfg.Pricing,
 		defaultPrice:   cfg.DefaultPrice,
+		evaluator:      cfg.Evaluator,
 	}
 
 	e.prompts = &promptService{e: e}

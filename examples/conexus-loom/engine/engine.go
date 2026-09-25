@@ -38,6 +38,24 @@ type Config struct {
 	// the Staleness Detector) on the Author. Leave false for the offline stub
 	// (its fixed prose would trip the bans); enable for real providers.
 	QualityEngine bool
+	// SemanticQuality registers the EXPERIMENTAL evaluator-backed quality gate
+	// on the Author (narrative.SemanticQualityGate): the same job as
+	// QualityEngine, asked as questions rather than matched as strings, so it
+	// catches the clichés nobody listed and the repetition that reuses no
+	// words.
+	//
+	// It is inert unless the loom engine also has an Evaluator configured, so
+	// setting it without one changes nothing.
+	SemanticQuality bool
+	// MinProseQuality is the weighted score below which the semantic gate sends
+	// a draft back, on narrative's 0..3 prose rubric. Zero leaves the graded
+	// tier off and keeps only the two yes/no gates.
+	MinProseQuality float64
+	// SemanticQualityRetryLimit caps retries requested by the evaluator alone.
+	// Zero means it may request one retry; a negative value uses Loom's full
+	// step retry budget. This protects an interactive run from a classifier
+	// that repeatedly rejects otherwise usable prose.
+	SemanticQualityRetryLimit int
 }
 
 // Conexus is the application engine.
@@ -62,11 +80,21 @@ func New(cfg Config) *Conexus {
 		cfg.Loom.Hooks().RegisterPost("schema-validate", loom.SchemaValidationPostHook())
 	}
 	cfg.Loom.Hooks().RegisterPost("logician-qa", narrative.QAHook())
+	// Enforce a reader-friendly scene length for all providers. The Flow also
+	// supplies a max_tokens cap; this hook is the provider-independent backstop.
+	cfg.Loom.Hooks().RegisterPost("prose-length", narrative.MaxWordsHook(550))
 	if cfg.QualityEngine {
 		// Author-side quality gates: reject cliché prose and scenes that repeat
 		// the previous turn, asking loom to retry with guidance.
 		cfg.Loom.Hooks().RegisterPost("slop-bans", narrative.SlopBanHook())
 		cfg.Loom.Hooks().RegisterPost("staleness", narrative.StalenessHook(0))
+	}
+	if cfg.SemanticQuality {
+		// The semantic tier. Registered AFTER the deterministic hooks on
+		// purpose: the string checks are free, so let them catch what they can
+		// before spending a call on the questions they cannot ask.
+		cfg.Loom.Hooks().RegisterPost("semantic-quality",
+			narrative.SemanticQualityGateWithRetryLimit(cfg.Loom, cfg.MinProseQuality, cfg.SemanticQualityRetryLimit))
 	}
 	return c
 }
@@ -180,7 +208,7 @@ func (c *Conexus) PlayTurn(ctx context.Context, storyID uuid.UUID, accountID, ac
 		"plugin_note":  injected,
 	}
 
-	var sb strings.Builder
+	var streamedDraft strings.Builder
 	turn, err := c.cfg.Loom.RunTurn(ctx, sess, loom.TurnRequest{
 		Flow:   c.flow,
 		Action: freeText(action),
@@ -189,10 +217,21 @@ func (c *Conexus) PlayTurn(ctx context.Context, storyID uuid.UUID, accountID, ac
 		// current narrative tension travels to every agent.
 		Params: map[string]any{"tension": play.Tension},
 		OnChunk: func(ch loom.Chunk) {
-			sb.WriteString(ch.Content)
+			streamedDraft.WriteString(ch.Content)
 			if onChunk != nil {
 				onChunk(ch.Content)
 			}
+		},
+		OnStreamEnd: func(attempt int) {
+			// A rejected streamed draft cannot be persisted as a Step. Keep it in
+			// verbose logs, labeled by attempt, so evaluator decisions can be
+			// compared with the exact Loom output that triggered them.
+			c.cfg.Log.Info("author draft complete",
+				"attempt", attempt,
+				"words", len(strings.Fields(streamedDraft.String())),
+				"draft", streamedDraft.String(),
+			)
+			streamedDraft.Reset()
 		},
 	})
 	if err != nil {
@@ -200,10 +239,9 @@ func (c *Conexus) PlayTurn(ctx context.Context, storyID uuid.UUID, accountID, ac
 	}
 
 	res := &TurnResult{TurnID: turn.ID.String()}
-	res.Prose = strings.TrimSpace(sb.String())
-	if res.Prose == "" {
-		res.Prose = loom.ResultText(turn.Lead.Result)
-	}
+	// Do not reconstruct prose from streamed chunks: a retry streams rejected
+	// drafts too. The settled Loom result is the only draft that passed hooks.
+	res.Prose = strings.TrimSpace(loom.ResultText(turn.Lead.Result))
 
 	// Parse the Logician follower (QA hook already validated it).
 	var logic domain.LogicianOutput

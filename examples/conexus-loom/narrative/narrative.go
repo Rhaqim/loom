@@ -22,7 +22,9 @@ func Flow(versions map[string][]int, target int) loom.Flow {
 		// agents run cold for reliable structured output. Turn-wide params (e.g.
 		// tension) merge under these — see engine.PlayTurn.
 		Lead: loom.FlowAgent{AgentSlug: AgentAuthor, AgentVersion: ResolveVersion(versions, AgentAuthor, target), Stream: true, OutputKey: "Prose",
-			Params: map[string]any{"temperature": 0.85}},
+			// 700 output tokens keeps a scene near the 350–500 word target even
+			// before the prose-length hook needs to correct an overlong draft.
+			Params: map[string]any{"temperature": 0.85, "max_tokens": 700}},
 		Followers: []loom.FlowAgent{
 			{AgentSlug: AgentLogician, AgentVersion: ResolveVersion(versions, AgentLogician, target),
 				Params: map[string]any{"temperature": 0.2}},

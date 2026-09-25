@@ -408,6 +408,74 @@ outruns the deadline. Step costs are not at risk either way: they commit with th
 `e.Judges()` provides rubric scoring, pairwise comparison, and binary constraints via an LLM.
 See `github.com/rhaqim/loom/judge` and the README for `ScoreRequest`/`PairwiseRequest`.
 
+## Evaluations (EXPERIMENTAL, opt-in)
+
+An `Evaluator` is the decision counterpart to a `Generator`: a `Generator` PRODUCES content, an
+`Evaluator` DECIDES things about it. It answers typed questions — `EvalNoul` (yes/no, as a
+probability), `EvalChoice` (pick one, with the full distribution), `EvalScore` (rate against an
+ordered rubric) — in ONE round trip, with every question evaluated independently.
+
+**It is entirely opt-in.** With `Config.Evaluator` unset, `e.Evaluate` returns
+`ErrEvaluatorNotConfigured`, every gate is inert, and no other code path changes. The API may
+change shape in a future minor release.
+
+```go
+import "github.com/rhaqim/loom/evaluator/typesafe"   // TypeSafe System One (Jev)
+// import "github.com/rhaqim/loom/evaluator/stub"    // offline / tests
+
+e, _ := loom.New(loom.Config{ /* ... */ Evaluator: typesafe.New(os.Getenv("TYPESAFE_API_KEY")) })
+
+eval, err := e.Evaluate(ctx, prose, map[string]loom.EvalQuestion{
+    "cliched": loom.EvalNoul("Does this lean on stock clichés?"),
+    "intent":  loom.EvalChoice("What is the player trying to do?", map[string]any{
+        "explore": "Move or look around", "fight": "Attack something", "talk": "Address a character"}),
+    "quality": loom.EvalScore("Rate the prose",
+        "generic filler", "competent but flat", "vivid and specific", "genuinely striking"),
+})
+eval.Answers.Yes("cliched", 0.7)   // miss-safe: an unanswered question reads as a zero value
+eval.Answers.Choice("intent")
+eval.Answers.Score("quality")
+```
+
+Ask everything one decision needs in a SINGLE call — independence is the property this exists
+for, and splitting a decision across calls throws it away.
+
+**Gate a retry on the answers** with `e.EvalGate`, which turns them into accept / retry / reject
+and feeds the reason to the next attempt as an ordinary `RetryAnnotation`:
+
+```go
+e.Hooks().RegisterPost("quality", e.EvalGate(loom.EvalGateConfig{
+    Agents:    []string{"author"},          // scope it; an unnamed agent is never evaluated
+    Questions: func(*loom.StepRequest, loom.Result) map[string]loom.EvalQuestion { return qs },
+    Decide: func(a loom.EvalAnswers) loom.EvalDecision {
+        if a.Yes("cliched", 0.7) {
+            return loom.EvalDecision{Verdict: loom.EvalRetry, Reason: "rewrite without clichés"}
+        }
+        return loom.EvalDecision{Verdict: loom.EvalAccept}
+    },
+}))
+```
+Returning no questions from `Questions` skips the evaluation entirely (no call, no cost).
+The gate **fails open** by default — if the evaluator errors, the result passes through — so an
+outage in the decision layer degrades quality rather than taking the product down. Set
+`FailClosed: true` only for a rule you would rather serve nothing than violate.
+
+**Skip a whole follower** with `FlowAgent.When`, the real cost lever: one cheap classification
+deciding whether a full generation happens. Returning false opens no step and calls no
+generator; the slug lands on `Turn.Skipped` (not `Turn.Errors` — a skip is neither a success nor
+a failure). A nil `When` always runs, which is the historical behaviour.
+
+**Back the existing judges with it** — the adapters satisfy the same interfaces, so this is a
+swap, not a migration, and the confidence becomes a real property of the distribution rather
+than a number a model asserted:
+
+```go
+ev := typesafe.New(key)
+e.Judges().Register("quality", evaluator.NewRubricJudge("quality", ev))   // → EvalScore per dimension
+e.Judges().Register("rules",   evaluator.NewConstraintJudge("rules", ev)) // → EvalNoul
+e.Judges().Register("pick",    evaluator.NewPairwiseJudge("pick", ev))    // → EvalChoice A/B/tie
+```
+
 ## Sessions: branching & replay, GC
 
 - Fork at a step: `branch, _ := e.Sessions().Fork(ctx, sess.ID, stepIndex)` — parent untouched.
