@@ -201,3 +201,38 @@ func TestLayeredExecution_IndependentFollowersStillConcurrent(t *testing.T) {
 		t.Fatalf("followers run = %d, want 2", len(turn.Followers))
 	}
 }
+
+func TestLayeredExecution_IndependentFollowersEachGetsOwnAgent(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reproEngine(t, "layer_indep_unique", map[string]Generator{"echo": echoPromptGen{}}, PollerConfig{})
+	mkEchoAgent(t, e, "lead", "L", nil)
+	mkEchoAgent(t, e, "f1", "one", nil)
+	mkEchoAgent(t, e, "f2", "two", nil)
+	mkEchoAgent(t, e, "f3", "three", nil)
+
+	sess := &Session{PlatformID: "p"}
+	if err := e.Sessions().Create(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	flow := Flow{
+		Slug: "t",
+		Lead: FlowAgent{AgentSlug: "lead", OutputKey: "Lead"},
+		Followers: []FlowAgent{
+			{AgentSlug: "f1", OutputKey: "F1"},
+			{AgentSlug: "f2", OutputKey: "F2"},
+			{AgentSlug: "f3", OutputKey: "F3"},
+		},
+	}
+	turn, err := e.RunTurn(ctx, sess, TurnRequest{Flow: flow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, slug := range []string{"f1", "f2", "f3"} {
+		if _, ok := turn.Followers[slug]; !ok {
+			t.Fatalf("follower %q missing from the turn: %v", slug, turn.Errors)
+		}
+	}
+	if len(turn.Followers) != 3 {
+		t.Fatalf("followers run = %d, want 3", len(turn.Followers))
+	}
+}

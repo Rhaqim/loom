@@ -339,10 +339,10 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 		for _, idx := range layer {
 			f := followers[idx]
 			wg.Add(1)
-			go func() {
+			go func(f FlowAgent) {
 				defer wg.Done()
 				runFollower(f)
-			}()
+			}(f)
 		}
 		wg.Wait()
 		// Barrier: publish this layer's outputs into the shared inputs so the
