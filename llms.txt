@@ -4,7 +4,7 @@
 > infrastructure — Postgres/SQLite persistence, versioned agents & prompts, session
 > branching/replay, a hook pipeline, cost tracking & budgets, LLM-as-judge scoring, and
 > multi-agent "turns" — so an application focuses on its product, not the plumbing.
-> Modality-agnostic: text, image, video, and structured JSON output flow through one pipeline.
+> Modality-agnostic: text, image, video, audio, 3D assets, and structured JSON output flow through one pipeline.
 
 This file is an AI-oriented guide (an "llms.txt"): read it before writing code that uses loom.
 It is accurate to the current public API. Everything shown is importable from the single
@@ -171,6 +171,10 @@ Built-in adapters (each `New...` takes an API key + model unless noted):
 - `generator/anthropic` → `anthropic.NewChatGenerator(key, model)`   — text, streaming
 - `generator/replicate` → `replicate.NewImageGenerator(key, model)`  — image, async
 - `generator/runway`    → `runway.NewVideoGenerator(key, model)`      — video, async
+- `generator/meshy`     → `meshy.NewModel3DGenerator(key)`            — 3D (GLB `Model3DResult`), async.
+  Text-to-3D by default (prompt ≤ `meshy.MaxPromptChars`, runs preview then refine); set
+  `Params.Extra["image_url"]` for image-to-3D. Other `Extra` keys pass through to Meshy;
+  `refine_`-prefixed keys go to the refine stage (e.g. `"refine_enable_pbr": true`).
 - `generator/echo`      → `echo.New(prefix)`                          — text stub, no API key
 
 Register at construction (`Config.Generators`) or at runtime: `e.RegisterGenerator("slug", gen)`.
@@ -220,7 +224,15 @@ func (g *MyImageGen) Poll(ctx context.Context, h loom.TaskHandle) (loom.Result, 
     // loom.NewPendingResult(...) to be polled again.
 }
 ```
-Enable polling via `Config.AsyncPoller` (Interval, Workers) and `e.StartPoller(ctx)`.
+Enable polling via `Config.AsyncPoller` (Interval, Workers, MaxAttempts) **and** `e.StartPoller(ctx)`
+— the poller does not run until started, and pending tasks stay pending forever without it.
+- The task is stored under the slug the generator is *registered* as; the adapter's
+  `TaskHandle.Provider` is overwritten, so register an async generator under any slug you like.
+- Multi-stage jobs: `Poll` may return a pending result with a **new** `TaskHandle.Handle` (e.g.
+  preview finished → refine submitted). The poller persists it and resets the attempt count, so
+  the next poll uses the new handle — never resubmit a stage from an old handle.
+- Check a job from your app with `e.TaskStatus(ctx, step.Result.TaskHandle().ID)` → `"pending" |
+  "ready" | "failed"` plus the resolved `Result` when ready.
 
 ## Error handling (typed — use errors.Is / errors.As)
 
@@ -320,8 +332,17 @@ field on `AgentCostStats`) tells you which you have — render `TotalUSD`/`ByMod
 loom.New(loom.Config{ /* ... */
     Pricing: map[string]loom.ModelPrice{"gpt-4o": {InputPer1M: 2.50, OutputPer1M: 10.00}},
     DefaultPrice: &loom.ModelPrice{InputPer1M: 1, OutputPer1M: 3}, // models absent from Pricing
+    // Per-job USD for tokenless generators (image/video/audio/3D), keyed by model id or slug.
+    JobPricing: map[string]float64{"meshy-3d": 0.40},
 })
 ```
+
+`PricingConfigured` on a summary is computed from the rows it sums: it is false if **any**
+included row was priced from the placeholder (`StepUsage.Estimated`), even when other models are
+priced. Tokenless results (image/video/audio/3D) are priced from `Config.JobPricing`, charged at
+submission so pending async jobs count toward budgets; with no entry they are recorded at $0 and
+marked Estimated. Rows record the generator that actually ran, so `StepRequest.GeneratorOverride`
+is costed against the override, not the agent's default.
 
 Cost is written **inside the step's own transaction**, so a durable step always has a durable
 cost row — `ByStep` and `SessionUsage` are readable the moment `RunStep` returns, with no

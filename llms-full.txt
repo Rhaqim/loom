@@ -4,7 +4,7 @@
 > infrastructure — Postgres/SQLite persistence, versioned agents & prompts, session
 > branching/replay, a hook pipeline, cost tracking & budgets, LLM-as-judge scoring, and
 > multi-agent "turns" — so an application focuses on its product, not the plumbing.
-> Modality-agnostic: text, image, video, and structured JSON output flow through one pipeline.
+> Modality-agnostic: text, image, video, audio, 3D assets, and structured JSON output flow through one pipeline.
 
 This file is an AI-oriented guide (an "llms.txt"): read it before writing code that uses loom.
 It is accurate to the current public API. Everything shown is importable from the single
@@ -171,6 +171,10 @@ Built-in adapters (each `New...` takes an API key + model unless noted):
 - `generator/anthropic` → `anthropic.NewChatGenerator(key, model)`   — text, streaming
 - `generator/replicate` → `replicate.NewImageGenerator(key, model)`  — image, async
 - `generator/runway`    → `runway.NewVideoGenerator(key, model)`      — video, async
+- `generator/meshy`     → `meshy.NewModel3DGenerator(key)`            — 3D (GLB `Model3DResult`), async.
+  Text-to-3D by default (prompt ≤ `meshy.MaxPromptChars`, runs preview then refine); set
+  `Params.Extra["image_url"]` for image-to-3D. Other `Extra` keys pass through to Meshy;
+  `refine_`-prefixed keys go to the refine stage (e.g. `"refine_enable_pbr": true`).
 - `generator/echo`      → `echo.New(prefix)`                          — text stub, no API key
 
 Register at construction (`Config.Generators`) or at runtime: `e.RegisterGenerator("slug", gen)`.
@@ -220,7 +224,15 @@ func (g *MyImageGen) Poll(ctx context.Context, h loom.TaskHandle) (loom.Result, 
     // loom.NewPendingResult(...) to be polled again.
 }
 ```
-Enable polling via `Config.AsyncPoller` (Interval, Workers) and `e.StartPoller(ctx)`.
+Enable polling via `Config.AsyncPoller` (Interval, Workers, MaxAttempts) **and** `e.StartPoller(ctx)`
+— the poller does not run until started, and pending tasks stay pending forever without it.
+- The task is stored under the slug the generator is *registered* as; the adapter's
+  `TaskHandle.Provider` is overwritten, so register an async generator under any slug you like.
+- Multi-stage jobs: `Poll` may return a pending result with a **new** `TaskHandle.Handle` (e.g.
+  preview finished → refine submitted). The poller persists it and resets the attempt count, so
+  the next poll uses the new handle — never resubmit a stage from an old handle.
+- Check a job from your app with `e.TaskStatus(ctx, step.Result.TaskHandle().ID)` → `"pending" |
+  "ready" | "failed"` plus the resolved `Result` when ready.
 
 ## Error handling (typed — use errors.Is / errors.As)
 
@@ -320,8 +332,17 @@ field on `AgentCostStats`) tells you which you have — render `TotalUSD`/`ByMod
 loom.New(loom.Config{ /* ... */
     Pricing: map[string]loom.ModelPrice{"gpt-4o": {InputPer1M: 2.50, OutputPer1M: 10.00}},
     DefaultPrice: &loom.ModelPrice{InputPer1M: 1, OutputPer1M: 3}, // models absent from Pricing
+    // Per-job USD for tokenless generators (image/video/audio/3D), keyed by model id or slug.
+    JobPricing: map[string]float64{"meshy-3d": 0.40},
 })
 ```
+
+`PricingConfigured` on a summary is computed from the rows it sums: it is false if **any**
+included row was priced from the placeholder (`StepUsage.Estimated`), even when other models are
+priced. Tokenless results (image/video/audio/3D) are priced from `Config.JobPricing`, charged at
+submission so pending async jobs count toward budgets; with no entry they are recorded at $0 and
+marked Estimated. Rows record the generator that actually ran, so `StepRequest.GeneratorOverride`
+is costed against the override, not the agent's default.
 
 Cost is written **inside the step's own transaction**, so a durable step always has a durable
 cost row — `ByStep` and `SessionUsage` are readable the moment `RunStep` returns, with no
@@ -1288,6 +1309,14 @@ type Config struct {
 	Pricing map[string]ModelPrice
 	// DefaultPrice is used for models absent from Pricing (default: $1/$3 per 1M).
 	DefaultPrice *ModelPrice
+	// JobPricing maps a generator slug or reported model id → USD per
+	// generation, for providers that bill per job rather than per token (image,
+	// video, audio and 3D generators). The model id is tried first, then the
+	// generator slug. A job is charged when it is submitted, which is when most
+	// providers bill, so an async job counts toward budgets while it is still
+	// pending. A tokenless result with no entry here is recorded at $0 and
+	// marked Estimated, since its real cost is unknown.
+	JobPricing map[string]float64
 	// BranchGC configures the branch garbage collector used by Engine.GC().
 	// Nil uses safe defaults (DryRun=true, so nothing is deleted); set an explicit
 	// config with DryRun=false to actually sweep. The Dialect is filled in from
@@ -2014,7 +2043,8 @@ type GenerateParams struct {
 	FrequencyPenalty float64
 	PresencePenalty  float64
 	Seed             int
-	// Image / video specific
+	// Image / video / 3D-asset specific. Providers may use Extra for their
+	// native settings such as mesh resolution, style, rigging, or topology.
 	Width       int
 	Height      int
 	DurationSec float64
@@ -2198,13 +2228,47 @@ type Modality string
     Modality is the output kind a generator produces.
 
 const (
-	ModalityText       Modality = "text"
-	ModalityImage      Modality = "image"
-	ModalityVideo      Modality = "video"
-	ModalityAudio      Modality = "audio"
+	ModalityText  Modality = "text"
+	ModalityImage Modality = "image"
+	ModalityVideo Modality = "video"
+	ModalityAudio Modality = "audio"
+	// ModalityModel3D is a generated, renderable 3D asset (normally a GLB).
+	// It is distinct from ModalityWorld, which carries logical world-state
+	// deltas rather than a model file.
+	ModalityModel3D    Modality = "model3d"
 	ModalityWorld      Modality = "world"
 	ModalityStructured Modality = "structured"
 )
+type Model3DResult struct {
+	URL          string
+	Format       string
+	PreviewImage string
+	Prompt       string
+	PolyCount    int
+	Rigged       bool
+	// Has unexported fields.
+}
+    Model3DResult is the output from a 3D-model generator. URL should normally
+    reference a binary glTF (.glb) asset, the portable format consumed by web
+    renderers such as Three.js. PreviewImage is an optional rendered thumbnail.
+    The common fields capture the properties a renderer needs to choose and load
+    the asset; applications can retain provider-specific data in their own asset
+    catalog keyed by URL or ResultID.
+
+func NewModel3DResult(url, format, previewImage, prompt string, polyCount int, rigged bool) *Model3DResult
+    NewModel3DResult creates a ready Model3DResult. format is the file format or
+    MIME type (for example "model/gltf-binary" or "glb").
+
+func (r *Model3DResult) Metadata() map[string]any
+
+func (r *Model3DResult) Modality() Modality
+
+func (r *Model3DResult) ResultID() uuid.UUID
+
+func (r *Model3DResult) Status() ResultStatus
+
+func (r *Model3DResult) TaskHandle() *TaskHandle
+
 type ModelPrice struct {
 	InputPer1M  float64
 	OutputPer1M float64
@@ -3213,6 +3277,48 @@ func (g *VideoGenerator) Modality() loom.Modality
 func (g *VideoGenerator) Poll(ctx context.Context, handle loom.TaskHandle) (loom.Result, error)
     Poll checks the RunwayML task status and returns the final VideoResult once
     the video is ready.
+
+
+################################################################################
+# github.com/rhaqim/loom/generator/meshy
+################################################################################
+
+package meshy // import "github.com/rhaqim/loom/generator/meshy"
+
+Package meshy provides a Loom generator adapter for Meshy's text-to-3D and
+image-to-3D APIs. It produces GLB-backed Model3DResults asynchronously.
+
+CONSTANTS
+
+const MaxPromptChars = 600
+    MaxPromptChars is Meshy's text-to-3D prompt limit. Longer prompts are
+    rejected before submission so the caller gets a clear error instead of a
+    provider 400.
+
+
+TYPES
+
+type Model3DGenerator struct {
+	// Has unexported fields.
+}
+
+func NewModel3DGenerator(apiKey string) *Model3DGenerator
+    NewModel3DGenerator creates a Meshy 3D generator. apiKey is a Meshy API key.
+
+func (g *Model3DGenerator) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error)
+    Generate submits a Meshy job. For image-to-3D, pass the
+    externally reachable image URL (or Meshy-supported data URI) in
+    GenerateParams.Extra["image_url"].
+
+func (g *Model3DGenerator) Modality() loom.Modality
+
+func (g *Model3DGenerator) Poll(ctx context.Context, handle loom.TaskHandle) (loom.Result, error)
+    Poll resolves an image task directly. A text task that has completed its
+    preview transparently starts the Meshy refine stage, then resolves its GLB.
+
+func (g *Model3DGenerator) WithBaseURL(url string) *Model3DGenerator
+    WithBaseURL replaces Meshy's API URL. It is primarily useful with an
+    httptest server; production callers should leave the default unchanged.
 
 
 ################################################################################

@@ -267,6 +267,15 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	if req.Action != nil && req.Action.ID == (uuid.UUID{}) {
 		req.Action.ID = uuid.New()
 	}
+	// An async result's task is persisted under the slug the generator is
+	// registered as, not whatever Provider the adapter wrote: the poller finds
+	// the generator to Poll by this name. Adapters hard-code their brand
+	// ("meshy", "replicate"), so a generator registered under any other key
+	// ("meshy-3d") left its task pending forever with nothing to poll it.
+	if th := result.TaskHandle(); th != nil {
+		th.Provider = genSlug
+	}
+
 	// Tag the step with turn linkage when it is part of a RunTurn flow so the
 	// steps of one turn can be grouped for branching, replay, and cost rollups.
 	if req.turnID != uuid.Nil {

@@ -96,14 +96,17 @@ func (c *costService) buildCostRecord(step *Step, agent *Agent, genSlug string, 
 		inputTokens  int
 		outputTokens int
 		usdCost      float64
+		priceKnown   bool
+		images       int
+		tokenBilled  bool
 	)
 	switch r := result.(type) {
 	case *TextResult:
-		inputTokens = r.InputTokens
-		outputTokens = r.OutputTokens
+		inputTokens, outputTokens, tokenBilled = r.InputTokens, r.OutputTokens, true
 	case *StructuredResult:
-		inputTokens = r.InputTokens
-		outputTokens = r.OutputTokens
+		inputTokens, outputTokens, tokenBilled = r.InputTokens, r.OutputTokens, true
+	case *ImageResult:
+		images = 1
 	}
 	// Per-model pricing: the generator reports its model on result metadata;
 	// fall back to the slug of the generator that ran as the pricing key.
@@ -111,8 +114,16 @@ func (c *costService) buildCostRecord(step *Step, agent *Agent, genSlug string, 
 	if model == "" {
 		model = genSlug
 	}
-	price, priceKnown := c.e.priceFor(model)
-	usdCost = price.Cost(inputTokens, outputTokens)
+	if tokenBilled {
+		var price ModelPrice
+		price, priceKnown = c.e.priceFor(model)
+		usdCost = price.Cost(inputTokens, outputTokens)
+	} else {
+		// Media and async results carry no tokens, so token pricing would
+		// record a confident $0 for a job the provider billed. Use the per-job
+		// price, or mark the row Estimated when none is configured.
+		usdCost, priceKnown = c.e.jobPriceFor(ResultModel(result), genSlug)
+	}
 
 	return CostRecord{
 		// Estimated marks a record whose USD figure came from the built-in flat
@@ -123,6 +134,7 @@ func (c *costService) buildCostRecord(step *Step, agent *Agent, genSlug string, 
 		Modal:        agent.Modal,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
+		Images:       images,
 		USDCost:      usdCost,
 		StepID:       step.ID,
 		AgentID:      agent.ID,

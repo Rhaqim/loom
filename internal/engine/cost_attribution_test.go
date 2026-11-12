@@ -154,3 +154,50 @@ func TestPricingConfiguredReflectsRows(t *testing.T) {
 		t.Fatalf("a placeholder-priced row is included, yet PricingConfigured = true (TotalUSD=%v)", u.TotalUSD)
 	}
 }
+
+// Tokenless (media/async) generations are priced per job. Without an entry they
+// must be marked Estimated, not recorded as a confident $0 — even when a token
+// DefaultPrice is configured.
+func TestJobPricingForTokenlessResults(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file:jobprice_"+uuid.NewString()+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := schema.NewLoader(schema.DialectSQLite).Apply(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	e, err := New(Config{
+		DB: db, Dialect: DialectSQLite,
+		Generators:   map[string]Generator{"default": asyncModel3DGen{}, "unpriced": asyncModel3DGen{}},
+		DefaultPrice: &ModelPrice{InputPer1M: 1, OutputPer1M: 1},
+		JobPricing:   map[string]float64{"default": 0.4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := setupAgentSession(t, e)
+	if err := e.Agents().Create(ctx, &Agent{Slug: "a3d", Version: 1, Modal: ModalityModel3D, GeneratorSlug: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a3d"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "a3d", GeneratorOverride: "unpriced"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := e.Cost().ByStep(ctx, sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	if rows[0].USDCost != 0.4 || rows[0].Estimated {
+		t.Fatalf("priced job: usd=%v estimated=%v, want 0.4/false", rows[0].USDCost, rows[0].Estimated)
+	}
+	if rows[1].USDCost != 0 || !rows[1].Estimated {
+		t.Fatalf("unpriced job: usd=%v estimated=%v, want 0/true", rows[1].USDCost, rows[1].Estimated)
+	}
+}

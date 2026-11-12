@@ -75,6 +75,16 @@ func sqlTaskStatus(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID)
 	return status, result, nil
 }
 
+// sqlAdvanceTaskHandle records that a multi-stage provider job moved to a new
+// stage under a new external handle, and resets the attempt counter so each
+// stage gets the full poll budget.
+func sqlAdvanceTaskHandle(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID, handle string) error {
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE %stasks SET handle=$1, attempts=0, last_error='', updated_at=$2 WHERE id=$3 AND status='pending'`,
+		prefix), handle, time.Now(), id)
+	return err
+}
+
 func sqlIncrementTaskAttempts(ctx context.Context, db *sql.DB, prefix string, id uuid.UUID, lastErr string) error {
 	_, err := db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %stasks SET attempts=attempts+1, last_error=$1, updated_at=$2 WHERE id=$3`,

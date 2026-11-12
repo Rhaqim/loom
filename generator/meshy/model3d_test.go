@@ -98,3 +98,57 @@ func TestModel3DGeneratorImageFlow(t *testing.T) {
 		t.Fatalf("result = %#v", res)
 	}
 }
+
+func TestModel3DGeneratorRefineOptions(t *testing.T) {
+	var preview, refine map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["mode"] == "refine" {
+				refine = body
+				_, _ = w.Write([]byte(`{"result":"refine-id"}`))
+				return
+			}
+			preview = body
+			_, _ = w.Write([]byte(`{"result":"preview-id"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"SUCCEEDED"}`))
+	}))
+	defer srv.Close()
+
+	g := NewModel3DGenerator("key").WithBaseURL(srv.URL)
+	res, err := g.Generate(context.Background(), loom.GenerateRequest{UserPrompt: "a chapel", Params: loom.GenerateParams{Extra: map[string]any{
+		"art_style": "realistic", "refine_enable_pbr": true, "refine_texture_prompt": "mossy stone",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview["art_style"] != "realistic" || preview["enable_pbr"] != nil || preview["refine_enable_pbr"] != nil {
+		t.Fatalf("preview body = %#v; refine_ options must not reach the preview", preview)
+	}
+	if _, err := g.Poll(context.Background(), *res.TaskHandle()); err != nil {
+		t.Fatal(err)
+	}
+	if refine["enable_pbr"] != true || refine["texture_prompt"] != "mossy stone" || refine["preview_task_id"] != "preview-id" {
+		t.Fatalf("refine body = %#v", refine)
+	}
+}
+
+func TestModel3DGeneratorRejectsLongPrompt(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	defer srv.Close()
+	g := NewModel3DGenerator("key").WithBaseURL(srv.URL)
+	long := make([]byte, MaxPromptChars+1)
+	for i := range long {
+		long[i] = 'a'
+	}
+	if _, err := g.Generate(context.Background(), loom.GenerateRequest{UserPrompt: string(long)}); err == nil {
+		t.Fatal("over-limit prompt accepted")
+	}
+	if called {
+		t.Fatal("over-limit prompt was submitted to Meshy")
+	}
+}

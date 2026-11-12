@@ -32,7 +32,7 @@ HDR
   printf '\n%s\n# github.com/rhaqim/loom  (use these under the loom. prefix)\n%s\n\n' "$rule" "$rule"
   go doc -all ./internal/engine
 
-  for pkg in schema generator/openai generator/anthropic generator/replicate generator/runway generator/echo judge harness cmd/loom-cli; do
+  for pkg in schema generator/openai generator/anthropic generator/replicate generator/runway generator/meshy generator/echo judge harness cmd/loom-cli; do
     printf '\n%s\n# github.com/rhaqim/loom/%s\n%s\n\n' "$rule" "$pkg" "$rule"
     go doc -all "./$pkg" 2>/dev/null || echo "(no exported API)"
   done

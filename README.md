@@ -258,6 +258,7 @@ Register any number of generators under a slug. Built-in adapters:
 | `generator/anthropic` | `NewChatGenerator(key, model)` | Text (streaming) |
 | `generator/replicate` | `NewImageGenerator(key, model)` | Image (async) |
 | `generator/runway` | `NewVideoGenerator(key, model)` | Video (async) |
+| `generator/meshy` | `NewModel3DGenerator(key)` | 3D asset, GLB (async, text- or image-to-3D) |
 | `generator/echo` | `New(prefix)` | Text — echo stub for testing |
 
 Bring your own by implementing one of three flavors — register it with
@@ -361,8 +362,12 @@ Other typed errors: `*loom.BudgetExceededError` (budget block), `*loom.RetryErro
 
 ### Cost tracking & budgets
 
-Every step records input/output tokens and USD cost (based on the built-in pricing
-table). Budgets enforce a spend cap per platform key (`Target.Kind` must be
+Every step records input/output tokens and USD cost. Token-billed generators are
+priced from `Config.Pricing`/`Config.DefaultPrice`; per-job generators (image, video,
+audio, 3D) from `Config.JobPricing` (USD per job, keyed by model id or generator slug).
+Rows priced from the built-in placeholder rate are marked `Estimated`, and a summary's
+`PricingConfigured` is false whenever any row it sums was estimated — show its USD as
+unknown in that case. Budgets enforce a spend cap per platform key (`Target.Kind` must be
 `loom.TargetPlatformID` — other kinds are rejected). Enforcement is best-effort
 (reads prior recorded spend; fails open on DB errors), not a hard transactional
 ceiling.

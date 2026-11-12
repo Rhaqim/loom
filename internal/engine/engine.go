@@ -81,6 +81,14 @@ type Config struct {
 	Pricing map[string]ModelPrice
 	// DefaultPrice is used for models absent from Pricing (default: $1/$3 per 1M).
 	DefaultPrice *ModelPrice
+	// JobPricing maps a generator slug or reported model id → USD per
+	// generation, for providers that bill per job rather than per token (image,
+	// video, audio and 3D generators). The model id is tried first, then the
+	// generator slug. A job is charged when it is submitted, which is when most
+	// providers bill, so an async job counts toward budgets while it is still
+	// pending. A tokenless result with no entry here is recorded at $0 and
+	// marked Estimated, since its real cost is unknown.
+	JobPricing map[string]float64
 	// BranchGC configures the branch garbage collector used by Engine.GC().
 	// Nil uses safe defaults (DryRun=true, so nothing is deleted); set an explicit
 	// config with DryRun=false to actually sweep. The Dialect is filled in from
@@ -136,6 +144,7 @@ type Engine struct {
 	latestCacheTTL time.Duration
 	pricing        map[string]ModelPrice
 	defaultPrice   *ModelPrice
+	jobPricing     map[string]float64
 	// evaluator backs the experimental evaluation subsystem; nil when the
 	// application has not opted in. Guarded by mu so SetEvaluator can replace it
 	// at runtime alongside a running turn, as RegisterGenerator does.
@@ -222,6 +231,7 @@ func New(cfg Config) (*Engine, error) {
 		log:            log,
 		pricing:        cfg.Pricing,
 		defaultPrice:   cfg.DefaultPrice,
+		jobPricing:     cfg.JobPricing,
 		evaluator:      cfg.Evaluator,
 	}
 
