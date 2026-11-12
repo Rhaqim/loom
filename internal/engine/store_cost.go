@@ -32,22 +32,34 @@ func sqlInsertCostRecord(ctx context.Context, db execer, prefix string, rec Cost
 	return err
 }
 
-func sqlSessionUsage(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID) (*UsageSummary, error) {
+// estimatedCountSQL counts rows priced from the placeholder rate. Written as
+// SUM(CASE ...) rather than BOOL_OR/COUNT FILTER so it runs on both Postgres
+// and SQLite.
+const estimatedCountSQL = `COALESCE(SUM(CASE WHEN estimated THEN 1 ELSE 0 END),0)`
+
+// sqlSessionUsage returns the session's totals and how many of the summed rows
+// were priced from the placeholder rate (see costService.pricedFromRows).
+func sqlSessionUsage(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID) (*UsageSummary, int, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT COALESCE(SUM(usd_cost),0), COALESCE(SUM(input_tokens+output_tokens),0), COUNT(*)
-		FROM %scost_records WHERE session_id=$1`, prefix), sessionID)
+		SELECT COALESCE(SUM(usd_cost),0), COALESCE(SUM(input_tokens+output_tokens),0), COUNT(*), %s
+		FROM %scost_records WHERE session_id=$1`, estimatedCountSQL, prefix), sessionID)
 	s := &UsageSummary{ByModel: map[string]float64{}}
-	return s, row.Scan(&s.TotalUSD, &s.TotalTokens, &s.StepCount)
+	var estimated int
+	err := row.Scan(&s.TotalUSD, &s.TotalTokens, &s.StepCount, &estimated)
+	return s, estimated, err
 }
 
-func sqlUsage(ctx context.Context, db *sql.DB, prefix string, q UsageQuery) (*UsageSummary, error) {
+// sqlUsage is sqlSessionUsage for a platform over a time window.
+func sqlUsage(ctx context.Context, db *sql.DB, prefix string, q UsageQuery) (*UsageSummary, int, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT COALESCE(SUM(usd_cost),0), COALESCE(SUM(input_tokens+output_tokens),0), COUNT(*)
+		SELECT COALESCE(SUM(usd_cost),0), COALESCE(SUM(input_tokens+output_tokens),0), COUNT(*), %s
 		FROM %scost_records
-		WHERE platform_id=$1 AND created_at BETWEEN $2 AND $3`, prefix),
+		WHERE platform_id=$1 AND created_at BETWEEN $2 AND $3`, estimatedCountSQL, prefix),
 		q.Target.Key, q.From, q.To)
 	s := &UsageSummary{ByModel: map[string]float64{}}
-	return s, row.Scan(&s.TotalUSD, &s.TotalTokens, &s.StepCount)
+	var estimated int
+	err := row.Scan(&s.TotalUSD, &s.TotalTokens, &s.StepCount, &estimated)
+	return s, estimated, err
 }
 
 func sqlByAgent(ctx context.Context, db *sql.DB, prefix string, q UsageQuery) ([]AgentUsage, error) {
@@ -73,7 +85,9 @@ func sqlByAgent(ctx context.Context, db *sql.DB, prefix string, q UsageQuery) ([
 	return out, rows.Err()
 }
 
-func sqlAgentStats(ctx context.Context, db *sql.DB, prefix string, agentID uuid.UUID, window time.Duration) (*AgentCostStats, error) {
+// sqlAgentStats also returns the row count and how many rows were priced from
+// the placeholder rate (see costService.pricedFromRows).
+func sqlAgentStats(ctx context.Context, db *sql.DB, prefix string, agentID uuid.UUID, window time.Duration) (*AgentCostStats, int, int, error) {
 	since := time.Now().Add(-window)
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT
@@ -81,11 +95,15 @@ func sqlAgentStats(ctx context.Context, db *sql.DB, prefix string, agentID uuid.
 			PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY usd_cost),
 			PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY usd_cost),
 			PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY input_tokens+output_tokens),
-			PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY input_tokens+output_tokens)
-		FROM %scost_records WHERE agent_id=$1 AND created_at >= $2`, prefix),
+			PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY input_tokens+output_tokens),
+			COUNT(*),
+			%s
+		FROM %scost_records WHERE agent_id=$1 AND created_at >= $2`, estimatedCountSQL, prefix),
 		agentID, since)
 	s := &AgentCostStats{}
-	return s, row.Scan(&s.USDMean, &s.USDP50, &s.USDP95, &s.TokensP50, &s.TokensP95)
+	var rows, estimated int
+	err := row.Scan(&s.USDMean, &s.USDP50, &s.USDP95, &s.TokensP50, &s.TokensP95, &rows, &estimated)
+	return s, rows, estimated, err
 }
 
 // sqlStepUsage returns one usage row per recorded step of a session, oldest

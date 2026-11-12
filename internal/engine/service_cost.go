@@ -16,18 +16,31 @@ func (e *Engine) pricingConfigured() bool {
 	return len(e.pricing) > 0 || e.defaultPrice != nil
 }
 
+// pricedFromRows decides PricingConfigured for an aggregate from the rows it
+// summed: the figure is real money only if none of them was priced from the
+// placeholder rate. Deriving it from engine config instead ("any model has a
+// price") reported placeholder USD as real whenever a single model was priced
+// — e.g. a dry run on an unpriced generator alongside a priced one. With no
+// rows there is nothing to judge, so fall back to the engine's configuration.
+func (e *Engine) pricedFromRows(rows, estimatedRows int) bool {
+	if rows == 0 {
+		return e.pricingConfigured()
+	}
+	return estimatedRows == 0
+}
+
 func (c *costService) SessionUsage(ctx context.Context, sessionID uuid.UUID) (*UsageSummary, error) {
-	s, err := sqlSessionUsage(ctx, c.e.db, c.e.prefix, sessionID)
+	s, estimated, err := sqlSessionUsage(ctx, c.e.db, c.e.prefix, sessionID)
 	if s != nil {
-		s.PricingConfigured = c.e.pricingConfigured()
+		s.PricingConfigured = c.e.pricedFromRows(s.StepCount, estimated)
 	}
 	return s, err
 }
 
 func (c *costService) Usage(ctx context.Context, q UsageQuery) (*UsageSummary, error) {
-	s, err := sqlUsage(ctx, c.e.db, c.e.prefix, q)
+	s, estimated, err := sqlUsage(ctx, c.e.db, c.e.prefix, q)
 	if s != nil {
-		s.PricingConfigured = c.e.pricingConfigured()
+		s.PricingConfigured = c.e.pricedFromRows(s.StepCount, estimated)
 	}
 	return s, err
 }
@@ -37,9 +50,9 @@ func (c *costService) ByAgent(ctx context.Context, q UsageQuery) ([]AgentUsage, 
 }
 
 func (c *costService) AgentStats(ctx context.Context, agentID uuid.UUID, window time.Duration) (*AgentCostStats, error) {
-	s, err := sqlAgentStats(ctx, c.e.db, c.e.prefix, agentID, window)
+	s, rows, estimated, err := sqlAgentStats(ctx, c.e.db, c.e.prefix, agentID, window)
 	if s != nil {
-		s.PricingConfigured = c.e.pricingConfigured()
+		s.PricingConfigured = c.e.pricedFromRows(rows, estimated)
 	}
 	return s, err
 }
@@ -72,7 +85,13 @@ func (c *costService) Record(ctx context.Context, rec CostRecord) error {
 // buildCostRecord derives the cost row for a completed step. It is pure — no
 // I/O — so the caller can write it inside the step's own transaction rather
 // than from a detached goroutine that a shutdown could lose.
-func (c *costService) buildCostRecord(step *Step, agent *Agent, result Result, platformID string) CostRecord {
+//
+// genSlug is the generator that actually ran the step — the agent's
+// GeneratorSlug, or StepRequest.GeneratorOverride when one was given. It must
+// be the resolved slug, not agent.GeneratorSlug: a per-request override routes
+// to a different generator (typically a different model), and recording the
+// agent's default here priced the call against the wrong model.
+func (c *costService) buildCostRecord(step *Step, agent *Agent, genSlug string, result Result, platformID string) CostRecord {
 	var (
 		inputTokens  int
 		outputTokens int
@@ -87,10 +106,10 @@ func (c *costService) buildCostRecord(step *Step, agent *Agent, result Result, p
 		outputTokens = r.OutputTokens
 	}
 	// Per-model pricing: the generator reports its model on result metadata;
-	// fall back to the generator slug as the pricing key.
+	// fall back to the slug of the generator that ran as the pricing key.
 	model := ResultModel(result)
 	if model == "" {
-		model = agent.GeneratorSlug
+		model = genSlug
 	}
 	price, priceKnown := c.e.priceFor(model)
 	usdCost = price.Cost(inputTokens, outputTokens)
@@ -99,7 +118,7 @@ func (c *costService) buildCostRecord(step *Step, agent *Agent, result Result, p
 		// Estimated marks a record whose USD figure came from the built-in flat
 		// rate rather than configured pricing. Tokens are exact either way.
 		Estimated:    !priceKnown,
-		Provider:     agent.GeneratorSlug,
+		Provider:     genSlug,
 		Model:        model,
 		Modal:        agent.Modal,
 		InputTokens:  inputTokens,

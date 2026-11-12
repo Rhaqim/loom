@@ -306,7 +306,7 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	// cost. A contained cost failure comes back as *costRecordError with the
 	// step still committed — the generation was already billed by the provider,
 	// so losing the bookkeeping row beats discarding the step.
-	cost := s.e.costs.buildCostRecord(step, agent, result, session.PlatformID)
+	cost := s.e.costs.buildCostRecord(step, agent, genSlug, result, session.PlatformID)
 	if err := insertStep(ctx, s.e.db, s.e.prefix, step, &session.State, &cost); err != nil {
 		var cre *costRecordError
 		if !errors.As(err, &cre) {
