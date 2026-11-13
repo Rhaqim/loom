@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -61,21 +62,46 @@ func (c *costService) ByStep(ctx context.Context, sessionID uuid.UUID) ([]StepUs
 	return sqlStepUsage(ctx, c.e.db, c.e.prefix, sessionID)
 }
 
-func (c *costService) Estimate(_ context.Context, req EstimateRequest) (*CostEstimate, error) {
-	// Simple estimation: count input tokens naively (1 token ≈ 4 chars).
-	inputTokens := len(req.Input) / 4
-	// Use conservative output token estimates by modality.
-	outputEst := 0
-	switch req.Modal {
-	case ModalityText, ModalityStructured:
-		outputEst = 512
+// Estimate prices a step before it runs, with the same pricing the engine
+// records costs with (Config.Pricing, DefaultPrice, JobPricing). It used to
+// apply fixed rates regardless of configuration.
+func (c *costService) Estimate(ctx context.Context, req EstimateRequest) (*CostEstimate, error) {
+	model, modal := req.Model, req.Modal
+	if req.AgentID != uuid.Nil && (model == "" || modal == "") {
+		agent, err := c.e.agents.GetByID(ctx, req.AgentID)
+		if err != nil {
+			return nil, err
+		}
+		if model == "" {
+			model = agent.GeneratorSlug
+		}
+		if modal == "" {
+			modal = agent.Modal
+		}
 	}
-	return &CostEstimate{
-		USDLow:                float64(inputTokens) * 0.000001,
-		USDHigh:               float64(inputTokens+outputEst) * 0.000030,
-		InputTokens:           inputTokens,
-		OutputTokensEstimated: outputEst,
-	}, nil
+	if model == "" {
+		return nil, fmt.Errorf("loom: Estimate needs an AgentID or a Model")
+	}
+	est := &CostEstimate{Model: model}
+	switch modal {
+	case ModalityText, ModalityStructured, "":
+		est.InputTokens = req.InputTokens
+		if est.InputTokens == 0 {
+			est.InputTokens = len(req.Input) / 4
+		}
+		est.OutputTokensEstimated = req.OutputTokens
+		if est.OutputTokensEstimated == 0 {
+			est.OutputTokensEstimated = 512
+		}
+		price, known := c.e.priceFor(model)
+		est.USDLow = price.Cost(est.InputTokens, 0)
+		est.USDHigh = price.Cost(est.InputTokens, est.OutputTokensEstimated)
+		est.PricingConfigured = known
+	default:
+		usd, known := c.e.jobPriceFor(model, model)
+		est.USDLow, est.USDHigh, est.PricingConfigured = usd, usd, known
+	}
+	return est, nil
 }
 
 func (c *costService) Record(ctx context.Context, rec CostRecord) error {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -40,6 +41,21 @@ type ChatGenerator struct {
 	// API-key-exfiltration primitive, since the request still carries this
 	// generator's real credential.
 	allowedBaseURLs map[string]struct{}
+	// nativeFormat sends a ResponseFormat schema as native structured outputs
+	// (output_config.format) instead of steering through the system prompt.
+	// Opt-in: the API rejects schemas that don't meet its rules, which the
+	// prompt-steered path accepts.
+	nativeFormat bool
+}
+
+// WithNativeStructuredOutputs makes a ResponseFormat with a schema use the
+// Messages API's native structured outputs (output_config.format), which
+// guarantees schema-valid JSON. Every object in the schema must set
+// additionalProperties: false, and numeric or length constraints are not
+// supported; a schema that breaks these rules is rejected by the API with a 400.
+func (g *ChatGenerator) WithNativeStructuredOutputs() *ChatGenerator {
+	g.nativeFormat = true
+	return g
 }
 
 // NewChatGenerator creates an Anthropic chat generator.
@@ -161,6 +177,7 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 		var assembled strings.Builder
 		stop := "end_turn"
 		var inTok, outTok int
+		var refusal stopDetails
 
 		// Anthropic streams Server-Sent Events: "event: <type>" and "data: <json>"
 		// lines separated by blanks. A bufio.Scanner over lines parses this; the
@@ -182,8 +199,9 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 					} `json:"usage"`
 				} `json:"message"`
 				Delta struct {
-					Text       string `json:"text"`
-					StopReason string `json:"stop_reason"`
+					Text        string       `json:"text"`
+					StopReason  string       `json:"stop_reason"`
+					StopDetails *stopDetails `json:"stop_details"`
 				} `json:"delta"`
 				Usage struct {
 					OutputTokens int `json:"output_tokens"`
@@ -207,10 +225,19 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 				if event.Delta.StopReason != "" {
 					stop = event.Delta.StopReason
 				}
+				if event.Delta.StopDetails != nil {
+					refusal = *event.Delta.StopDetails
+				}
 			}
 		}
 		if err := sc.Err(); err != nil && assembled.Len() == 0 {
 			results <- loom.NewFailedResult(loom.ModalityText, err)
+			return
+		}
+		// A refusal, even mid-stream after some text, fails the result; the
+		// engine surfaces it as GenerationRejected.
+		if stop == "refusal" {
+			results <- loom.NewFailedResult(loom.ModalityText, refusalError(refusal))
 			return
 		}
 		tr := loom.NewTextResult(assembled.String(), stop, inTok, outTok)
@@ -226,13 +253,54 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 // -----------------------------------------------------------------------
 
 type messagesRequest struct {
-	Model       string         `json:"model"`
-	MaxTokens   int            `json:"max_tokens"`
-	Temperature float64        `json:"temperature,omitempty"`
-	TopP        float64        `json:"top_p,omitempty"`
-	System      string         `json:"system,omitempty"`
-	Messages    []anthropicMsg `json:"messages"`
-	Stream      bool           `json:"stream,omitempty"`
+	Model        string         `json:"model"`
+	MaxTokens    int            `json:"max_tokens"`
+	Temperature  float64        `json:"temperature,omitempty"`
+	TopP         float64        `json:"top_p,omitempty"`
+	System       string         `json:"system,omitempty"`
+	Messages     []anthropicMsg `json:"messages"`
+	Stream       bool           `json:"stream,omitempty"`
+	OutputConfig *outputConfig  `json:"output_config,omitempty"`
+}
+
+// outputConfig is the Messages API output_config object: effort (thinking
+// depth and token spend) and format (native structured outputs).
+type outputConfig struct {
+	Effort string        `json:"effort,omitempty"`
+	Format *outputFormat `json:"format,omitempty"`
+}
+
+type outputFormat struct {
+	Type   string         `json:"type"` // "json_schema"
+	Schema map[string]any `json:"schema"`
+}
+
+// stopDetails accompanies stop_reason "refusal".
+type stopDetails struct {
+	Category    string `json:"category"`
+	Explanation string `json:"explanation"`
+}
+
+// defaultMaxTokens applies when GenerateParams.MaxTokens is unset. On current
+// models thinking is on by default and its tokens count against max_tokens, so
+// the old 4096 could be spent on reasoning before any visible text. 16000 keeps
+// non-streaming requests within HTTP timeouts.
+const defaultMaxTokens = 16000
+
+// effortLevels are the accepted output_config.effort values.
+var effortLevels = map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}
+
+// refusalError reports a safety refusal (stop_reason "refusal") as a typed
+// rejection, so callers see GenerationRejected rather than an empty success.
+func refusalError(d stopDetails) error {
+	msg := "anthropic: request refused"
+	if d.Category != "" {
+		msg += " (" + d.Category + ")"
+	}
+	if d.Explanation != "" {
+		msg += ": " + d.Explanation
+	}
+	return &loom.GenerationError{Kind: loom.GenerationRejected, Message: msg}
 }
 
 type anthropicMsg struct {
@@ -245,35 +313,61 @@ type messagesResponse struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"content"`
-	StopReason string `json:"stop_reason"`
-	Usage      struct {
+	StopReason  string       `json:"stop_reason"`
+	StopDetails *stopDetails `json:"stop_details"`
+	Usage       struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
 }
 
+// buildBody builds the Messages request.
+//
+//   - Params.Extra["effort"] ("low" | "medium" | "high" | "xhigh" | "max") is
+//     sent as output_config.effort. Unset leaves the model's default, which on
+//     Claude Opus 5.5 is "medium".
+//   - With WithNativeStructuredOutputs, a ResponseFormat with a schema uses
+//     native structured outputs (output_config.format). Otherwise the JSON
+//     contract is steered through the system prompt, as before.
+//   - Temperature and TopP are sent only when set; some current models (Claude
+//     Opus 5.5 among them) reject sampling parameters with a 400.
 func (g *ChatGenerator) buildBody(req loom.GenerateRequest, stream bool) ([]byte, error) {
 	maxTokens := req.Params.MaxTokens
 	if maxTokens == 0 {
-		maxTokens = 4096
+		maxTokens = defaultMaxTokens
 	}
 	mr := messagesRequest{
 		Model:       g.model,
 		MaxTokens:   maxTokens,
 		Temperature: req.Params.Temperature,
 		TopP:        req.Params.TopP,
-		System:      systemWithFormat(req),
 		Messages:    []anthropicMsg{{Role: "user", Content: req.UserPrompt}},
 		Stream:      stream,
+	}
+	var oc outputConfig
+	if v, ok := req.Params.Extra["effort"]; ok {
+		effort, _ := v.(string)
+		if !effortLevels[effort] {
+			return nil, fmt.Errorf("anthropic: effort %v is not one of low, medium, high, xhigh, max", v)
+		}
+		oc.Effort = effort
+	}
+	if rf := req.ResponseFormat; g.nativeFormat && rf != nil && len(rf.Schema) > 0 {
+		oc.Format = &outputFormat{Type: "json_schema", Schema: rf.Schema}
+		mr.System = req.SystemPrompt
+	} else {
+		mr.System = systemWithFormat(req)
+	}
+	if oc != (outputConfig{}) {
+		mr.OutputConfig = &oc
 	}
 	return json.Marshal(mr)
 }
 
 // systemWithFormat appends JSON-output guidance to the system prompt when the
-// agent declares a response format. The Anthropic Messages API has no native
-// response_format field, so the contract is steered through the system prompt
-// and validated by loom's SchemaValidationPostHook; parseResponse then decodes
-// the JSON into a StructuredResult.
+// agent declares a response format without StrictMode (see buildBody for the
+// native path). The contract is validated by loom's SchemaValidationPostHook;
+// parseResponse then decodes the JSON into a StructuredResult.
 func systemWithFormat(req loom.GenerateRequest) string {
 	if req.ResponseFormat == nil {
 		return req.SystemPrompt
@@ -297,6 +391,13 @@ func (g *ChatGenerator) parseResponse(body []byte, req loom.GenerateRequest) (lo
 	var mr messagesResponse
 	if err := json.Unmarshal(body, &mr); err != nil {
 		return nil, fmt.Errorf("anthropic: parse response: %w", err)
+	}
+	if mr.StopReason == "refusal" {
+		var d stopDetails
+		if mr.StopDetails != nil {
+			d = *mr.StopDetails
+		}
+		return nil, refusalError(d)
 	}
 	var sb strings.Builder
 	for _, c := range mr.Content {
@@ -348,4 +449,47 @@ func (g *ChatGenerator) postRaw(ctx context.Context, path string, body []byte) (
 		return nil, fmt.Errorf("anthropic: http %d: %s", resp.StatusCode, b)
 	}
 	return resp.Body, nil
+}
+
+var _ loom.Verifier = (*ChatGenerator)(nil)
+
+// Verify checks the API key and model against the provider's models endpoint
+// (GET /models/{model}), honouring "api_key", "model" and "base_url"
+// overrides. It generates nothing and spends no tokens. A 401/403 wraps
+// loom.ErrKeyRejected; a 404 means the key works but the model does not exist.
+func (g *ChatGenerator) Verify(ctx context.Context, overrides map[string]any) (loom.ModelInfo, error) {
+	g, err := g.withOverrides(loom.GenerateRequest{Overrides: overrides})
+	if err != nil {
+		return loom.ModelInfo{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.baseURL+"/models/"+url.PathEscape(g.model), nil)
+	if err != nil {
+		return loom.ModelInfo{}, err
+	}
+	req.Header.Set("x-api-key", g.apiKey)
+	req.Header.Set("anthropic-version", anthropicVersion)
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return loom.ModelInfo{}, fmt.Errorf("anthropic: http: %w", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return loom.ModelInfo{}, fmt.Errorf("%w (anthropic http %d): %s", loom.ErrKeyRejected, resp.StatusCode, b)
+	case resp.StatusCode == http.StatusNotFound:
+		return loom.ModelInfo{}, fmt.Errorf("anthropic: model %q not found for this key", g.model)
+	case resp.StatusCode >= 400:
+		return loom.ModelInfo{}, fmt.Errorf("anthropic: http %d: %s", resp.StatusCode, b)
+	}
+	var m struct {
+		ID             string `json:"id"`
+		DisplayName    string `json:"display_name"`
+		MaxInputTokens int    `json:"max_input_tokens"`
+		MaxTokens      int    `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return loom.ModelInfo{}, fmt.Errorf("anthropic: parse model: %w", err)
+	}
+	return loom.ModelInfo{ID: m.ID, DisplayName: m.DisplayName, ContextWindow: m.MaxInputTokens, MaxOutputTokens: m.MaxTokens}, nil
 }

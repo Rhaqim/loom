@@ -118,11 +118,11 @@ func sqlInsertStep(ctx context.Context, db *sql.DB, prefix string, step *Step, c
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %ssteps
 			(id, session_id, step_index, agent_id, request, result_id,
-			 action_id, diagnostics, duration_ms, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, prefix),
+			 action_id, diagnostics, duration_ms, created_at, author, participant_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, prefix),
 		step.ID, step.SessionID, step.Index, step.AgentID,
 		reqJSON, step.Result.ResultID(),
-		actionID, diagJSON, step.DurationMs, step.CreatedAt,
+		actionID, diagJSON, step.DurationMs, step.CreatedAt, step.Author, step.ParticipantID,
 	); err != nil {
 		return err
 	}
@@ -229,18 +229,27 @@ func sqlQuerySteps(ctx context.Context, db *sql.DB, prefix string, sessionID uui
 // no limit. Each row carries the fully rendered request and the result payload,
 // so an unbounded read grows with session length — hence the paged variant.
 func sqlQueryStepsPage(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID, limit, offset int) ([]Step, error) {
+	return sqlQueryStepsWhere(ctx, db, prefix, sessionID, 0, limit, offset)
+}
+
+// sqlQueryStepsFrom reads a session's steps with step_index >= from, in order.
+func sqlQueryStepsFrom(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID, from int) ([]Step, error) {
+	return sqlQueryStepsWhere(ctx, db, prefix, sessionID, from, 0, 0)
+}
+
+func sqlQueryStepsWhere(ctx context.Context, db *sql.DB, prefix string, sessionID uuid.UUID, from, limit, offset int) ([]Step, error) {
 	q := fmt.Sprintf(`
 		SELECT s.id, s.session_id, s.step_index, s.agent_id,
-		       s.request, s.diagnostics, s.duration_ms, s.created_at,
+		       s.request, s.diagnostics, s.duration_ms, s.created_at, s.author, s.participant_id,
 		       r.modality, r.status, r.payload
 		FROM %ssteps s
 		JOIN %sresults r ON r.id = s.result_id
-		WHERE s.session_id=$1
+		WHERE s.session_id=$1 AND s.step_index >= $2
 		ORDER BY s.step_index`, prefix, prefix)
-	args := []any{sessionID}
+	args := []any{sessionID, max(from, 0)}
 	if limit > 0 {
 		// OFFSET without LIMIT is not portable, so it is only applied alongside one.
-		q += ` LIMIT $2 OFFSET $3`
+		q += ` LIMIT $3 OFFSET $4`
 		args = append(args, limit, max(offset, 0))
 	}
 	rows, err := db.QueryContext(ctx, q, args...)
@@ -258,7 +267,7 @@ func sqlQueryStepsPage(ctx context.Context, db *sql.DB, prefix string, sessionID
 		)
 		if err := rows.Scan(
 			&step.ID, &step.SessionID, &step.Index, &step.AgentID,
-			&reqJSON, &diagJSON, &step.DurationMs, &step.CreatedAt,
+			&reqJSON, &diagJSON, &step.DurationMs, &step.CreatedAt, &step.Author, &step.ParticipantID,
 			&modal, &status, &payload,
 		); err != nil {
 			return nil, err

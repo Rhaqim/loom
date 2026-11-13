@@ -11,6 +11,20 @@ import (
 // BranchGCConfig is a re-export of gc.Config for callers who import only loom.
 type BranchGCConfig = loomgc.Config
 
+// RetentionRule expires whole sessions by tag and idle time on each GC sweep;
+// set them on BranchGCConfig.Retention. See gc.RetentionRule.
+type RetentionRule = loomgc.RetentionRule
+
+// RetentionAction is what a RetentionRule does to a matching session.
+type RetentionAction = loomgc.RetentionAction
+
+// RetentionDiscard soft-deletes matching sessions (hard-deleted after the
+// soft-delete grace period).
+const RetentionDiscard = loomgc.RetentionDiscard
+
+// RetentionPurge hard-deletes matching sessions immediately.
+const RetentionPurge = loomgc.RetentionPurge
+
 // DefaultBranchGCConfig returns sensible production GC defaults.
 func DefaultBranchGCConfig() BranchGCConfig {
 	return loomgc.DefaultConfig()
@@ -72,6 +86,7 @@ func toSweepReport(r *loomgc.SweepReport) *SweepReport {
 		StaleSoftDeleted:    r.StaleSoftDeleted,
 		GraceHardDeleted:    r.GraceHardDeleted,
 		TestBranchesDeleted: r.TestBranchesDeleted,
+		Retention:           r.Retention,
 	}
 }
 
@@ -84,4 +99,7 @@ type SweepReport struct {
 	StaleSoftDeleted    int
 	GraceHardDeleted    int
 	TestBranchesDeleted int
+	// Retention counts sessions each BranchGCConfig.Retention rule discarded
+	// or purged, keyed by rule name.
+	Retention map[string]int
 }

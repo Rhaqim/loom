@@ -38,7 +38,7 @@ var sectionOrder = []string{
 	"responseformat.go", "api_action.go", "api_step.go", "api_result.go",
 	"api_generator.go", "api_modality.go", "flow.go", "flow_store.go",
 	"hook.go", "schemahook.go", "judges.go", "api_evaluator.go", "evalgate.go",
-	"api_cost.go", "api_budget.go",
+	"api_cost.go", "api_budget.go", "api_events.go",
 	"cache.go", "bus.go", "pricing.go", "gc_service.go", "poller.go",
 	"query.go", "api_errors.go",
 }
@@ -65,6 +65,7 @@ var sectionTitle = map[string]string{
 	"judges.go":         "Judges",
 	"api_cost.go":       "Cost tracking",
 	"api_budget.go":     "Budgets",
+	"api_events.go":     "Session event stream",
 	"cache.go":          "Caching",
 	"bus.go":            "Event bus",
 	"pricing.go":        "Pricing",

@@ -106,6 +106,24 @@ type AsyncGenerator interface {
 	Poll(ctx context.Context, handle TaskHandle) (Result, error)
 }
 
+// ModelInfo describes the model a generator would call, as its provider
+// reports it. Fields the provider does not report are zero.
+type ModelInfo struct {
+	ID              string
+	DisplayName     string
+	ContextWindow   int // max input tokens
+	MaxOutputTokens int
+}
+
+// Verifier is an optional generator interface: Verify checks that the
+// generator's API key (or an "api_key" override) is accepted and that its model
+// (or a "model" override) exists, without generating anything or spending
+// tokens. A rejected key returns an error wrapping ErrKeyRejected. Call it
+// through Engine.VerifyGenerator.
+type Verifier interface {
+	Verify(ctx context.Context, overrides map[string]any) (ModelInfo, error)
+}
+
 // PollerConfig configures the background async result poller.
 type PollerConfig struct {
 	Interval time.Duration // how often to poll pending tasks

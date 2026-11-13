@@ -49,13 +49,22 @@ func sqlSessionUsage(ctx context.Context, db *sql.DB, prefix string, sessionID u
 	return s, estimated, err
 }
 
-// sqlUsage is sqlSessionUsage for a platform over a time window.
+// sqlUsage is sqlSessionUsage for a budget target (a platform or a session)
+// over a time window.
 func sqlUsage(ctx context.Context, db *sql.DB, prefix string, q UsageQuery) (*UsageSummary, int, error) {
+	col, key := "platform_id", any(q.Target.Key)
+	if q.Target.Kind == TargetSessionID {
+		id, err := uuid.Parse(q.Target.Key)
+		if err != nil {
+			return nil, 0, fmt.Errorf("loom: session usage needs a session ID: %w", err)
+		}
+		col, key = "session_id", id
+	}
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT COALESCE(SUM(usd_cost),0), COALESCE(SUM(input_tokens+output_tokens),0), COUNT(*), %s
 		FROM %scost_records
-		WHERE platform_id=$1 AND created_at BETWEEN $2 AND $3`, estimatedCountSQL, prefix),
-		q.Target.Key, q.From, q.To)
+		WHERE %s=$1 AND created_at BETWEEN $2 AND $3`, estimatedCountSQL, prefix, col),
+		key, q.From, q.To)
 	s := &UsageSummary{ByModel: map[string]float64{}}
 	var estimated int
 	err := row.Scan(&s.TotalUSD, &s.TotalTokens, &s.StepCount, &estimated)

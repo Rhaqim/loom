@@ -164,11 +164,40 @@ for slug, ferr := range turn.Errors {  // follower failures (never returned as e
 }
 ```
 
+## Shared sessions: participants, human steps, live events
+
+For a session several people share (a multiplayer game):
+
+- **Participants.** `e.Sessions().AddParticipant(ctx, sess, loom.Participant{ID: "wren", Role:
+  "player"})` / `RemoveParticipant(ctx, sess, "wren")`. Membership lives in `State.Participants`,
+  so every checkpoint records it and a fork from before a join drops that player. Pass the same
+  `*Session` you run steps on (the change is serialised with in-flight steps). Set
+  `Action.ParticipantID`: a non-member's action fails with `loom.ErrNotParticipant`, and the id is
+  stored as `Step.ParticipantID`. Turn-taking (who acts when) is app code.
+- **Human-written steps.** `e.RecordStep(ctx, sess, loom.ExternalStep{AgentSlug: "human-dm",
+  Author: "participant:host", Result: loom.NewTextResult(text, "stop", 0, 0)})` records a step a
+  person wrote: persisted, checkpointed, hooks run (`req.Recorded()`, `req.Author()`), no
+  generator, no prompt, no budget check, no cost row; `Step.Author` is set. A human-led turn:
+  `RunTurn` with `TurnRequest{LeadResult: result, LeadAuthor: "participant:host"}` records the lead
+  and runs followers on it via the lead's `OutputKey`.
+- **Live events to everyone.** `sub, err := e.Subscribe(ctx, sess.ID, loom.SubscribeOptions{FromStep:
+  0})`, then `for ev := range sub.Events` — `step.started`, `chunk`, `step.done`, `step.failed`,
+  `turn.done`, `forked`. Persisted steps from `FromStep` are replayed first (`ev.Replayed`); resume
+  after a disconnect with `FromStep: lastStepDone.StepIndex + 1`. Chunks are live only and are
+  published when the caller passes `OnChunk` (stream the lead). A consumer that falls far behind is
+  disconnected with `sub.Err() == loom.ErrSubscriberLagged` — reconnect from its last step. The
+  default broadcaster is in-process; with several engine instances set `Config.Broadcaster`.
+
 ## Generators (built-in + bring-your-own)
 
 Built-in adapters (each `New...` takes an API key + model unless noted):
 - `generator/openai`    → `openai.NewChatGenerator(key, model)`      — text, streaming
 - `generator/anthropic` → `anthropic.NewChatGenerator(key, model)`   — text, streaming
+  `Params.Extra["effort"]` (`low`…`max`) → `output_config.effort`; `.WithNativeStructuredOutputs()`
+  sends a ResponseFormat schema as native structured outputs (schema needs `additionalProperties: false`
+  on every object). Default `max_tokens` 16000. A safety refusal returns `*loom.GenerationError{Kind:
+  GenerationRejected}` carrying the refusal category; leave `Temperature`/`TopP` unset on models that
+  reject sampling parameters (Claude Opus 5.5).
 - `generator/replicate` → `replicate.NewImageGenerator(key, model)`  — image, async
 - `generator/runway`    → `runway.NewVideoGenerator(key, model)`      — video, async
 - `generator/meshy`     → `meshy.NewModel3DGenerator(key)`            — 3D (GLB `Model3DResult`), async.
@@ -363,7 +392,7 @@ Budgets enforce spend caps per platform key:
 ```go
 e.Budgets().Create(ctx, &loom.Budget{
     Name:     "user-daily",
-    Target:   loom.BudgetTarget{Kind: loom.TargetPlatformID, Key: "user-123"}, // only platform_id is enforced
+    Target:   loom.BudgetTarget{Kind: loom.TargetPlatformID, Key: "user-123"}, // or TargetSessionID
     Window:   loom.BudgetWindowDay,
     Limit:    loom.BudgetLimit{USD: 0.50}, // USD/Tokens/Steps; 0 = no limit on that axis
     OnExceed: loom.BudgetBlock,            // or BudgetDowngrade (to Agent.FallbackAgentID) / BudgetNotify
@@ -371,7 +400,21 @@ e.Budgets().Create(ctx, &loom.Budget{
 })
 ```
 Enforcement is best-effort (reads prior recorded spend, fails open on DB errors) — not a hard
-transactional ceiling. On block, `RunStep` returns `*loom.BudgetExceededError`.
+transactional ceiling. On block, `RunStep` returns `*loom.BudgetExceededError`, carrying used and
+limit USD, tokens and steps; its message names the limit that tripped.
+
+`Target: loom.BudgetTarget{Kind: loom.TargetSessionID, Key: sess.ID.String()}` caps one session
+(one shared game) whoever acts in it. A step is checked against its platform's budgets and its
+session's. Recorded steps (`RecordStep`) cost nothing and are never blocked.
+
+Pre-flight: `e.Cost().Estimate(ctx, loom.EstimateRequest{AgentID: id, InputTokens: n, OutputTokens:
+m})` (or `Model:` instead of `AgentID`) prices with the same `Pricing`/`DefaultPrice`/`JobPricing`
+the engine records with; `CostEstimate.PricingConfigured` is false when the figure is a placeholder.
+Check a key before play with `e.VerifyGenerator(ctx, "slug", map[string]any{"api_key": k, "model":
+m})`: it asks the provider's models endpoint (no tokens), returns `loom.ModelInfo`, and wraps
+`loom.ErrKeyRejected` on 401/403 (`ErrVerifyNotSupported` for generators without `loom.Verifier`;
+the openai and anthropic adapters implement it). loom ships no price list: prices go stale between
+releases, so keep yours in `Config.Pricing`.
 
 A `Limit.USD` is evaluated against the same recorded USD described above, so **a USD cap is not
 meaningful without configured pricing** — loom still enforces it (failing open on a spend control
@@ -573,6 +616,13 @@ compose into one: every tier requires `pinned = false`, so a pinned session is n
 deleted, and `Discard` hides it from `Get`, `List` and `BranchTree`. The result is readable via
 `GetIncludingDeleted` (with history) and invisible to live queries — "finished, keep it
 readable, stop treating it as live". Unpin to make it collectable again.
+
+**Retention rules expire whole sessions** — roots too — for short-lived data such as a public
+demo: `Config.BranchGC.Retention = []loom.RetentionRule{{Name: "demo", Tags: []string{"demo"},
+MaxIdle: 48 * time.Hour, Action: loom.RetentionPurge}}` (`RetentionDiscard` soft-deletes, then the
+grace tier hard-deletes). A session matches when it carries every listed tag, is unpinned, idle
+for `MaxIdle`, and has no live branches; an empty `Tags` matches everything. Counts are in
+`SweepReport.Retention` by rule name, and DryRun applies.
 
 **Sweep on demand** with `e.GC().Sweep(ctx)` — `Run` blocks on a timer and `DryRun` never acts,
 so `Sweep` is what an external scheduler or an admin endpoint calls. It honours

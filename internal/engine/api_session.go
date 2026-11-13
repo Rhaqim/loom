@@ -3,8 +3,8 @@ package engine
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"maps"
-	"reflect"
 	"slices"
 	"time"
 
@@ -38,6 +38,30 @@ type State struct {
 	Snapshot         []byte         // serialized application state (opaque to engine)
 	Vars             map[string]any // engine-tracked typed variables
 	AvailableActions []ActionTemplate
+	// Participants are the people sharing this session (players, a host, a
+	// human game master). It is part of State, so every step's checkpoint
+	// records the membership at that step and a fork restores it. Change it
+	// with SessionRegistry.AddParticipant / RemoveParticipant.
+	Participants []Participant
+}
+
+// Participant is one person in a shared session. Role is application-defined
+// ("host", "player", "dm"). ID is the application's own identifier and is what
+// Action.ParticipantID and Step.ParticipantID refer to.
+type Participant struct {
+	ID       string
+	Role     string
+	JoinedAt time.Time
+}
+
+// HasParticipant reports whether id is a current participant.
+func (st State) HasParticipant(id string) bool {
+	for _, p := range st.Participants {
+		if p.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // forStep returns a copy of the session whose State a step's pre-hooks and
@@ -56,39 +80,113 @@ func (s *Session) forStep() *Session {
 	cp.State.Vars = maps.Clone(s.State.Vars)
 	cp.State.Snapshot = bytes.Clone(s.State.Snapshot)
 	cp.State.AvailableActions = slices.Clone(s.State.AvailableActions)
+	cp.State.Participants = slices.Clone(s.State.Participants)
 	return &cp
 }
 
-// mergeState reconciles a step's (possibly hook-mutated) State back onto dst.
-//
-// Vars are merged key-by-key so concurrent followers each contribute their own
-// keys. Snapshot and AvailableActions are opaque whole values the engine cannot
-// merge, so they are replaced when the step changed them, and left alone
-// otherwise — a hook that never touches Snapshot must not clear it. Concurrent
-// followers that both write Snapshot resolve last-writer-wins.
-func mergeState(dst *State, src State) {
-	mergeVars(dst, src.Vars)
-	if !bytes.Equal(dst.Snapshot, src.Snapshot) {
-		dst.Snapshot = src.Snapshot
-	}
-	// reflect.DeepEqual, not slices.Equal: ActionTemplate.Payload and
-	// .Constraints are `any` and may hold maps or slices, which would make ==
-	// panic at runtime.
-	if !reflect.DeepEqual(dst.AvailableActions, src.AvailableActions) {
-		dst.AvailableActions = src.AvailableActions
-	}
+// stateBase is the State a step started from, kept so mergeState can tell
+// what the step itself changed from what a concurrent sibling changed since.
+// Values are held as their JSON encoding (State is persisted as JSON): a Vars
+// value is `any` and only shallow-cloned by forStep, so a hook mutating a nested
+// map in place would also mutate a retained copy and the change would go
+// unseen. Bytes taken up front cannot be mutated that way.
+type stateBase struct {
+	vars         map[string][]byte
+	snapshot     []byte
+	actions      []byte
+	participants []byte
 }
 
-// mergeVars copies a step's (possibly hook-mutated) Vars onto dst, lazily
-// allocating dst.Vars. A no-op when vars is empty.
-func mergeVars(dst *State, vars map[string]any) {
-	if len(vars) == 0 {
-		return
+// baseOf records st as a step's starting point.
+func baseOf(st State) stateBase {
+	b := stateBase{vars: make(map[string][]byte, len(st.Vars)), snapshot: bytes.Clone(st.Snapshot)}
+	for k, v := range st.Vars {
+		b.vars[k] = encodeForCompare(v)
 	}
-	if dst.Vars == nil {
-		dst.Vars = make(map[string]any, len(vars))
+	b.actions = encodeForCompare(st.AvailableActions)
+	b.participants = encodeForCompare(st.Participants)
+	return b
+}
+
+// encodeForCompare returns v's JSON encoding, or nil when it has none. A nil
+// encoding never equals another value's, so an unencodable value always counts
+// as changed (the pre-merge behaviour: copy it).
+func encodeForCompare(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
 	}
-	maps.Copy(dst.Vars, vars)
+	return b
+}
+
+func sameEncoding(a, b []byte) bool { return a != nil && b != nil && bytes.Equal(a, b) }
+
+// mergeState reconciles a step's (possibly hook-mutated) State back onto dst
+// with a three-way merge against base, the State the step started from. Only
+// what the step itself changed is applied:
+//
+//   - Vars: each key whose value differs from base is set; a key the step
+//     deleted is deleted. Keys the step left alone are not touched, so a
+//     sibling's newer write to them survives.
+//   - Snapshot, AvailableActions and Participants are whole values: replaced
+//     only when the step changed them.
+//
+// This matters when RunTurn runs followers concurrently. The old two-way merge
+// compared the step's copy with dst's CURRENT value, so a follower that wrote
+// nothing still "differed" from a sibling's newer write and reverted it with
+// its stale copy. When two steps change the same key or field, last writer
+// wins; the returned names list those conflicts so the caller can log them.
+func mergeState(dst *State, base stateBase, src State) (conflicts []string) {
+	for k, v := range src.Vars {
+		enc := encodeForCompare(v)
+		was, existed := base.vars[k]
+		if existed && sameEncoding(was, enc) {
+			continue // unchanged by this step
+		}
+		if cur, ok := dst.Vars[k]; ok {
+			curEnc := encodeForCompare(cur)
+			changedByOther := !existed || !sameEncoding(curEnc, was)
+			if changedByOther && !sameEncoding(curEnc, enc) {
+				conflicts = append(conflicts, "Vars."+k)
+			}
+		}
+		if dst.Vars == nil {
+			dst.Vars = make(map[string]any, len(src.Vars))
+		}
+		dst.Vars[k] = v
+	}
+	for k, was := range base.vars {
+		if _, kept := src.Vars[k]; kept {
+			continue
+		}
+		if cur, ok := dst.Vars[k]; ok {
+			if !sameEncoding(encodeForCompare(cur), was) {
+				conflicts = append(conflicts, "Vars."+k)
+			}
+			delete(dst.Vars, k)
+		}
+	}
+	if !bytes.Equal(src.Snapshot, base.snapshot) {
+		if !bytes.Equal(dst.Snapshot, base.snapshot) && !bytes.Equal(dst.Snapshot, src.Snapshot) {
+			conflicts = append(conflicts, "Snapshot")
+		}
+		dst.Snapshot = src.Snapshot
+	}
+	if srcActs := encodeForCompare(src.AvailableActions); !sameEncoding(srcActs, base.actions) {
+		dstActs := encodeForCompare(dst.AvailableActions)
+		if !sameEncoding(dstActs, base.actions) && !sameEncoding(dstActs, srcActs) {
+			conflicts = append(conflicts, "AvailableActions")
+		}
+		dst.AvailableActions = src.AvailableActions
+	}
+	if srcP := encodeForCompare(src.Participants); !sameEncoding(srcP, base.participants) {
+		dstP := encodeForCompare(dst.Participants)
+		if !sameEncoding(dstP, base.participants) && !sameEncoding(dstP, srcP) {
+			conflicts = append(conflicts, "Participants")
+		}
+		dst.Participants = src.Participants
+	}
+	return conflicts
 }
 
 // BranchNode represents a node in the session branch tree.
@@ -109,6 +207,16 @@ type BranchNode struct {
 type SessionRegistry interface {
 	// Create persists a new session.
 	Create(ctx context.Context, s *Session) error
+	// AddParticipant adds p to the session's participants and persists the
+	// session. JoinedAt defaults to now. Adding an ID that is already present
+	// returns ErrParticipantExists. Pass the same *Session the app runs steps
+	// on: the change is serialised with in-flight steps, so it is neither lost
+	// nor reported as a conflict. Membership is part of State, so the next
+	// step's checkpoint records it and a fork from before the join drops it.
+	AddParticipant(ctx context.Context, s *Session, p Participant) error
+	// RemoveParticipant removes the participant with id and persists the
+	// session; an unknown id returns ErrNotParticipant.
+	RemoveParticipant(ctx context.Context, s *Session, id string) error
 	// Get retrieves a session by ID, with its full step history loaded. A
 	// missing OR soft-deleted session returns *NotFoundError (which unwraps to
 	// ErrNotFound) — consistent with List, BranchTree and Update. Use

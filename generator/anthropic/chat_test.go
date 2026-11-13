@@ -9,6 +9,7 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -218,5 +219,128 @@ func TestBaseURLOverrideRejectedUnlessAllowlisted(t *testing.T) {
 	}
 	if reached {
 		t.Fatal("request reached the un-allowlisted host — API key would have leaked")
+	}
+}
+
+func captureServer(t *testing.T, reply string, got *map[string]any) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, got)
+		io.WriteString(w, reply)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+const okReply = `{"content":[{"type":"text","text":"{\"answer\":42}"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+
+func TestRefusalIsRejected(t *testing.T) {
+	var sent map[string]any
+	srv := captureServer(t, `{"content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"declined"},"usage":{"input_tokens":1,"output_tokens":0}}`, &sent)
+	_, err := NewChatGenerator("k", "m").WithBaseURL(srv.URL).Generate(context.Background(), loom.GenerateRequest{UserPrompt: "q"})
+	var ge *loom.GenerationError
+	if !errors.As(err, &ge) || ge.Kind != loom.GenerationRejected {
+		t.Fatalf("err = %v, want GenerationRejected", err)
+	}
+	if !strings.Contains(ge.Message, "cyber") || !strings.Contains(ge.Message, "declined") {
+		t.Fatalf("message %q lacks the stop details", ge.Message)
+	}
+}
+
+func TestStreamingRefusalFailsResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n"+
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"+
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"category\":\"bio\"}},\"usage\":{\"output_tokens\":2}}\n\n")
+	}))
+	defer srv.Close()
+	chunks, results, err := NewChatGenerator("k", "m").WithBaseURL(srv.URL).GenerateStream(context.Background(), loom.GenerateRequest{UserPrompt: "q"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range chunks {
+	}
+	res := <-results
+	if res.Status() != loom.ResultStatusFailed {
+		t.Fatalf("status = %q, want failed", res.Status())
+	}
+	if msg, _ := res.Metadata()["error"].(string); !strings.Contains(msg, "bio") {
+		t.Fatalf("error metadata %q lacks the category", msg)
+	}
+}
+
+func TestEffortAndDefaults(t *testing.T) {
+	var sent map[string]any
+	srv := captureServer(t, okReply, &sent)
+	g := NewChatGenerator("k", "m").WithBaseURL(srv.URL)
+	if _, err := g.Generate(context.Background(), loom.GenerateRequest{UserPrompt: "q", Params: loom.GenerateParams{Extra: map[string]any{"effort": "high"}}}); err != nil {
+		t.Fatal(err)
+	}
+	oc, _ := sent["output_config"].(map[string]any)
+	if oc["effort"] != "high" {
+		t.Fatalf("output_config = %v, want effort high", sent["output_config"])
+	}
+	if sent["max_tokens"] != float64(defaultMaxTokens) {
+		t.Fatalf("max_tokens = %v, want %d", sent["max_tokens"], defaultMaxTokens)
+	}
+	if _, ok := sent["temperature"]; ok {
+		t.Fatal("unset temperature was sent; some models reject sampling params")
+	}
+	if _, err := g.Generate(context.Background(), loom.GenerateRequest{UserPrompt: "q", Params: loom.GenerateParams{Extra: map[string]any{"effort": "extreme"}}}); err == nil {
+		t.Fatal("invalid effort accepted")
+	}
+}
+
+func TestNativeStructuredOutputs(t *testing.T) {
+	schema := map[string]any{"type": "object", "properties": map[string]any{"answer": map[string]any{"type": "integer"}}, "required": []any{"answer"}, "additionalProperties": false}
+	var sent map[string]any
+	srv := captureServer(t, okReply, &sent)
+	res, err := NewChatGenerator("k", "m").WithBaseURL(srv.URL).WithNativeStructuredOutputs().Generate(context.Background(), loom.GenerateRequest{
+		SystemPrompt: "be helpful", UserPrompt: "q", ResponseFormat: &loom.ResponseFormat{Schema: schema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oc, _ := sent["output_config"].(map[string]any)
+	format, _ := oc["format"].(map[string]any)
+	if format["type"] != "json_schema" || format["schema"] == nil {
+		t.Fatalf("output_config = %v, want a json_schema format", sent["output_config"])
+	}
+	if sent["system"] != "be helpful" {
+		t.Fatalf("system = %q; native mode must not inject the prompt-steering text", sent["system"])
+	}
+	if sr, ok := res.(*loom.StructuredResult); !ok || sr.Data["answer"] != float64(42) {
+		t.Fatalf("result = %#v", res)
+	}
+}
+
+func TestVerify(t *testing.T) {
+	var path, key string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path, key = r.URL.Path, r.Header.Get("x-api-key")
+		switch key {
+		case "good":
+			io.WriteString(w, `{"id":"claude-opus-5-5","display_name":"Claude Opus 5.5","max_input_tokens":1000000,"max_tokens":128000}`)
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"error":{"type":"authentication_error"}}`)
+		}
+	}))
+	defer srv.Close()
+	g := NewChatGenerator("good", "claude-opus-5-5").WithBaseURL(srv.URL)
+	info, err := g.Verify(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/models/claude-opus-5-5" || info.ContextWindow != 1000000 || info.MaxOutputTokens != 128000 || info.DisplayName != "Claude Opus 5.5" {
+		t.Fatalf("path %q info %+v", path, info)
+	}
+	if _, err := g.Verify(context.Background(), map[string]any{"api_key": "user-key"}); !errors.Is(err, loom.ErrKeyRejected) {
+		t.Fatalf("bad override key: err = %v, want ErrKeyRejected", err)
+	}
+	if key != "user-key" {
+		t.Fatalf("override key not used: %q", key)
 	}
 }

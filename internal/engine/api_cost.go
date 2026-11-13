@@ -111,15 +111,37 @@ type AgentCostStats struct {
 
 // EstimateRequest is the input to Cost().Estimate().
 type EstimateRequest struct {
+	// AgentID selects the agent whose generator prices the estimate. Optional
+	// when Model is set.
 	AgentID uuid.UUID
-	Input   string
-	Modal   Modality
+	// Model is the pricing key (a model id in Config.Pricing / JobPricing).
+	// "" uses the agent's generator slug, as cost records do when a generator
+	// reports no model.
+	Model string
+	// Input is sample prompt text, counted at ~4 characters per token, unless
+	// InputTokens is set.
+	Input       string
+	InputTokens int
+	// OutputTokens is the expected output length; 0 assumes 512 for text and
+	// structured output.
+	OutputTokens int
+	// Modal is the output modality; 0 uses the agent's. Image, video, audio and
+	// 3D are priced per job from Config.JobPricing.
+	Modal Modality
 }
 
-// CostEstimate is the output of Cost().Estimate().
+// CostEstimate is the output of Cost().Estimate(). USDLow prices the input
+// alone, USDHigh input plus the expected output; for per-job generators both
+// are the job price.
 type CostEstimate struct {
 	USDLow                float64
 	USDHigh               float64
 	InputTokens           int
 	OutputTokensEstimated int
+	// Model is the pricing key the estimate used.
+	Model string
+	// PricingConfigured is false when no configured price covered Model and
+	// the figures come from the built-in placeholder rate (or are 0 for a
+	// per-job generator): render them as unknown, not as money.
+	PricingConfigured bool
 }

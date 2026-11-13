@@ -164,11 +164,40 @@ for slug, ferr := range turn.Errors {  // follower failures (never returned as e
 }
 ```
 
+## Shared sessions: participants, human steps, live events
+
+For a session several people share (a multiplayer game):
+
+- **Participants.** `e.Sessions().AddParticipant(ctx, sess, loom.Participant{ID: "wren", Role:
+  "player"})` / `RemoveParticipant(ctx, sess, "wren")`. Membership lives in `State.Participants`,
+  so every checkpoint records it and a fork from before a join drops that player. Pass the same
+  `*Session` you run steps on (the change is serialised with in-flight steps). Set
+  `Action.ParticipantID`: a non-member's action fails with `loom.ErrNotParticipant`, and the id is
+  stored as `Step.ParticipantID`. Turn-taking (who acts when) is app code.
+- **Human-written steps.** `e.RecordStep(ctx, sess, loom.ExternalStep{AgentSlug: "human-dm",
+  Author: "participant:host", Result: loom.NewTextResult(text, "stop", 0, 0)})` records a step a
+  person wrote: persisted, checkpointed, hooks run (`req.Recorded()`, `req.Author()`), no
+  generator, no prompt, no budget check, no cost row; `Step.Author` is set. A human-led turn:
+  `RunTurn` with `TurnRequest{LeadResult: result, LeadAuthor: "participant:host"}` records the lead
+  and runs followers on it via the lead's `OutputKey`.
+- **Live events to everyone.** `sub, err := e.Subscribe(ctx, sess.ID, loom.SubscribeOptions{FromStep:
+  0})`, then `for ev := range sub.Events` — `step.started`, `chunk`, `step.done`, `step.failed`,
+  `turn.done`, `forked`. Persisted steps from `FromStep` are replayed first (`ev.Replayed`); resume
+  after a disconnect with `FromStep: lastStepDone.StepIndex + 1`. Chunks are live only and are
+  published when the caller passes `OnChunk` (stream the lead). A consumer that falls far behind is
+  disconnected with `sub.Err() == loom.ErrSubscriberLagged` — reconnect from its last step. The
+  default broadcaster is in-process; with several engine instances set `Config.Broadcaster`.
+
 ## Generators (built-in + bring-your-own)
 
 Built-in adapters (each `New...` takes an API key + model unless noted):
 - `generator/openai`    → `openai.NewChatGenerator(key, model)`      — text, streaming
 - `generator/anthropic` → `anthropic.NewChatGenerator(key, model)`   — text, streaming
+  `Params.Extra["effort"]` (`low`…`max`) → `output_config.effort`; `.WithNativeStructuredOutputs()`
+  sends a ResponseFormat schema as native structured outputs (schema needs `additionalProperties: false`
+  on every object). Default `max_tokens` 16000. A safety refusal returns `*loom.GenerationError{Kind:
+  GenerationRejected}` carrying the refusal category; leave `Temperature`/`TopP` unset on models that
+  reject sampling parameters (Claude Opus 5.5).
 - `generator/replicate` → `replicate.NewImageGenerator(key, model)`  — image, async
 - `generator/runway`    → `runway.NewVideoGenerator(key, model)`      — video, async
 - `generator/meshy`     → `meshy.NewModel3DGenerator(key)`            — 3D (GLB `Model3DResult`), async.
@@ -363,7 +392,7 @@ Budgets enforce spend caps per platform key:
 ```go
 e.Budgets().Create(ctx, &loom.Budget{
     Name:     "user-daily",
-    Target:   loom.BudgetTarget{Kind: loom.TargetPlatformID, Key: "user-123"}, // only platform_id is enforced
+    Target:   loom.BudgetTarget{Kind: loom.TargetPlatformID, Key: "user-123"}, // or TargetSessionID
     Window:   loom.BudgetWindowDay,
     Limit:    loom.BudgetLimit{USD: 0.50}, // USD/Tokens/Steps; 0 = no limit on that axis
     OnExceed: loom.BudgetBlock,            // or BudgetDowngrade (to Agent.FallbackAgentID) / BudgetNotify
@@ -371,7 +400,21 @@ e.Budgets().Create(ctx, &loom.Budget{
 })
 ```
 Enforcement is best-effort (reads prior recorded spend, fails open on DB errors) — not a hard
-transactional ceiling. On block, `RunStep` returns `*loom.BudgetExceededError`.
+transactional ceiling. On block, `RunStep` returns `*loom.BudgetExceededError`, carrying used and
+limit USD, tokens and steps; its message names the limit that tripped.
+
+`Target: loom.BudgetTarget{Kind: loom.TargetSessionID, Key: sess.ID.String()}` caps one session
+(one shared game) whoever acts in it. A step is checked against its platform's budgets and its
+session's. Recorded steps (`RecordStep`) cost nothing and are never blocked.
+
+Pre-flight: `e.Cost().Estimate(ctx, loom.EstimateRequest{AgentID: id, InputTokens: n, OutputTokens:
+m})` (or `Model:` instead of `AgentID`) prices with the same `Pricing`/`DefaultPrice`/`JobPricing`
+the engine records with; `CostEstimate.PricingConfigured` is false when the figure is a placeholder.
+Check a key before play with `e.VerifyGenerator(ctx, "slug", map[string]any{"api_key": k, "model":
+m})`: it asks the provider's models endpoint (no tokens), returns `loom.ModelInfo`, and wraps
+`loom.ErrKeyRejected` on 401/403 (`ErrVerifyNotSupported` for generators without `loom.Verifier`;
+the openai and anthropic adapters implement it). loom ships no price list: prices go stale between
+releases, so keep yours in `Config.Pricing`.
 
 A `Limit.USD` is evaluated against the same recorded USD described above, so **a USD cap is not
 meaningful without configured pricing** — loom still enforces it (failing open on a spend control
@@ -573,6 +616,13 @@ compose into one: every tier requires `pinned = false`, so a pinned session is n
 deleted, and `Discard` hides it from `Get`, `List` and `BranchTree`. The result is readable via
 `GetIncludingDeleted` (with history) and invisible to live queries — "finished, keep it
 readable, stop treating it as live". Unpin to make it collectable again.
+
+**Retention rules expire whole sessions** — roots too — for short-lived data such as a public
+demo: `Config.BranchGC.Retention = []loom.RetentionRule{{Name: "demo", Tags: []string{"demo"},
+MaxIdle: 48 * time.Hour, Action: loom.RetentionPurge}}` (`RetentionDiscard` soft-deletes, then the
+grace tier hard-deletes). A session matches when it carries every listed tag, is unpinned, idle
+for `MaxIdle`, and has no live branches; an empty `Tags` matches everything. Counts are in
+`SweepReport.Retention` by rule name, and DryRun applies.
 
 **Sweep on demand** with `e.GC().Sweep(ctx)` — `Run` blocks on a timer and `DryRun` never acts,
 so `Sweep` is what an external scheduler or an admin endpoint calls. It honours
@@ -811,8 +861,19 @@ const EvalNoulType = evaluator.TypeNoul
 const EvalScoreType = evaluator.TypeScore
     EvalScoreType rates the state against an ordered rubric of levels.
 
+const RetentionDiscard = loomgc.RetentionDiscard
+    RetentionDiscard soft-deletes matching sessions (hard-deleted after the
+    soft-delete grace period).
+
+const RetentionPurge = loomgc.RetentionPurge
+    RetentionPurge hard-deletes matching sessions immediately.
+
 const TargetPlatformID = "platform_id"
     TargetPlatformID is the BudgetTarget.Kind for per-user budgets.
+
+const TargetSessionID = "session_id"
+    TargetSessionID is the BudgetTarget.Kind for a budget on one session (Key =
+    Session.ID.String()), e.g. a cap on one shared game regardless of who acts.
 
 const TopicAll = "*"
     TopicAll subscribes to every topic.
@@ -848,6 +909,10 @@ var ErrInvalidConfig = errors.New("loom: invalid config")
     ErrInvalidConfig is returned by New when the Config is missing a required
     field or is otherwise unusable. Wrapped errors carry the specific reason.
 
+var ErrKeyRejected = errors.New("loom: provider rejected the API key")
+    ErrKeyRejected is wrapped by Verifier.Verify when the provider rejects the
+    API key (HTTP 401/403), so a UI can say "key not accepted" before play.
+
 var ErrMissingVariables = errors.New("loom: missing required template variables")
     ErrMissingVariables is returned by RunStep when the user template's prompt
     declares required input variables (Prompt.Variables) and one or more were
@@ -860,6 +925,15 @@ var ErrNotFound = errors.New("loom: not found")
     it, so errors.Is(err, ErrNotFound) is the portable "does not exist" check;
     use errors.As with *NotFoundError to learn which entity and key were
     missing.
+
+var ErrNotParticipant = errors.New("loom: not a participant of this session")
+    ErrNotParticipant is returned when an action names a ParticipantID that
+    is not one of the session's participants, or RemoveParticipant is given an
+    unknown id.
+
+var ErrParticipantExists = errors.New("loom: participant already in this session")
+    ErrParticipantExists is returned by AddParticipant for an ID already
+    present.
 
 var ErrSessionConflict = errors.New("loom: session update conflict")
     ErrSessionConflict is returned by Session update when the row's version
@@ -890,6 +964,15 @@ var ErrSessionPinned = errors.New("loom: session is pinned")
 
 var ErrSkip = skipError{reason: "step cancelled by pre-hook"}
     ErrSkip cancels the current step when returned from a pre-hook.
+
+var ErrSubscriberLagged = errors.New("loom: event subscriber fell behind and was disconnected")
+    ErrSubscriberLagged is the reason a subscription was closed because its
+    consumer fell too far behind. Reconnect with FromStep set past the last
+    step.done received; nothing persisted is lost.
+
+var ErrVerifyNotSupported = errors.New("loom: generator does not support key verification")
+    ErrVerifyNotSupported is returned by Engine.VerifyGenerator for a generator
+    that does not implement Verifier.
 
 var EvalChoice = evaluator.Choice
     EvalChoice builds a question that picks one option from a map of option name
@@ -962,6 +1045,11 @@ func ResultText(r Result) string
     ResultText extracts the primary text payload from a Result for prompt
     injection, returning "" for modalities without a natural text form.
 
+    A StructuredResult renders as its "text" field when it has one (the
+    established convention) and otherwise as the JSON encoding of Data. It used
+    to return "" in that case, so a structured agent's output reached the next
+    agent in a turn as an empty input.
+
 func ValidateJSONSchema(schema map[string]any, value any) []string
     ValidateJSONSchema validates value against a JSON Schema (the common LLM
     subset) and returns a list of human-readable violations ("" path = root).
@@ -974,6 +1062,10 @@ type Action struct {
 	Kind     ActionKind
 	Payload  any // typed per Kind: Selection, FreeText, Spatial, etc.
 	Metadata map[string]any
+	// ParticipantID names the participant who took this action. When set, it
+	// must be one of the session's participants (else ErrNotParticipant) and it
+	// is stored on the step as Step.ParticipantID.
+	ParticipantID string
 }
     Action is the discriminator's structured human-guidance input for a step.
 
@@ -1135,6 +1227,20 @@ type BranchNode struct {
 }
     BranchNode represents a node in the session branch tree.
 
+type Broadcaster interface {
+	// Publish delivers ev to the session's current subscribers. It must not
+	// block on slow subscribers.
+	Publish(ctx context.Context, ev SessionEvent)
+	// Subscribe returns a live feed of the session's events from now on. The
+	// channel is closed when ctx ends, when cancel is called, or when the
+	// subscriber falls behind (lagged then returns true).
+	Subscribe(ctx context.Context, sessionID uuid.UUID) (events <-chan SessionEvent, lagged func() bool, cancel func())
+}
+    Broadcaster fans session events out to subscribers. The default is
+    in-process; a deployment with several engine instances supplies one backed
+    by Redis, NATS or similar via Config.Broadcaster, so a player connected to
+    one instance sees steps run on another.
+
 type Budget struct {
 	ID          uuid.UUID
 	Name        string
@@ -1164,6 +1270,8 @@ type BudgetExceededError struct {
 	LimitUSD    float64
 	UsedTokens  int
 	LimitTokens int
+	UsedSteps   int
+	LimitSteps  int
 	ResetsAt    time.Time
 	Suggestion  string
 }
@@ -1171,6 +1279,8 @@ type BudgetExceededError struct {
     budget.
 
 func (e *BudgetExceededError) Error() string
+    Error names the limit that tripped. It used to report USD unconditionally,
+    so a token- or step-limited budget read "used $0.0000 of $0.0000".
 
 type BudgetLimit struct {
 	USD    float64 // 0 = no USD limit
@@ -1192,11 +1302,12 @@ type BudgetManager interface {
     BudgetManager is the public interface returned by Engine.Budgets().
 
 type BudgetTarget struct {
-	Kind string // currently only "platform_id" is enforced
+	Kind string
 	Key  string
 }
-    BudgetTarget identifies the entity a budget applies to. Only Kind ==
-    TargetPlatformID is currently enforced; Create rejects other kinds.
+    BudgetTarget identifies the entity a budget applies to: Kind is
+    TargetPlatformID (Key = Session.PlatformID) or TargetSessionID (Key = the
+    session's ID as a string). Create rejects other kinds.
 
 type BudgetWindow string
     BudgetWindow is the rolling time window for a budget.
@@ -1342,6 +1453,11 @@ type Config struct {
 	// where the application wires it (EvalGate, FlowAgent.When, or an
 	// evaluator-backed judge).
 	Evaluator Evaluator
+
+	// Broadcaster carries session events (Engine.Subscribe) to subscribers.
+	// Nil uses an in-process broadcaster, which only reaches subscribers of
+	// this engine instance; with several instances, supply a shared one.
+	Broadcaster Broadcaster
 }
     Config is the top-level engine configuration.
 
@@ -1356,8 +1472,16 @@ type CostEstimate struct {
 	USDHigh               float64
 	InputTokens           int
 	OutputTokensEstimated int
+	// Model is the pricing key the estimate used.
+	Model string
+	// PricingConfigured is false when no configured price covered Model and
+	// the figures come from the built-in placeholder rate (or are 0 for a
+	// per-job generator): render them as unknown, not as money.
+	PricingConfigured bool
 }
-    CostEstimate is the output of Cost().Estimate().
+    CostEstimate is the output of Cost().Estimate(). USDLow prices the input
+    alone, USDHigh input plus the expected output; for per-job generators both
+    are the job price.
 
 type CostManager interface {
 	// SessionUsage returns aggregated cost for a single session.
@@ -1553,6 +1677,18 @@ func (e *Engine) PriceResult(model string, inputTokens, outputTokens int) (float
 func (e *Engine) Prompts() PromptRegistry
     Prompts returns the prompt registry.
 
+func (e *Engine) RecordStep(ctx context.Context, session *Session, ext ExternalStep) (*Step, error)
+    RecordStep appends a step whose result was written outside loom — a human
+    game master's narration, a moderator's correction — to the session history.
+
+    It is persisted and checkpointed exactly like a generated step, so forks and
+    StateAt see it, and pre- and post-hooks run so hooks can update state from
+    it. No generator is called, no prompt is rendered, no budget is checked and
+    no cost row is written. Step.Author records who wrote it.
+
+    Errors are those of RunStep, minus generation and budget errors; a post-hook
+    that asks for a retry is an error, since there is nothing to re-run.
+
 func (e *Engine) RegisterGenerator(slug string, g Generator)
     RegisterGenerator adds or replaces a generator under a slug at runtime.
     This is how a platform extends into a new modality — register a video or
@@ -1639,16 +1775,53 @@ func (e *Engine) StartPoller(ctx context.Context)
     whereas cancelling ctx alone returns immediately and leaves stragglers
     writing to the database.
 
+func (e *Engine) Subscribe(ctx context.Context, sessionID uuid.UUID, opts SubscribeOptions) (*Subscription, error)
+    Subscribe streams a session's events: first every persisted step from
+    opts.FromStep on, replayed as step.done (Replayed = true), then live events
+    as they happen — step.started, chunk, step.done, step.failed, turn.done and
+    forked. A step that completes while the replay is being read is delivered
+    once. Chunks are live only.
+
+    To resume after a disconnect, subscribe again with FromStep one past the
+    last step.done StepIndex received. Close the subscription (or cancel ctx)
+    when done. A consumer that falls more than a few hundred events behind is
+    disconnected and Err returns ErrSubscriberLagged.
+
+    Live events reach only subscribers of this engine instance unless
+    Config.Broadcaster is a shared broadcaster.
+
 func (e *Engine) TaskStatus(ctx context.Context, taskID uuid.UUID) (string, Result, error)
     TaskStatus reports a task's status ("pending", "ready", or "failed") and,
     when ready, its resolved result. It lets an embedder check on an async job
     without querying loom's internal tables. Returns ErrNotFound when no such
     task exists.
 
+func (e *Engine) VerifyGenerator(ctx context.Context, slug string, overrides map[string]any) (ModelInfo, error)
+    VerifyGenerator checks the registered generator slug's credentials and
+    model (with optional per-request overrides such as a user's own "api_key"
+    and "model") by asking the provider, without generating. It returns
+    ErrGeneratorNotRegistered for an unknown slug, ErrVerifyNotSupported when
+    the generator cannot verify, and an error wrapping ErrKeyRejected when the
+    provider refuses the key.
+
 type EstimateRequest struct {
+	// AgentID selects the agent whose generator prices the estimate. Optional
+	// when Model is set.
 	AgentID uuid.UUID
-	Input   string
-	Modal   Modality
+	// Model is the pricing key (a model id in Config.Pricing / JobPricing).
+	// "" uses the agent's generator slug, as cost records do when a generator
+	// reports no model.
+	Model string
+	// Input is sample prompt text, counted at ~4 characters per token, unless
+	// InputTokens is set.
+	Input       string
+	InputTokens int
+	// OutputTokens is the expected output length; 0 assumes 512 for text and
+	// structured output.
+	OutputTokens int
+	// Modal is the output modality; 0 uses the agent's. Image, video, audio and
+	// 3D are priced per job from Config.JobPricing.
+	Modal Modality
 }
     EstimateRequest is the input to Cost().Estimate().
 
@@ -1779,6 +1952,28 @@ type Evaluator = evaluator.Evaluator
     and for the typesafe (TypeSafe System One / Jev) and stub implementations.
 
     EXPERIMENTAL.
+
+type ExternalStep struct {
+	// AgentSlug (with Owner and AgentVersion; 0 = latest) names the agent the
+	// step is attributed to: the role being played, such as a human game
+	// master. Its generator is never called and its prompts are not rendered.
+	AgentSlug    string
+	Owner        string
+	AgentVersion int
+	// Author identifies who wrote the result (required), e.g.
+	// "participant:host". It is stored on Step.Author.
+	Author string
+	// Result is the finished result to record. It must be ready: a pending
+	// (async) result cannot be recorded.
+	Result Result
+	// Action, Inputs and Params are recorded and exposed to hooks exactly as
+	// on a StepRequest.
+	Action *Action
+	Inputs map[string]any
+	Params map[string]any
+}
+    ExternalStep is a step whose result was written outside loom — a human game
+    master's narration, a moderator's edit — recorded with Engine.RecordStep.
 
 type Flow struct {
 	Slug      string
@@ -2269,6 +2464,15 @@ func (r *Model3DResult) Status() ResultStatus
 
 func (r *Model3DResult) TaskHandle() *TaskHandle
 
+type ModelInfo struct {
+	ID              string
+	DisplayName     string
+	ContextWindow   int // max input tokens
+	MaxOutputTokens int
+}
+    ModelInfo describes the model a generator would call, as its provider
+    reports it. Fields the provider does not report are zero.
+
 type ModelPrice struct {
 	InputPer1M  float64
 	OutputPer1M float64
@@ -2295,6 +2499,15 @@ type PairwiseJudge = judge.PairwiseJudge
 
 type PairwiseVerdict = judge.PairwiseVerdict
     PairwiseVerdict is the output of PairwiseJudge.Compare.
+
+type Participant struct {
+	ID       string
+	Role     string
+	JoinedAt time.Time
+}
+    Participant is one person in a shared session. Role is application-defined
+    ("host", "player", "dm"). ID is the application's own identifier and is what
+    Action.ParticipantID and Step.ParticipantID refer to.
 
 type PollerConfig struct {
 	Interval time.Duration // how often to poll pending tasks
@@ -2501,6 +2714,13 @@ const (
 	ResultStatusPending ResultStatus = "pending"
 	ResultStatusFailed  ResultStatus = "failed"
 )
+type RetentionAction = loomgc.RetentionAction
+    RetentionAction is what a RetentionRule does to a matching session.
+
+type RetentionRule = loomgc.RetentionRule
+    RetentionRule expires whole sessions by tag and idle time on each GC sweep;
+    set them on BranchGCConfig.Retention. See gc.RetentionRule.
+
 type RetryAnnotation struct {
 	Reason    string   // human-readable reason
 	Forbidden []string // phrases/patterns the next attempt must avoid
@@ -2579,9 +2799,61 @@ type Session struct {
     Session is a running conversation. It holds state, action log, result
     history, and any custom data the platform attaches.
 
+type SessionEvent struct {
+	Type      SessionEventType
+	SessionID uuid.UUID
+	// StepIndex is the step's index for step.done, and the index of the last
+	// persisted step a subscriber had seen for replayed events. It is the
+	// resume cursor: reconnect with SubscribeOptions.FromStep = StepIndex+1.
+	// -1 when the event is not about a persisted step.
+	StepIndex int
+	Step      *Step  // step.done
+	Chunk     string // chunk
+	Agent     string // agent slug, for step and chunk events
+	TurnID    uuid.UUID
+	TurnRole  string // "lead", "follower:<slug>" or "" outside a turn
+	Err       string // step.failed
+	BranchID  uuid.UUID
+	// Replayed marks a step.done rebuilt from storage on Subscribe, rather
+	// than delivered live.
+	Replayed bool
+	At       time.Time
+}
+    SessionEvent is one event on a session's stream. Treat it as read-only:
+    the same value is delivered to every subscriber.
+
+type SessionEventType string
+    SessionEventType names a SessionEvent.
+
+const (
+	// EventStepStarted fires when a step begins (before generation).
+	EventStepStarted SessionEventType = "step.started"
+	// EventChunk carries one streamed fragment of a step's output. Chunks are
+	// live only: they are never replayed.
+	EventChunk SessionEventType = "chunk"
+	// EventStepDone fires once a step is persisted. Step is set.
+	EventStepDone SessionEventType = "step.done"
+	// EventStepFailed fires when a step fails before persisting. Err is set.
+	EventStepFailed SessionEventType = "step.failed"
+	// EventTurnDone fires when RunTurn finishes (lead and all followers).
+	EventTurnDone SessionEventType = "turn.done"
+	// EventForked fires on the parent when a branch is forked from it;
+	// BranchID is the new session.
+	EventForked SessionEventType = "forked"
+)
 type SessionRegistry interface {
 	// Create persists a new session.
 	Create(ctx context.Context, s *Session) error
+	// AddParticipant adds p to the session's participants and persists the
+	// session. JoinedAt defaults to now. Adding an ID that is already present
+	// returns ErrParticipantExists. Pass the same *Session the app runs steps
+	// on: the change is serialised with in-flight steps, so it is neither lost
+	// nor reported as a conflict. Membership is part of State, so the next
+	// step's checkpoint records it and a fork from before the join drops it.
+	AddParticipant(ctx context.Context, s *Session, p Participant) error
+	// RemoveParticipant removes the participant with id and persists the
+	// session; an unknown id returns ErrNotParticipant.
+	RemoveParticipant(ctx context.Context, s *Session, id string) error
 	// Get retrieves a session by ID, with its full step history loaded. A
 	// missing OR soft-deleted session returns *NotFoundError (which unwraps to
 	// ErrNotFound) — consistent with List, BranchTree and Update. Use
@@ -2697,8 +2969,16 @@ type State struct {
 	Snapshot         []byte         // serialized application state (opaque to engine)
 	Vars             map[string]any // engine-tracked typed variables
 	AvailableActions []ActionTemplate
+	// Participants are the people sharing this session (players, a host, a
+	// human game master). It is part of State, so every step's checkpoint
+	// records the membership at that step and a fork restores it. Change it
+	// with SessionRegistry.AddParticipant / RemoveParticipant.
+	Participants []Participant
 }
     State is the live state of a session between steps.
+
+func (st State) HasParticipant(id string) bool
+    HasParticipant reports whether id is a current participant.
 
 type Step struct {
 	ID        uuid.UUID
@@ -2717,6 +2997,13 @@ type Step struct {
 	Diagnostics map[string]any // anything pre/post processors logged
 	DurationMs  int
 	CreatedAt   time.Time
+	// Author is who wrote the result: "" when the agent's generator produced
+	// it, otherwise the caller-chosen author of a recorded step (RecordStep or
+	// a human-led turn), e.g. "participant:host".
+	Author string
+	// ParticipantID is the participant whose action drove this step
+	// (Action.ParticipantID), or "".
+	ParticipantID string
 }
     Step is one iteration of the engine loop: build request → call agent →
     result → actions. Steps are append-only; they form the complete timeline of
@@ -2809,10 +3096,19 @@ func (r *StepRequest) Attempt() int
     A post-hook reads it to self-cap how many times it re-requests its own
     correction before accepting a draft.
 
+func (r *StepRequest) Author() string
+    Author is the author of a recorded step (Engine.RecordStep or a human-led
+    turn), or "" when the step is generated. Hooks use it to treat human input
+    differently from model output.
+
 func (r *StepRequest) Bus() Bus
     Bus returns the per-turn cross-agent communication fabric for this step,
     or nil if the step is not part of a RunTurn. Hooks and plugins use it to
     publish or subscribe alongside the turn's agents.
+
+func (r *StepRequest) Recorded() bool
+    Recorded reports whether this step records an externally written result
+    rather than calling a generator.
 
 func (r *StepRequest) RetryAnnotations() []RetryAnnotation
     RetryAnnotations returns a copy of the retry hints accumulated across prior
@@ -2897,6 +3193,30 @@ func (r *StructuredResult) Status() ResultStatus
 
 func (r *StructuredResult) TaskHandle() *TaskHandle
 
+type SubscribeOptions struct {
+	// FromStep replays every persisted step with Index >= FromStep as
+	// step.done events (Replayed = true) before live events. 0 replays the
+	// whole session; a negative value replays nothing.
+	FromStep int
+}
+    SubscribeOptions configures Engine.Subscribe.
+
+type Subscription struct {
+	// Events delivers replayed then live events, in order. It is closed when
+	// the subscription ends; call Err to learn why.
+	Events <-chan SessionEvent
+
+	// Has unexported fields.
+}
+    Subscription is a live session event feed from Engine.Subscribe.
+
+func (s *Subscription) Close()
+    Close ends the subscription.
+
+func (s *Subscription) Err() error
+    Err reports why Events closed: nil after Close or a cancelled context,
+    ErrSubscriberLagged when the consumer fell behind, or a replay error.
+
 type SweepReport struct {
 	// DryRun reports whether these counts describe planned or actual deletions.
 	// Without it a caller cannot tell a real sweep's report from a dry one.
@@ -2905,6 +3225,9 @@ type SweepReport struct {
 	StaleSoftDeleted    int
 	GraceHardDeleted    int
 	TestBranchesDeleted int
+	// Retention counts sessions each BranchGCConfig.Retention rule discarded
+	// or purged, keyed by rule name.
+	Retention map[string]int
 }
     SweepReport is what a GC sweep did (or, for DryRun, would have done).
 
@@ -3000,6 +3323,16 @@ type TurnRequest struct {
 	// turn. It lets an embedder build follower inputs from the lead and react to
 	// each follower in completion order.
 	OnStep func(role string, step *Step, err error)
+	// LeadResult, when set, makes this a human-led turn: the lead step records
+	// this result (written by LeadAuthor, e.g. a human game master) instead of
+	// calling the lead agent's generator, then the followers run as usual and
+	// consume it through the lead's OutputKey. It must be a ready result. The
+	// recorded lead has no cost row and does not stream; its text reaches the
+	// bus "lead.done" topic as any lead's does.
+	LeadResult Result
+	// LeadAuthor is stored on the recorded lead's Step.Author. Required with
+	// LeadResult.
+	LeadAuthor string
 }
     TurnRequest is the input to RunTurn.
 
@@ -3031,6 +3364,15 @@ type UsageSummary struct {
 
     Token and step counts are always exact. The USD figures are only meaningful
     when PricingConfigured is true — see that field.
+
+type Verifier interface {
+	Verify(ctx context.Context, overrides map[string]any) (ModelInfo, error)
+}
+    Verifier is an optional generator interface: Verify checks that the
+    generator's API key (or an "api_key" override) is accepted and that its
+    model (or a "model" override) exists, without generating anything or
+    spending tokens. A rejected key returns an error wrapping ErrKeyRejected.
+    Call it through Engine.VerifyGenerator.
 
 type VideoResult struct {
 	URL          string
@@ -3166,6 +3508,12 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 
 func (g *ChatGenerator) Modality() loom.Modality
 
+func (g *ChatGenerator) Verify(ctx context.Context, overrides map[string]any) (loom.ModelInfo, error)
+    Verify checks the API key and model against the provider's models endpoint
+    (GET /models/{model}), honouring "api_key", "model" and "base_url"
+    overrides. It generates nothing and spends no tokens. A 401/403 wraps
+    loom.ErrKeyRejected; a 404 means the key works but the model does not exist.
+
 func (g *ChatGenerator) WithAllowedBaseURLs(urls ...string) *ChatGenerator
     WithAllowedBaseURLs opts into honoring the per-request "base_url" override,
     restricted to the given exact URLs. Anything not listed here (and not equal
@@ -3206,6 +3554,12 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 
 func (g *ChatGenerator) Modality() loom.Modality
 
+func (g *ChatGenerator) Verify(ctx context.Context, overrides map[string]any) (loom.ModelInfo, error)
+    Verify checks the API key and model against the provider's models endpoint
+    (GET /models/{model}), honouring "api_key", "model" and "base_url"
+    overrides. It generates nothing and spends no tokens. A 401/403 wraps
+    loom.ErrKeyRejected; a 404 means the key works but the model does not exist.
+
 func (g *ChatGenerator) WithAllowedBaseURLs(urls ...string) *ChatGenerator
     WithAllowedBaseURLs opts into honoring the per-request "base_url" override,
     restricted to the given exact URLs. Anything not listed here (and not equal
@@ -3217,6 +3571,14 @@ func (g *ChatGenerator) WithBaseURL(url string) *ChatGenerator
     WithBaseURL overrides the API base URL (useful for testing / proxies).
     The URL set here is also implicitly trusted as a per-request "base_url"
     override.
+
+func (g *ChatGenerator) WithNativeStructuredOutputs() *ChatGenerator
+    WithNativeStructuredOutputs makes a ResponseFormat with a schema use
+    the Messages API's native structured outputs (output_config.format),
+    which guarantees schema-valid JSON. Every object in the schema must set
+    additionalProperties: false, and numeric or length constraints are not
+    supported; a schema that breaks these rules is rejected by the API with a
+    400.
 
 
 ################################################################################
