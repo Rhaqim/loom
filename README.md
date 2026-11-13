@@ -637,6 +637,21 @@ after changing the public surface (CI enforces the facade is in sync).
 
 ---
 
+## Releasing
+
+loom is two Go modules: the root and `generator/anthropic` (kept separate so the
+Anthropic SDK's dependencies stay out of loom). Both are released from one
+commit on `main`:
+
+```bash
+make release VERSION=v0.0.3   # checks, bumps generator/anthropic's loom require, tags
+git push origin main v0.0.3 generator/anthropic/v0.0.3   # the command it prints
+```
+
+`generator/anthropic` is only retagged when it changed since its last release;
+otherwise just `vX.Y.Z` is created. The script refuses a dirty tree, another
+branch (`RELEASE_BRANCH` overrides) or an existing tag, and pushes nothing.
+
 ## License
 
 MIT
