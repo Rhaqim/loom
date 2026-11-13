@@ -29,6 +29,18 @@ type asyncImageGen struct {
 	calls     int
 }
 
+// asyncModel3DGen proves 3D asset providers use the same durable submission
+// and polling path as image and video providers.
+type asyncModel3DGen struct{}
+
+func (asyncModel3DGen) Modality() Modality { return ModalityModel3D }
+func (asyncModel3DGen) Generate(context.Context, GenerateRequest) (Result, error) {
+	return NewPendingResult(ModalityModel3D, &TaskHandle{ID: uuid.New(), Provider: "model3d", Handle: "chapel-1"}), nil
+}
+func (asyncModel3DGen) Poll(context.Context, TaskHandle) (Result, error) {
+	return NewModel3DResult("https://cdn.example/chapel-1.glb", "model/gltf-binary", "https://cdn.example/chapel-1.png", "ruined chapel", 1200, false), nil
+}
+
 func (*asyncImageGen) Modality() Modality { return ModalityImage }
 func (*asyncImageGen) Generate(context.Context, GenerateRequest) (Result, error) {
 	return NewPendingResult(ModalityImage, &TaskHandle{ID: uuid.New(), Provider: "asyncimg", Handle: "job-1"}), nil
@@ -54,15 +66,15 @@ func (failedResultGen) Poll(ctx context.Context, h TaskHandle) (Result, error) {
 
 // runPending runs a real step through the engine with the given async generator
 // and returns the pending task handle the engine persisted.
-func runPending(t *testing.T, ctx context.Context, e *Engine, provider string) *TaskHandle {
+func runPending(t *testing.T, ctx context.Context, e *Engine, provider string, modality Modality) *TaskHandle {
 	t.Helper()
 	// Persist the agent first (an inline req.Agent is not auto-persisted, so its
 	// FK from the step would fail on Postgres), then run the step by slug.
-	agent := &Agent{ID: uuid.New(), Slug: "async-" + uuid.NewString()[:8], Version: 1, Modal: ModalityImage, GeneratorSlug: provider}
+	agent := &Agent{ID: uuid.New(), Slug: "async-" + uuid.NewString()[:8], Version: 1, Modal: modality, GeneratorSlug: provider}
 	if err := e.Agents().Create(ctx, agent); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
-	sess := &Session{PlatformID: "async-test", State: State{Modality: ModalityImage}}
+	sess := &Session{PlatformID: "async-test", State: State{Modality: modality}}
 	if err := e.Sessions().Create(ctx, sess); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -99,7 +111,7 @@ func TestAsyncMedia_PendingResolvesEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	e, db := reproEngine(t, "asyncmedia_ok", map[string]Generator{"asyncimg": &asyncImageGen{}}, PollerConfig{Interval: time.Minute, Workers: 1})
 
-	th := runPending(t, ctx, e, "asyncimg")
+	th := runPending(t, ctx, e, "asyncimg", ModalityImage)
 
 	// The task row exists and both task and result start pending.
 	if got := taskStatus(t, db, e.prefix, th.ID); got != "pending" {
@@ -124,12 +136,27 @@ func TestAsyncMedia_PendingResolvesEndToEnd(t *testing.T) {
 	}
 }
 
+func TestAsyncMedia_Model3DResolvesEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	e, db := reproEngine(t, "asyncmodel3d_ok", map[string]Generator{"model3d": asyncModel3DGen{}}, PollerConfig{Interval: time.Minute, Workers: 1})
+	th := runPending(t, ctx, e, "model3d", ModalityModel3D)
+
+	newAsyncPollerService(e, PollerConfig{Interval: time.Minute, Workers: 1}).pollPending(ctx)
+	if got := taskStatus(t, db, e.prefix, th.ID); got != "ready" {
+		t.Fatalf("task status after poll = %q, want ready", got)
+	}
+	status, payload := resultByTask(t, db, e.prefix, th.ID)
+	if status != "ready" || !strings.Contains(payload, "chapel-1.glb") {
+		t.Fatalf("resolved 3D result = status %q payload %s", status, payload)
+	}
+}
+
 func TestAsyncMedia_TerminalFailureAfterMaxAttempts(t *testing.T) {
 	ctx := context.Background()
 	const maxAttempts = 3
 	// Always errors on Poll, so it should fail terminally after maxAttempts.
 	e, db := reproEngine(t, "asyncmedia_fail", map[string]Generator{"asyncimg": &asyncImageGen{failTimes: 100}}, PollerConfig{Interval: time.Minute, Workers: 1})
-	th := runPending(t, ctx, e, "asyncimg")
+	th := runPending(t, ctx, e, "asyncimg", ModalityImage)
 
 	p := newAsyncPollerService(e, PollerConfig{Interval: time.Minute, Workers: 1, MaxAttempts: maxAttempts})
 	for range maxAttempts {
@@ -159,7 +186,7 @@ func TestAsyncMedia_PerpetuallyPendingIsCapped(t *testing.T) {
 	ctx := context.Background()
 	const maxAttempts = 3
 	e, db := reproEngine(t, "asyncmedia_stuck", map[string]Generator{"pendingforever": pendingForeverGen{}}, PollerConfig{Interval: time.Minute, Workers: 1})
-	th := runPending(t, ctx, e, "pendingforever")
+	th := runPending(t, ctx, e, "pendingforever", ModalityImage)
 
 	p := newAsyncPollerService(e, PollerConfig{Interval: time.Minute, Workers: 1, MaxAttempts: maxAttempts})
 	for range maxAttempts {
@@ -174,7 +201,7 @@ func TestAsyncMedia_PerpetuallyPendingIsCapped(t *testing.T) {
 func TestAsyncMedia_FailedResultMarksFailed(t *testing.T) {
 	ctx := context.Background()
 	e, db := reproEngine(t, "asyncmedia_failres", map[string]Generator{"failres": failedResultGen{}}, PollerConfig{Interval: time.Minute, Workers: 1})
-	th := runPending(t, ctx, e, "failres")
+	th := runPending(t, ctx, e, "failres", ModalityImage)
 
 	newAsyncPollerService(e, PollerConfig{Interval: time.Minute, Workers: 1}).pollPending(ctx)
 
@@ -211,7 +238,7 @@ func TestAsyncMedia_PostgresFKOrdering(t *testing.T) {
 
 	// This step's result is pending; before the fix its insert FK-violated
 	// because no loom_tasks row existed for results.task_id.
-	th := runPending(t, ctx, e, "asyncimg")
+	th := runPending(t, ctx, e, "asyncimg", ModalityImage)
 	if got := taskStatus(t, db, e.prefix, th.ID); got != "pending" {
 		t.Fatalf("task status before poll = %q, want pending", got)
 	}

@@ -13,7 +13,7 @@ Loom handles the infrastructure — session management, versioned agents and pro
 
 | | |
 |---|---|
-| **Modality-agnostic** | Text, image, video, and structured output in one pipeline |
+| **Modality-agnostic** | Text, image, video, audio, 3D assets, and structured output in one pipeline |
 | **Versioned agents & prompts** | Slug + version addressing; swap models without touching session history |
 | **Session branching & replay** | Fork at any step; explore alternatives; GC stale branches automatically |
 | **Hook bus** | Pre- and post-hooks for validation, retry logic, and content filtering |
@@ -255,9 +255,10 @@ Register any number of generators under a slug. Built-in adapters:
 | Package | Generator | Modality |
 |---|---|---|
 | `generator/openai` | `NewChatGenerator(key, model)` | Text (streaming) |
-| `generator/anthropic` | `NewChatGenerator(key, model)` | Text (streaming) |
+| `generator/anthropic` | `NewChatGenerator(key, model)` | Text (streaming), on the official Anthropic Go SDK — a separate module: `go get github.com/rhaqim/loom/generator/anthropic` |
 | `generator/replicate` | `NewImageGenerator(key, model)` | Image (async) |
 | `generator/runway` | `NewVideoGenerator(key, model)` | Video (async) |
+| `generator/meshy` | `NewModel3DGenerator(key)` | 3D asset, GLB (async, text- or image-to-3D) |
 | `generator/echo` | `New(prefix)` | Text — echo stub for testing |
 
 Bring your own by implementing one of three flavors — register it with
@@ -361,8 +362,12 @@ Other typed errors: `*loom.BudgetExceededError` (budget block), `*loom.RetryErro
 
 ### Cost tracking & budgets
 
-Every step records input/output tokens and USD cost (based on the built-in pricing
-table). Budgets enforce a spend cap per platform key (`Target.Kind` must be
+Every step records input/output tokens and USD cost. Token-billed generators are
+priced from `Config.Pricing`/`Config.DefaultPrice`; per-job generators (image, video,
+audio, 3D) from `Config.JobPricing` (USD per job, keyed by model id or generator slug).
+Rows priced from the built-in placeholder rate are marked `Estimated`, and a summary's
+`PricingConfigured` is false whenever any row it sums was estimated — show its USD as
+unknown in that case. Budgets enforce a spend cap per platform key (`Target.Kind` must be
 `loom.TargetPlatformID` — other kinds are rejected). Enforcement is best-effort
 (reads prior recorded spend; fails open on DB errors), not a hard transactional
 ceiling.
@@ -607,6 +612,7 @@ loom/
 │   ├── anthropic/      # Anthropic Messages API (sync + streaming)
 │   ├── replicate/      # async image generation
 │   ├── runway/         # async video generation
+│   ├── meshy/          # async text/image-to-3D generation
 │   └── echo/           # echo stub (testing, no API key needed)
 ├── judge/              # RubricJudge, PairwiseJudge, ConstraintJudge
 ├── evaluator/          # EXPERIMENTAL decision primitive (Noul / Choice / Score)
@@ -617,11 +623,12 @@ loom/
 ├── cmd/loom-cli/       # CLI: migrate, seed, test
 ├── scripts/            # gen-llms-full.sh
 ├── docs/               # design/architecture notes
-└── examples/           # each has its own go.mod
+└── examples/
     ├── quickstart/     # smallest possible program
     ├── story/          # minimal single-agent example
     ├── dnd/            # full D&D solo experience
     ├── storyapi/       # HTTP API with auth, sessions, streaming
+    ├── media-story/    # Go-template multi-modality narrative server
     └── conexus-loom/   # multi-agent, multimodal session via RunTurn (zero-setup)
 ```
 
@@ -629,6 +636,21 @@ Contributors: `aliases.go` and `llms-full.txt` are generated — run `make gener
 after changing the public surface (CI enforces the facade is in sync).
 
 ---
+
+## Releasing
+
+loom is two Go modules: the root and `generator/anthropic` (kept separate so the
+Anthropic SDK's dependencies stay out of loom). Both are released from one
+commit on `main`:
+
+```bash
+make release VERSION=v0.0.3   # checks, bumps generator/anthropic's loom require, tags
+git push origin main v0.0.3 generator/anthropic/v0.0.3   # the command it prints
+```
+
+`generator/anthropic` is only retagged when it changed since its last release;
+otherwise just `vX.Y.Z` is created. The script refuses a dirty tree, another
+branch (`RELEASE_BRANCH` overrides) or an existing tag, and pushes nothing.
 
 ## License
 

@@ -60,6 +60,16 @@ func TestResultRoundTrip(t *testing.T) {
 		}
 	})
 
+	t.Run("model3d", func(t *testing.T) {
+		got, ok := roundTrip(t, NewModel3DResult("https://x/chapel.glb", "model/gltf-binary", "https://x/chapel.png", "ruined chapel", 4812, true)).(*Model3DResult)
+		if !ok {
+			t.Fatal("not a *Model3DResult")
+		}
+		if got.URL != "https://x/chapel.glb" || got.Format != "model/gltf-binary" || got.PreviewImage != "https://x/chapel.png" || got.Prompt != "ruined chapel" || got.PolyCount != 4812 || !got.Rigged {
+			t.Errorf("model3d round trip lost fields: %+v", got)
+		}
+	})
+
 	t.Run("world", func(t *testing.T) {
 		src := &WorldResult{Deltas: []WorldDelta{
 			{Op: "add_entity", Type: "tree", EntityID: "e1", Pos: [3]float64{1, 2, 3}},

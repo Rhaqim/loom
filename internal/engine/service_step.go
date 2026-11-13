@@ -18,7 +18,42 @@ type stepService struct {
 	maxRetries int
 }
 
+// run executes a step and publishes its session events: step.started, chunk
+// (as the step streams), then step.done or step.failed. A skipped step (ErrSkip)
+// publishes no failure.
 func (s *stepService) run(ctx context.Context, session *Session, req StepRequest) (*Step, error) {
+	agentSlug := req.AgentSlug
+	if req.Agent != nil {
+		agentSlug = req.Agent.Slug
+	}
+	base := SessionEvent{SessionID: session.ID, StepIndex: -1, Agent: agentSlug, TurnID: req.turnID, TurnRole: req.turnRole}
+	started := base
+	started.Type = EventStepStarted
+	s.e.emit(ctx, started)
+	if orig := req.OnChunk; orig != nil {
+		req.OnChunk = func(c Chunk) {
+			orig(c)
+			ev := base
+			ev.Type, ev.Chunk = EventChunk, c.Content
+			s.e.emit(ctx, ev)
+		}
+	}
+
+	step, err := s.runStep(ctx, session, req)
+	switch {
+	case step != nil: // includes ErrSessionNotPersisted: the step is durable
+		ev := base
+		ev.Type, ev.Step, ev.StepIndex = EventStepDone, step, step.Index
+		s.e.emit(ctx, ev)
+	case err != nil && !IsSkip(err):
+		ev := base
+		ev.Type, ev.Err = EventStepFailed, err.Error()
+		s.e.emit(ctx, ev)
+	}
+	return step, err
+}
+
+func (s *stepService) runStep(ctx context.Context, session *Session, req StepRequest) (*Step, error) {
 	start := time.Now()
 
 	// Resolve agent.
@@ -29,6 +64,22 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		if err != nil {
 			return nil, fmt.Errorf("loom: resolve agent %q: %w", req.AgentSlug, err)
 		}
+	}
+
+	// An action taken on behalf of a participant must come from one.
+	if req.Action != nil && req.Action.ParticipantID != "" {
+		s.e.mu.RLock()
+		ok := session.State.HasParticipant(req.Action.ParticipantID)
+		s.e.mu.RUnlock()
+		if !ok {
+			return nil, fmt.Errorf("%w: %q", ErrNotParticipant, req.Action.ParticipantID)
+		}
+	}
+
+	// A recorded step (RecordStep, a human-led turn) has its result already:
+	// no budget to spend, no generator, no prompt to render.
+	if req.external != nil {
+		return s.record(ctx, session, agent, req, start)
 	}
 
 	// Enforce budgets before the generator is chosen: an exceeded budget may
@@ -59,6 +110,9 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 	s.e.mu.RLock()
 	stepSession := session.forStep()
 	s.e.mu.RUnlock()
+	// The step's starting point, so the merge below applies only what this step
+	// changed and cannot revert a concurrent sibling's writes.
+	stepBase := baseOf(stepSession.State)
 
 	// Expose the (per-step) session to hooks before they run.
 	req.Session = stepSession
@@ -184,7 +238,27 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = err.Error()
 					break
 				}
+				// An adapter that already classified its failure (e.g. a safety
+				// refusal as GenerationRejected) keeps that Kind; anything else
+				// is a transport failure.
+				var ge *GenerationError
+				if errors.As(err, &ge) {
+					if ge.Provider == "" {
+						ge.Provider = genSlug
+					}
+					return nil, ge
+				}
 				return nil, &GenerationError{Kind: GenerationTransport, Provider: genSlug, Err: err}
+			}
+			// Mirror the streaming path: a failed result is a rejection, not a
+			// step to persist.
+			if result != nil && result.Status() == ResultStatusFailed {
+				msg := resultErrorMessage(result)
+				if keepBest && haveBest {
+					diagnostics[fmt.Sprintf("attempt_%d_error", attempt)] = msg
+					break
+				}
+				return nil, &GenerationError{Kind: GenerationRejected, Provider: genSlug, Message: msg}
 			}
 		}
 
@@ -262,11 +336,59 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		diagnostics["kept_score"] = bestScore
 	}
 
+	return s.persist(ctx, session, stepSession, stepBase, agent, genSlug, genReq, req, result, diagnostics, start)
+}
+
+// record runs a step whose result was written outside loom. Pre- and
+// post-hooks run as for a generated step (a post-hook may still reject it, but
+// cannot ask for a retry: there is no generator to re-run), the state merge and
+// checkpoint are identical, and no cost row is written.
+func (s *stepService) record(ctx context.Context, session *Session, agent *Agent, req StepRequest, start time.Time) (*Step, error) {
+	if req.external.Status() != ResultStatusReady || req.external.TaskHandle() != nil {
+		return nil, fmt.Errorf("loom: a recorded step needs a ready result, got status %q", req.external.Status())
+	}
+	s.e.mu.RLock()
+	stepSession := session.forStep()
+	s.e.mu.RUnlock()
+	stepBase := baseOf(stepSession.State)
+	req.Session = stepSession
+
+	if err := s.e.hooks.RunPre(ctx, &req); err != nil {
+		if IsSkip(err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("loom: pre-hook: %w", err)
+	}
+	result, err := s.e.hooks.RunPost(ctx, &req, req.external)
+	if err != nil {
+		if IsRetry(err) {
+			return nil, fmt.Errorf("loom: post-hook asked to retry a recorded step, which has no generator to re-run: %w", err)
+		}
+		return nil, fmt.Errorf("loom: post-hook: %w", err)
+	}
+	genReq := GenerateRequest{SessionID: session.ID, AgentID: agent.ID, Inputs: req.Inputs, ParamsMap: req.Params}
+	return s.persist(ctx, session, stepSession, stepBase, agent, "", genReq, req, result, map[string]any{"recorded": true}, start)
+}
+
+// persist is the shared tail of every step: it builds the Step, merges the
+// step's state changes onto the session, and commits step, checkpoint and (for
+// generated steps) cost in one transaction before updating the session row.
+func (s *stepService) persist(ctx context.Context, session, stepSession *Session, stepBase stateBase, agent *Agent,
+	genSlug string, genReq GenerateRequest, req StepRequest, result Result, diagnostics map[string]any, start time.Time) (*Step, error) {
 	// Build and persist step.
 	// Ensure the action has a unique ID before persisting.
 	if req.Action != nil && req.Action.ID == (uuid.UUID{}) {
 		req.Action.ID = uuid.New()
 	}
+	// An async result's task is persisted under the slug the generator is
+	// registered as, not whatever Provider the adapter wrote: the poller finds
+	// the generator to Poll by this name. Adapters hard-code their brand
+	// ("meshy", "replicate"), so a generator registered under any other key
+	// ("meshy-3d") left its task pending forever with nothing to poll it.
+	if th := result.TaskHandle(); th != nil {
+		th.Provider = genSlug
+	}
+
 	// Tag the step with turn linkage when it is part of a RunTurn flow so the
 	// steps of one turn can be grouped for branching, replay, and cost rollups.
 	if req.turnID != uuid.Nil {
@@ -294,20 +416,32 @@ func (s *stepService) run(ctx context.Context, session *Session, req StepRequest
 		Diagnostics: diagnostics,
 		DurationMs:  int(time.Since(start).Milliseconds()),
 		CreatedAt:   time.Now(),
+		Author:      req.author,
+	}
+	if req.Action != nil {
+		step.ParticipantID = req.Action.ParticipantID
 	}
 	// Finalize the post-step state before persisting so the step and its
 	// checkpoint commit in one transaction. Reconcile everything the hooks wrote
 	// on the per-step copy — Vars, Snapshot and AvailableActions — back onto the
 	// shared session (last writer wins). Modality is engine-owned and always
 	// taken from the result, so it is set after the merge.
-	mergeState(&session.State, stepSession.State)
+	if conflicts := mergeState(&session.State, stepBase, stepSession.State); len(conflicts) > 0 {
+		s.e.log.Error("concurrent steps changed the same state; last writer wins",
+			"session_id", session.ID, "agent", agent.Slug, "fields", conflicts)
+	}
 	session.State.Modality = result.Modality()
 	// The cost row commits with the step, so a durable step always has durable
 	// cost. A contained cost failure comes back as *costRecordError with the
 	// step still committed — the generation was already billed by the provider,
 	// so losing the bookkeeping row beats discarding the step.
-	cost := s.e.costs.buildCostRecord(step, agent, result, session.PlatformID)
-	if err := insertStep(ctx, s.e.db, s.e.prefix, step, &session.State, &cost); err != nil {
+	// A recorded step was not generated, so it has no cost row.
+	var cost *CostRecord
+	if req.external == nil {
+		c := s.e.costs.buildCostRecord(step, agent, genSlug, result, session.PlatformID)
+		cost = &c
+	}
+	if err := insertStep(ctx, s.e.db, s.e.prefix, step, &session.State, cost); err != nil {
 		var cre *costRecordError
 		if !errors.As(err, &cre) {
 			return nil, fmt.Errorf("loom: persist step: %w", err)

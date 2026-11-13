@@ -6,8 +6,10 @@ package gc
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -39,6 +41,34 @@ type Config struct {
 	// dialect-specific SQL (currently the test-tag match, since tags is JSONB on
 	// Postgres and TEXT on SQLite). Empty defaults to Postgres syntax.
 	Dialect string
+
+	// Retention expires whole sessions — root sessions included, unlike the
+	// branch tiers above — by tag and idle time, e.g. the throwaway sessions
+	// of a public demo. Each rule runs on every sweep and honours DryRun.
+	Retention []RetentionRule
+}
+
+// RetentionAction is what a RetentionRule does to a matching session.
+type RetentionAction string
+
+const (
+	// RetentionDiscard soft-deletes the session; tier 3 hard-deletes it after
+	// SoftDeleteGrace, so it can be restored until then.
+	RetentionDiscard RetentionAction = "discard"
+	// RetentionPurge hard-deletes the session and its steps immediately.
+	RetentionPurge RetentionAction = "purge"
+)
+
+// RetentionRule expires sessions idle for longer than MaxIdle. A session
+// matches when it carries every tag in Tags (an empty Tags matches every
+// session — use with care), is not pinned, is not already deleted, has had no
+// activity (updated_at) for MaxIdle, and has no live branches. A rule with a
+// non-positive MaxIdle or an unknown Action is skipped and logged.
+type RetentionRule struct {
+	Name    string // reported in SweepReport.Retention; defaults to "rule-<n>"
+	Tags    []string
+	MaxIdle time.Duration
+	Action  RetentionAction
 }
 
 // DefaultConfig returns sensible production defaults.
@@ -60,7 +90,10 @@ type SweepReport struct {
 	StaleSoftDeleted    int // T2 soft-deleted
 	GraceHardDeleted    int // T3 hard-deleted
 	TestBranchesDeleted int // T4 hard-deleted
-	DryRun              bool
+	// Retention counts the sessions each RetentionRule discarded or purged,
+	// keyed by rule name.
+	Retention map[string]int
+	DryRun    bool
 }
 
 func (r SweepReport) String() string {
@@ -68,11 +101,15 @@ func (r SweepReport) String() string {
 	if r.DryRun {
 		mode = "dry-run"
 	}
-	return fmt.Sprintf(
+	out := fmt.Sprintf(
 		"GC sweep [%s]: T1=%d T2=%d T3=%d T4=%d",
 		mode, r.SpeculativeDeleted, r.StaleSoftDeleted,
 		r.GraceHardDeleted, r.TestBranchesDeleted,
 	)
+	for name, n := range r.Retention {
+		out += fmt.Sprintf(" %s=%d", name, n)
+	}
+	return out
 }
 
 // Worker runs the periodic GC sweep.
@@ -182,7 +219,80 @@ func (w *Worker) Sweep(ctx context.Context) (*SweepReport, error) {
 	}
 	report.TestBranchesDeleted = t4
 
+	for i, rule := range w.cfg.Retention {
+		name := rule.Name
+		if name == "" {
+			name = fmt.Sprintf("rule-%d", i+1)
+		}
+		n, err := w.sweepRetention(ctx, rule)
+		if err != nil {
+			return report, fmt.Errorf("retention %q: %w", name, err)
+		}
+		if n >= 0 {
+			if report.Retention == nil {
+				report.Retention = map[string]int{}
+			}
+			report.Retention[name] = n
+		}
+	}
+
 	return report, nil
+}
+
+// sweepRetention applies one retention rule. It returns -1 for a rule that is
+// skipped as invalid.
+func (w *Worker) sweepRetention(ctx context.Context, rule RetentionRule) (int, error) {
+	if rule.MaxIdle <= 0 || (rule.Action != RetentionDiscard && rule.Action != RetentionPurge) {
+		log.Printf("loom gc: skipping retention rule %q: needs MaxIdle > 0 and Action discard or purge", rule.Name)
+		return -1, nil
+	}
+	p := w.prefix
+	args := []any{time.Now().Add(-rule.MaxIdle)}
+	conds := []string{
+		"pinned = false",
+		"deleted_at IS NULL",
+		"updated_at < $1",
+		fmt.Sprintf("NOT EXISTS (SELECT 1 FROM %ssessions child WHERE child.parent_session_id = %ssessions.id AND child.deleted_at IS NULL)", p, p),
+	}
+	for _, tag := range rule.Tags {
+		args = append(args, w.tagArg(tag))
+		conds = append(conds, w.tagMatch(len(args)))
+	}
+	where := strings.Join(conds, " AND ")
+	if rule.Action == RetentionPurge {
+		return w.hardSweep(ctx, where, args...)
+	}
+	if w.cfg.DryRun {
+		return w.countWhere(ctx, where, args...)
+	}
+	now := time.Now()
+	args = append(args, now)
+	res, err := w.db.ExecContext(ctx,
+		fmt.Sprintf(`UPDATE %ssessions SET deleted_at=$%d, updated_at=$%d WHERE %s`, p, len(args), len(args), where), args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// tagMatch returns a predicate testing that the session's tags array contains
+// the tag bound to placeholder $n (array membership, not a substring match).
+func (w *Worker) tagMatch(n int) string {
+	if w.cfg.Dialect == "sqlite" {
+		return fmt.Sprintf("EXISTS (SELECT 1 FROM json_each(tags) WHERE value = $%d)", n)
+	}
+	return fmt.Sprintf("tags @> $%d::jsonb", n)
+}
+
+// tagArg is the bind value tagMatch expects: the tag itself on SQLite, a
+// one-element JSON array on Postgres.
+func (w *Worker) tagArg(tag string) any {
+	if w.cfg.Dialect == "sqlite" {
+		return tag
+	}
+	b, _ := json.Marshal([]string{tag})
+	return string(b)
 }
 
 // T1: Speculative branches — a branch that was forked but never actually played.

@@ -37,6 +37,16 @@ jobs:
       - name: Test (race)
         run: go test -race -count=1 ./...
 
+      # generator/anthropic is its own module (it carries the Anthropic SDK's
+      # dependencies, which the root module stays free of), so ./... above
+      # does not reach it.
+      - name: Anthropic generator module (vet, build, test)
+        working-directory: generator/anthropic
+        run: |
+          go vet ./...
+          go build ./...
+          go test -race -count=1 ./...
+
   postgres:
     name: Postgres integration & migrations
     runs-on: ubuntu-latest

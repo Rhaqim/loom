@@ -45,8 +45,36 @@ func nullInt(i int) any {
 	return i
 }
 
+// resultModelKey is the payload key carrying the generator-reported model id
+// (Result.Metadata()["model"]). It is namespaced so it cannot collide with a
+// StructuredResult's legacy unwrapped data.
+const resultModelKey = "_model"
+
 // marshalResultForStorage serialises a Result to JSON for loom_results.payload.
+//
+// The reported model is persisted alongside the payload. Without it a step
+// reloaded from storage had empty metadata, so ResultModel returned "" and any
+// caller pricing that step (PriceResult) silently fell back to the default
+// price instead of the model that actually ran — wrong whenever a per-request
+// override picked a different model.
 func marshalResultForStorage(r Result) ([]byte, error) {
+	b, err := marshalResultPayload(r)
+	if err != nil {
+		return nil, err
+	}
+	model := ResultModel(r)
+	if model == "" {
+		return b, nil
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(b, &m) != nil || m == nil {
+		return b, nil
+	}
+	m[resultModelKey], _ = json.Marshal(model)
+	return json.Marshal(m)
+}
+
+func marshalResultPayload(r Result) ([]byte, error) {
 	switch v := r.(type) {
 	case *TextResult:
 		return json.Marshal(map[string]any{
@@ -76,6 +104,15 @@ func marshalResultForStorage(r Result) ([]byte, error) {
 			"duration_sec": v.DurationSec,
 			"format":       v.Format,
 		})
+	case *Model3DResult:
+		return json.Marshal(map[string]any{
+			"url":           v.URL,
+			"format":        v.Format,
+			"preview_image": v.PreviewImage,
+			"prompt":        v.Prompt,
+			"poly_count":    v.PolyCount,
+			"rigged":        v.Rigged,
+		})
 	case *WorldResult:
 		return json.Marshal(map[string]any{"deltas": v.Deltas})
 	case *StructuredResult:
@@ -89,10 +126,21 @@ func marshalResultForStorage(r Result) ([]byte, error) {
 	}
 }
 
-// unmarshalResult deserialises a stored payload back to a Result.
+// unmarshalResult deserialises a stored payload back to a Result, restoring the
+// persisted model id onto its metadata (see marshalResultForStorage).
 func unmarshalResult(modal Modality, status ResultStatus, payload []byte) Result {
 	var m map[string]any
 	_ = json.Unmarshal(payload, &m)
+	model, _ := m[resultModelKey].(string)
+	delete(m, resultModelKey)
+	r := decodeResult(modal, status, m)
+	if model != "" {
+		r.Metadata()["model"] = model
+	}
+	return r
+}
+
+func decodeResult(modal Modality, status ResultStatus, m map[string]any) Result {
 	str := func(k string) string { s, _ := m[k].(string); return s }
 	num := func(k string) int { f, _ := m[k].(float64); return int(f) }
 	fnum := func(k string) float64 { f, _ := m[k].(float64); return f }
@@ -112,6 +160,11 @@ func unmarshalResult(modal Modality, status ResultStatus, payload []byte) Result
 	case ModalityAudio:
 		r := &AudioResult{URL: str("url"), DurationSec: fnum("duration_sec"), Format: str("format")}
 		r.modal, r.status, r.meta = ModalityAudio, status, map[string]any{}
+		return r
+	case ModalityModel3D:
+		r := &Model3DResult{URL: str("url"), Format: str("format"), PreviewImage: str("preview_image"), Prompt: str("prompt"), PolyCount: num("poly_count")}
+		r.Rigged, _ = m["rigged"].(bool)
+		r.modal, r.status, r.meta = ModalityModel3D, status, map[string]any{}
 		return r
 	case ModalityWorld:
 		r := &WorldResult{}

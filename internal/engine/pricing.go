@@ -40,6 +40,20 @@ func (e *Engine) priceFor(model string) (ModelPrice, bool) {
 	return defaultModelPrice, false
 }
 
+// jobPriceFor returns the per-job USD price for a tokenless generation, trying
+// the reported model first and then the generator slug.
+func (e *Engine) jobPriceFor(model, genSlug string) (float64, bool) {
+	for _, k := range []string{model, genSlug} {
+		if k == "" {
+			continue
+		}
+		if p, ok := e.jobPricing[k]; ok {
+			return p, true
+		}
+	}
+	return 0, false
+}
+
 // PriceResult returns the USD cost for a result's token usage under the model's
 // configured pricing. model is the generator's reported model id ("" uses the
 // default price). Exposed so applications can compute per-turn spend consistently

@@ -33,10 +33,11 @@ type Budget struct {
 	CreatedAt   time.Time
 }
 
-// BudgetTarget identifies the entity a budget applies to. Only Kind ==
-// TargetPlatformID is currently enforced; Create rejects other kinds.
+// BudgetTarget identifies the entity a budget applies to: Kind is
+// TargetPlatformID (Key = Session.PlatformID) or TargetSessionID (Key = the
+// session's ID as a string). Create rejects other kinds.
 type BudgetTarget struct {
-	Kind string // currently only "platform_id" is enforced
+	Kind string
 	Key  string
 }
 
@@ -69,3 +70,7 @@ const (
 
 // TargetPlatformID is the BudgetTarget.Kind for per-user budgets.
 const TargetPlatformID = "platform_id"
+
+// TargetSessionID is the BudgetTarget.Kind for a budget on one session (Key =
+// Session.ID.String()), e.g. a cap on one shared game regardless of who acts.
+const TargetSessionID = "session_id"

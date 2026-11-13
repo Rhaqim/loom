@@ -1,7 +1,7 @@
 DSN ?= postgres://loom:loom@localhost:5432/loom?sslmode=disable
 export LOOM_DSN := $(DSN)
 
-.PHONY: help up down migrate seed example test-engine test-cli test-schema test-all build clean generate check-facade check llms-full
+.PHONY: help up down migrate seed example test-engine test-cli test-schema test-all build clean generate check-facade check llms-full release
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -69,6 +69,10 @@ check: check-facade ## Run non-DB checks: facade sync, vet, build, race tests (n
 	go vet ./...
 	go build ./...
 	LOOM_DSN= go test -race -count=1 ./...
+	cd generator/anthropic && go vet ./... && go build ./... && go test -race -count=1 ./...
+
+release: ## Tag loom (and generator/anthropic if it changed) as VERSION=vX.Y.Z on main; prints the push command
+	@./scripts/release.sh "$(VERSION)"
 
 build: ## Build the loom-cli binary
 	go build -o bin/loom-cli ./cmd/loom-cli

@@ -17,10 +17,16 @@ type budgetService struct {
 }
 
 func (b *budgetService) Create(ctx context.Context, budget *Budget) error {
-	// Only platform_id budgets are enforced today; reject other kinds rather than
-	// silently storing a budget that would never be applied.
-	if budget.Target.Kind != TargetPlatformID {
-		return fmt.Errorf("loom: budget target kind %q is not supported (only %q is enforced)", budget.Target.Kind, TargetPlatformID)
+	// Reject kinds that are not enforced rather than silently storing a budget
+	// that would never be applied.
+	switch budget.Target.Kind {
+	case TargetPlatformID:
+	case TargetSessionID:
+		if _, err := uuid.Parse(budget.Target.Key); err != nil {
+			return fmt.Errorf("loom: a %q budget needs a session ID as its key: %w", TargetSessionID, err)
+		}
+	default:
+		return fmt.Errorf("loom: budget target kind %q is not supported (use %q or %q)", budget.Target.Kind, TargetPlatformID, TargetSessionID)
 	}
 	if budget.ID == uuid.Nil {
 		budget.ID = uuid.New()
@@ -58,11 +64,17 @@ func (b *budgetService) enforce(ctx context.Context, session *Session, agent *Ag
 	if session == nil || session.PlatformID == "" {
 		return agent, nil
 	}
+	// A step is subject to its platform's budgets and its session's.
 	budgets, err := b.List(ctx, TargetPlatformID, session.PlatformID)
 	if err != nil {
 		b.e.log.Error("budget: list", "err", err)
 		return agent, nil
 	}
+	sessionBudgets, err := b.List(ctx, TargetSessionID, session.ID.String())
+	if err != nil {
+		b.e.log.Error("budget: list", "err", err)
+	}
+	budgets = append(budgets, sessionBudgets...)
 	now := time.Now()
 	for _, bud := range budgets {
 		if !bud.Active {
@@ -126,6 +138,8 @@ func budgetExceededErr(bud *Budget, used *UsageSummary, now time.Time) *BudgetEx
 		LimitUSD:    bud.Limit.USD,
 		UsedTokens:  used.TotalTokens,
 		LimitTokens: bud.Limit.Tokens,
+		UsedSteps:   used.StepCount,
+		LimitSteps:  bud.Limit.Steps,
 		ResetsAt:    budgetWindowEnd(bud.Window, now),
 	}
 }

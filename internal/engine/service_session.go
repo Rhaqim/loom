@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -63,6 +64,54 @@ func (s *sessionService) StateAt(ctx context.Context, id uuid.UUID, stepIndex in
 	return querySnapshotAt(ctx, s.e.db, s.e.prefix, id, stepIndex)
 }
 
+func (s *sessionService) AddParticipant(ctx context.Context, sess *Session, p Participant) error {
+	if p.ID == "" {
+		return fmt.Errorf("loom: participant needs an ID")
+	}
+	if p.JoinedAt.IsZero() {
+		p.JoinedAt = time.Now()
+	}
+	return s.changeParticipants(ctx, sess, func(ps []Participant) ([]Participant, error) {
+		for _, q := range ps {
+			if q.ID == p.ID {
+				return nil, ErrParticipantExists
+			}
+		}
+		return append(ps, p), nil
+	})
+}
+
+func (s *sessionService) RemoveParticipant(ctx context.Context, sess *Session, id string) error {
+	return s.changeParticipants(ctx, sess, func(ps []Participant) ([]Participant, error) {
+		for i, q := range ps {
+			if q.ID == id {
+				return append(slices.Clone(ps[:i]), ps[i+1:]...), nil
+			}
+		}
+		return nil, ErrNotParticipant
+	})
+}
+
+// changeParticipants applies change under the engine lock — the same lock a
+// step's persist tail holds — so a membership change cannot interleave with a
+// step's state merge and session write. On a failed write the in-memory
+// session is restored.
+func (s *sessionService) changeParticipants(ctx context.Context, sess *Session, change func([]Participant) ([]Participant, error)) error {
+	s.e.mu.Lock()
+	defer s.e.mu.Unlock()
+	next, err := change(slices.Clone(sess.State.Participants))
+	if err != nil {
+		return err
+	}
+	prev := sess.State.Participants
+	sess.State.Participants = next
+	if err := s.Update(ctx, sess); err != nil {
+		sess.State.Participants = prev
+		return err
+	}
+	return nil
+}
+
 func (s *sessionService) Update(ctx context.Context, sess *Session) error {
 	sess.UpdatedAt = time.Now()
 	return updateSession(ctx, s.e.db, s.e.prefix, sess)
@@ -96,6 +145,7 @@ func (s *sessionService) Fork(ctx context.Context, parentID uuid.UUID, stepIndex
 	if err := insertSession(ctx, s.e.db, s.e.prefix, branch); err != nil {
 		return nil, err
 	}
+	s.e.emit(ctx, SessionEvent{Type: EventForked, SessionID: parentID, StepIndex: stepIndex, BranchID: branch.ID})
 	return branch, nil
 }
 

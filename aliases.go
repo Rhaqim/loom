@@ -58,6 +58,11 @@ type Session = engine.Session
 // State is the live state of a session between steps.
 type State = engine.State
 
+// Participant is one person in a shared session. Role is application-defined
+// ("host", "player", "dm"). ID is the application's own identifier and is what
+// Action.ParticipantID and Step.ParticipantID refer to.
+type Participant = engine.Participant
+
 // BranchNode represents a node in the session branch tree.
 type BranchNode = engine.BranchNode
 
@@ -194,6 +199,10 @@ type StoredResult = engine.StoredResult
 // Steps are append-only; they form the complete timeline of a session.
 type Step = engine.Step
 
+// ExternalStep is a step whose result was written outside loom — a human game
+// master's narration, a moderator's edit — recorded with Engine.RecordStep.
+type ExternalStep = engine.ExternalStep
+
 // RetryMode selects how the engine treats post-hook retries.
 type RetryMode = engine.RetryMode
 
@@ -245,6 +254,14 @@ type VideoResult = engine.VideoResult
 // AudioResult is the output from an audio-modality generator.
 type AudioResult = engine.AudioResult
 
+// Model3DResult is the output from a 3D-model generator. URL should normally
+// reference a binary glTF (.glb) asset, the portable format consumed by web
+// renderers such as Three.js. PreviewImage is an optional rendered thumbnail.
+// The common fields capture the properties a renderer needs to choose and load
+// the asset; applications can retain provider-specific data in their own asset
+// catalog keyed by URL or ResultID.
+type Model3DResult = engine.Model3DResult
+
 // WorldDelta is a single structured operation applied to a procedural world.
 type WorldDelta = engine.WorldDelta
 
@@ -268,6 +285,10 @@ var NewVideoResult = engine.NewVideoResult
 // format is the MIME type or extension (e.g. "audio/mpeg", "mp3").
 // durationSec is the audio length in seconds.
 var NewAudioResult = engine.NewAudioResult
+
+// NewModel3DResult creates a ready Model3DResult. format is the file format or
+// MIME type (for example "model/gltf-binary" or "glb").
+var NewModel3DResult = engine.NewModel3DResult
 
 // NewPendingResult creates a pending Result for async generators.
 var NewPendingResult = engine.NewPendingResult
@@ -333,6 +354,17 @@ type StreamingGenerator = engine.StreamingGenerator
 // via Config.AsyncPoller.
 type AsyncGenerator = engine.AsyncGenerator
 
+// ModelInfo describes the model a generator would call, as its provider
+// reports it. Fields the provider does not report are zero.
+type ModelInfo = engine.ModelInfo
+
+// Verifier is an optional generator interface: Verify checks that the
+// generator's API key (or an "api_key" override) is accepted and that its model
+// (or a "model" override) exists, without generating anything or spending
+// tokens. A rejected key returns an error wrapping ErrKeyRejected. Call it
+// through Engine.VerifyGenerator.
+type Verifier = engine.Verifier
+
 // PollerConfig configures the background async result poller.
 type PollerConfig = engine.PollerConfig
 
@@ -350,6 +382,11 @@ const ModalityImage = engine.ModalityImage
 const ModalityVideo = engine.ModalityVideo
 
 const ModalityAudio = engine.ModalityAudio
+
+// ModalityModel3D is a generated, renderable 3D asset (normally a GLB).
+// It is distinct from ModalityWorld, which carries logical world-state
+// deltas rather than a model file.
+const ModalityModel3D = engine.ModalityModel3D
 
 const ModalityWorld = engine.ModalityWorld
 
@@ -380,6 +417,11 @@ type Turn = engine.Turn
 
 // ResultText extracts the primary text payload from a Result for prompt
 // injection, returning "" for modalities without a natural text form.
+//
+// A StructuredResult renders as its "text" field when it has one (the
+// established convention) and otherwise as the JSON encoding of Data. It used
+// to return "" in that case, so a structured agent's output reached the next
+// agent in a turn as an empty input.
 var ResultText = engine.ResultText
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -661,7 +703,9 @@ type AgentCostStats = engine.AgentCostStats
 // EstimateRequest is the input to Cost().Estimate().
 type EstimateRequest = engine.EstimateRequest
 
-// CostEstimate is the output of Cost().Estimate().
+// CostEstimate is the output of Cost().Estimate(). USDLow prices the input
+// alone, USDHigh input plus the expected output; for per-job generators both
+// are the job price.
 type CostEstimate = engine.CostEstimate
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -674,8 +718,9 @@ type BudgetManager = engine.BudgetManager
 // Budget defines a (target, window, limit) spending triple.
 type Budget = engine.Budget
 
-// BudgetTarget identifies the entity a budget applies to. Only Kind ==
-// TargetPlatformID is currently enforced; Create rejects other kinds.
+// BudgetTarget identifies the entity a budget applies to: Kind is
+// TargetPlatformID (Key = Session.PlatformID) or TargetSessionID (Key = the
+// session's ID as a string). Create rejects other kinds.
 type BudgetTarget = engine.BudgetTarget
 
 // BudgetWindow is the rolling time window for a budget.
@@ -705,6 +750,58 @@ const BudgetNotify = engine.BudgetNotify
 
 // TargetPlatformID is the BudgetTarget.Kind for per-user budgets.
 const TargetPlatformID = engine.TargetPlatformID
+
+// TargetSessionID is the BudgetTarget.Kind for a budget on one session (Key =
+// Session.ID.String()), e.g. a cap on one shared game regardless of who acts.
+const TargetSessionID = engine.TargetSessionID
+
+////////////////////////////////////////////////////////////////////////////////
+// Session event stream
+////////////////////////////////////////////////////////////////////////////////
+
+// SessionEventType names a SessionEvent.
+type SessionEventType = engine.SessionEventType
+
+// EventStepStarted fires when a step begins (before generation).
+const EventStepStarted = engine.EventStepStarted
+
+// EventChunk carries one streamed fragment of a step's output. Chunks are
+// live only: they are never replayed.
+const EventChunk = engine.EventChunk
+
+// EventStepDone fires once a step is persisted. Step is set.
+const EventStepDone = engine.EventStepDone
+
+// EventStepFailed fires when a step fails before persisting. Err is set.
+const EventStepFailed = engine.EventStepFailed
+
+// EventTurnDone fires when RunTurn finishes (lead and all followers).
+const EventTurnDone = engine.EventTurnDone
+
+// EventForked fires on the parent when a branch is forked from it;
+// BranchID is the new session.
+const EventForked = engine.EventForked
+
+// SessionEvent is one event on a session's stream. Treat it as read-only: the
+// same value is delivered to every subscriber.
+type SessionEvent = engine.SessionEvent
+
+// ErrSubscriberLagged is the reason a subscription was closed because its
+// consumer fell too far behind. Reconnect with FromStep set past the last
+// step.done received; nothing persisted is lost.
+var ErrSubscriberLagged = engine.ErrSubscriberLagged
+
+// Broadcaster fans session events out to subscribers. The default is
+// in-process; a deployment with several engine instances supplies one backed
+// by Redis, NATS or similar via Config.Broadcaster, so a player connected to
+// one instance sees steps run on another.
+type Broadcaster = engine.Broadcaster
+
+// SubscribeOptions configures Engine.Subscribe.
+type SubscribeOptions = engine.SubscribeOptions
+
+// Subscription is a live session event feed from Engine.Subscribe.
+type Subscription = engine.Subscription
 
 ////////////////////////////////////////////////////////////////////////////////
 // Caching
@@ -764,6 +861,20 @@ var ResultModel = engine.ResultModel
 // BranchGCConfig is a re-export of gc.Config for callers who import only loom.
 type BranchGCConfig = engine.BranchGCConfig
 
+// RetentionRule expires whole sessions by tag and idle time on each GC sweep;
+// set them on BranchGCConfig.Retention. See gc.RetentionRule.
+type RetentionRule = engine.RetentionRule
+
+// RetentionAction is what a RetentionRule does to a matching session.
+type RetentionAction = engine.RetentionAction
+
+// RetentionDiscard soft-deletes matching sessions (hard-deleted after the
+// soft-delete grace period).
+const RetentionDiscard = engine.RetentionDiscard
+
+// RetentionPurge hard-deletes matching sessions immediately.
+const RetentionPurge = engine.RetentionPurge
+
 // DefaultBranchGCConfig returns sensible production GC defaults.
 var DefaultBranchGCConfig = engine.DefaultBranchGCConfig
 
@@ -808,6 +919,22 @@ var RetryAnnotationFrom = engine.RetryAnnotationFrom
 
 // BudgetExceededError is returned when a step would exceed a configured budget.
 type BudgetExceededError = engine.BudgetExceededError
+
+// ErrKeyRejected is wrapped by Verifier.Verify when the provider rejects the
+// API key (HTTP 401/403), so a UI can say "key not accepted" before play.
+var ErrKeyRejected = engine.ErrKeyRejected
+
+// ErrVerifyNotSupported is returned by Engine.VerifyGenerator for a generator
+// that does not implement Verifier.
+var ErrVerifyNotSupported = engine.ErrVerifyNotSupported
+
+// ErrNotParticipant is returned when an action names a ParticipantID that is
+// not one of the session's participants, or RemoveParticipant is given an
+// unknown id.
+var ErrNotParticipant = engine.ErrNotParticipant
+
+// ErrParticipantExists is returned by AddParticipant for an ID already present.
+var ErrParticipantExists = engine.ErrParticipantExists
 
 // ErrNotFound is returned when a requested entity does not exist. Errors from
 // the registries (Agents/Prompts/Sessions/Budgets/ResponseFormats) unwrap to it,

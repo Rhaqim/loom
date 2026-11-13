@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -355,4 +356,43 @@ func (g *ChatGenerator) postStream(ctx context.Context, path string, body []byte
 // newFailedResult returns a minimal failed result for goroutine error propagation.
 func newFailedResult(err error) loom.Result {
 	return loom.NewFailedResult(loom.ModalityText, err)
+}
+
+var _ loom.Verifier = (*ChatGenerator)(nil)
+
+// Verify checks the API key and model against the provider's models endpoint
+// (GET /models/{model}), honouring "api_key", "model" and "base_url"
+// overrides. It generates nothing and spends no tokens. A 401/403 wraps
+// loom.ErrKeyRejected; a 404 means the key works but the model does not exist.
+func (g *ChatGenerator) Verify(ctx context.Context, overrides map[string]any) (loom.ModelInfo, error) {
+	g, err := g.withOverrides(loom.GenerateRequest{Overrides: overrides})
+	if err != nil {
+		return loom.ModelInfo{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.baseURL+"/models/"+url.PathEscape(g.model), nil)
+	if err != nil {
+		return loom.ModelInfo{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+g.apiKey)
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return loom.ModelInfo{}, fmt.Errorf("openai: http: %w", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return loom.ModelInfo{}, fmt.Errorf("%w (openai http %d): %s", loom.ErrKeyRejected, resp.StatusCode, b)
+	case resp.StatusCode == http.StatusNotFound:
+		return loom.ModelInfo{}, fmt.Errorf("openai: model %q not found for this key", g.model)
+	case resp.StatusCode >= 400:
+		return loom.ModelInfo{}, fmt.Errorf("openai: http %d: %s", resp.StatusCode, b)
+	}
+	var m struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return loom.ModelInfo{}, fmt.Errorf("openai: parse model: %w", err)
+	}
+	return loom.ModelInfo{ID: m.ID}, nil
 }

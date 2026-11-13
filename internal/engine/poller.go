@@ -9,6 +9,10 @@ import (
 type asyncPollerService struct {
 	e   *Engine
 	cfg PollerConfig
+
+	// unroutable remembers tasks already warned about having no registered
+	// generator, so the warning is logged once per task rather than per tick.
+	unroutable sync.Map
 }
 
 func newAsyncPollerService(e *Engine, cfg PollerConfig) *asyncPollerService {
@@ -59,10 +63,21 @@ func (p *asyncPollerService) pollPending(ctx context.Context) {
 	for _, t := range tasks {
 		gen, ok := p.e.generator(t.Provider)
 		if !ok {
+			// Left pending rather than failed: another engine instance sharing
+			// this database may have the generator registered. But say so —
+			// silently skipping hid tasks that no instance could ever resolve.
+			if _, seen := p.unroutable.LoadOrStore(t.ID, struct{}{}); !seen {
+				p.e.log.Error("poll task: no generator registered under the task's provider; it stays pending",
+					"task_id", t.ID, "provider", t.Provider)
+			}
 			continue
 		}
 		poller, ok := gen.(AsyncGenerator)
 		if !ok {
+			if _, seen := p.unroutable.LoadOrStore(t.ID, struct{}{}); !seen {
+				p.e.log.Error("poll task: generator is not an AsyncGenerator; it stays pending",
+					"task_id", t.ID, "provider", t.Provider)
+			}
 			continue
 		}
 		result, err := poller.Poll(ctx, TaskHandle{
@@ -90,6 +105,14 @@ func (p *asyncPollerService) pollPending(ctx context.Context) {
 				p.e.log.Error("mark task failed", "task_id", t.ID, "err", err)
 			}
 			p.notify(ctx, t, ResultStatusFailed, nil, msg)
+		case result.TaskHandle() != nil && result.TaskHandle().Handle != "" && result.TaskHandle().Handle != t.Handle:
+			// A multi-stage job (e.g. Meshy preview -> refine) advanced to a new
+			// external handle. Persist it, or the next tick polls the finished
+			// first stage again and starts another — separately billed — second
+			// stage, once per tick. The new stage gets a fresh attempt budget.
+			if err := sqlAdvanceTaskHandle(ctx, p.e.db, p.e.prefix, t.ID, result.TaskHandle().Handle); err != nil {
+				p.e.log.Error("advance task handle", "task_id", t.ID, "err", err)
+			}
 		default:
 			// Still pending at the provider: count the poll so a job that never
 			// resolves is eventually capped rather than polled forever.

@@ -81,6 +81,14 @@ type Config struct {
 	Pricing map[string]ModelPrice
 	// DefaultPrice is used for models absent from Pricing (default: $1/$3 per 1M).
 	DefaultPrice *ModelPrice
+	// JobPricing maps a generator slug or reported model id → USD per
+	// generation, for providers that bill per job rather than per token (image,
+	// video, audio and 3D generators). The model id is tried first, then the
+	// generator slug. A job is charged when it is submitted, which is when most
+	// providers bill, so an async job counts toward budgets while it is still
+	// pending. A tokenless result with no entry here is recorded at $0 and
+	// marked Estimated, since its real cost is unknown.
+	JobPricing map[string]float64
 	// BranchGC configures the branch garbage collector used by Engine.GC().
 	// Nil uses safe defaults (DryRun=true, so nothing is deleted); set an explicit
 	// config with DryRun=false to actually sweep. The Dialect is filled in from
@@ -106,6 +114,11 @@ type Config struct {
 	// where the application wires it (EvalGate, FlowAgent.When, or an
 	// evaluator-backed judge).
 	Evaluator Evaluator
+
+	// Broadcaster carries session events (Engine.Subscribe) to subscribers.
+	// Nil uses an in-process broadcaster, which only reaches subscribers of
+	// this engine instance; with several instances, supply a shared one.
+	Broadcaster Broadcaster
 }
 
 // Logger is the minimal logging interface the engine uses.
@@ -136,6 +149,8 @@ type Engine struct {
 	latestCacheTTL time.Duration
 	pricing        map[string]ModelPrice
 	defaultPrice   *ModelPrice
+	jobPricing     map[string]float64
+	broadcaster    Broadcaster
 	// evaluator backs the experimental evaluation subsystem; nil when the
 	// application has not opted in. Guarded by mu so SetEvaluator can replace it
 	// at runtime alongside a running turn, as RegisterGenerator does.
@@ -222,7 +237,12 @@ func New(cfg Config) (*Engine, error) {
 		log:            log,
 		pricing:        cfg.Pricing,
 		defaultPrice:   cfg.DefaultPrice,
+		jobPricing:     cfg.JobPricing,
 		evaluator:      cfg.Evaluator,
+		broadcaster:    cfg.Broadcaster,
+	}
+	if e.broadcaster == nil {
+		e.broadcaster = newMemoryBroadcaster()
 	}
 
 	e.prompts = &promptService{e: e}
@@ -433,6 +453,176 @@ func (e *Engine) Close(ctx context.Context) error {
 //   - otherwise, a wrapped error from a hook, template render, or persistence.
 func (e *Engine) RunStep(ctx context.Context, session *Session, req StepRequest) (*Step, error) {
 	return e.steps.run(ctx, session, req)
+}
+
+// AddParticipant adds p to the session's participants and persists the
+// session. JoinedAt defaults to now. Adding an ID that is already present
+// returns ErrParticipantExists. Pass the same *Session the app runs steps on:
+// the change is serialised with in-flight steps, so it is neither lost nor
+// reported as a conflict. Membership is part of State, so the next step's
+// checkpoint records it and a fork from before the join drops it.
+//
+// These live on Engine rather than SessionRegistry so that interface — which
+// applications may implement themselves, e.g. as a test double — is unchanged.
+func (e *Engine) AddParticipant(ctx context.Context, s *Session, p Participant) error {
+	return e.sessions.AddParticipant(ctx, s, p)
+}
+
+// RemoveParticipant removes the participant with id and persists the session;
+// an unknown id returns ErrNotParticipant.
+func (e *Engine) RemoveParticipant(ctx context.Context, s *Session, id string) error {
+	return e.sessions.RemoveParticipant(ctx, s, id)
+}
+
+// VerifyGenerator checks the registered generator slug's credentials and model
+// (with optional per-request overrides such as a user's own "api_key" and
+// "model") by asking the provider, without generating. It returns
+// ErrGeneratorNotRegistered for an unknown slug, ErrVerifyNotSupported when the
+// generator cannot verify, and an error wrapping ErrKeyRejected when the
+// provider refuses the key.
+func (e *Engine) VerifyGenerator(ctx context.Context, slug string, overrides map[string]any) (ModelInfo, error) {
+	gen, ok := e.generator(slug)
+	if !ok {
+		return ModelInfo{}, fmt.Errorf("generator %q: %w", slug, ErrGeneratorNotRegistered)
+	}
+	v, ok := gen.(Verifier)
+	if !ok {
+		return ModelInfo{}, fmt.Errorf("generator %q: %w", slug, ErrVerifyNotSupported)
+	}
+	return v.Verify(ctx, overrides)
+}
+
+// Subscribe streams a session's events: first every persisted step from
+// opts.FromStep on, replayed as step.done (Replayed = true), then live events
+// as they happen — step.started, chunk, step.done, step.failed, turn.done and
+// forked. A step that completes while the replay is being read is delivered
+// once. Chunks are live only.
+//
+// To resume after a disconnect, subscribe again with FromStep one past the
+// last step.done StepIndex received. Close the subscription (or cancel ctx)
+// when done. A consumer that falls more than a few hundred events behind is
+// disconnected and Err returns ErrSubscriberLagged.
+//
+// Live events reach only subscribers of this engine instance unless
+// Config.Broadcaster is a shared broadcaster.
+func (e *Engine) Subscribe(ctx context.Context, sessionID uuid.UUID, opts SubscribeOptions) (*Subscription, error) {
+	if _, err := querySession(ctx, e.db, e.prefix, sessionID); err != nil {
+		return nil, err
+	}
+	subCtx, cancel := context.WithCancel(ctx)
+	// Subscribe to live events BEFORE reading history, so a step that lands
+	// in between is not missed (it is de-duplicated below instead).
+	live, lagged, liveCancel := e.broadcaster.Subscribe(subCtx, sessionID)
+	var replay []Step
+	if opts.FromStep >= 0 {
+		var err error
+		if replay, err = sqlQueryStepsFrom(subCtx, e.db, e.prefix, sessionID, opts.FromStep); err != nil {
+			liveCancel()
+			cancel()
+			return nil, err
+		}
+	}
+	out := make(chan SessionEvent, 64)
+	var (
+		mu      sync.Mutex
+		lastErr error
+	)
+	go func() {
+		defer close(out)
+		defer liveCancel()
+		send := func(ev SessionEvent) bool {
+			select {
+			case out <- ev:
+				return true
+			case <-subCtx.Done():
+				return false
+			}
+		}
+		last := opts.FromStep - 1
+		for i := range replay {
+			st := replay[i]
+			if !send(SessionEvent{Type: EventStepDone, SessionID: sessionID, StepIndex: st.Index, Step: &st,
+				TurnID: turnIDOf(&st), TurnRole: turnRoleOf(&st), Replayed: true, At: st.CreatedAt}) {
+				return
+			}
+			last = st.Index
+		}
+		for ev := range live {
+			if ev.Type == EventStepDone && ev.StepIndex <= last {
+				continue // already replayed
+			}
+			if !send(ev) {
+				return
+			}
+		}
+		if lagged() {
+			mu.Lock()
+			lastErr = ErrSubscriberLagged
+			mu.Unlock()
+		}
+	}()
+	return &Subscription{
+		Events: out,
+		err: func() error {
+			mu.Lock()
+			defer mu.Unlock()
+			return lastErr
+		},
+		cancel: func() { cancel(); liveCancel() },
+	}, nil
+}
+
+// emit publishes a session event. StepIndex defaults to -1 for events that
+// are not about a persisted step.
+func (e *Engine) emit(ctx context.Context, ev SessionEvent) {
+	if ev.At.IsZero() {
+		ev.At = time.Now()
+	}
+	e.broadcaster.Publish(context.WithoutCancel(ctx), ev)
+}
+
+// turnIDOf and turnRoleOf read a step's turn linkage from its diagnostics.
+func turnIDOf(st *Step) uuid.UUID {
+	if s, ok := st.Diagnostics["turn_id"].(string); ok {
+		if id, err := uuid.Parse(s); err == nil {
+			return id
+		}
+	}
+	return uuid.Nil
+}
+
+func turnRoleOf(st *Step) string {
+	r, _ := st.Diagnostics["turn_role"].(string)
+	return r
+}
+
+// RecordStep appends a step whose result was written outside loom — a human
+// game master's narration, a moderator's correction — to the session history.
+//
+// It is persisted and checkpointed exactly like a generated step, so forks and
+// StateAt see it, and pre- and post-hooks run so hooks can update state from
+// it. No generator is called, no prompt is rendered, no budget is checked and
+// no cost row is written. Step.Author records who wrote it.
+//
+// Errors are those of RunStep, minus generation and budget errors; a post-hook
+// that asks for a retry is an error, since there is nothing to re-run.
+func (e *Engine) RecordStep(ctx context.Context, session *Session, ext ExternalStep) (*Step, error) {
+	if ext.Result == nil {
+		return nil, fmt.Errorf("loom: RecordStep needs a Result")
+	}
+	if ext.Author == "" {
+		return nil, fmt.Errorf("loom: RecordStep needs an Author")
+	}
+	return e.steps.run(ctx, session, StepRequest{
+		AgentSlug:    ext.AgentSlug,
+		Owner:        ext.Owner,
+		AgentVersion: ext.AgentVersion,
+		Action:       ext.Action,
+		Inputs:       ext.Inputs,
+		Params:       ext.Params,
+		external:     ext.Result,
+		author:       ext.Author,
+	})
 }
 
 type JudgeRegistry interface {

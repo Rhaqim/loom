@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -112,5 +113,30 @@ func TestBaseURLOverrideRejectedUnlessAllowlisted(t *testing.T) {
 	}
 	if reached {
 		t.Fatal("request reached the un-allowlisted host — API key would have leaked")
+	}
+}
+
+func TestVerify(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer good" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/models/gpt-test" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		io.WriteString(w, `{"id":"gpt-test"}`)
+	}))
+	defer srv.Close()
+	g := NewChatGenerator("good", "gpt-test").WithBaseURL(srv.URL)
+	if info, err := g.Verify(context.Background(), nil); err != nil || info.ID != "gpt-test" {
+		t.Fatalf("info %+v err %v", info, err)
+	}
+	if _, err := g.Verify(context.Background(), map[string]any{"api_key": "bad"}); !errors.Is(err, loom.ErrKeyRejected) {
+		t.Fatalf("err = %v, want ErrKeyRejected", err)
+	}
+	if _, err := g.Verify(context.Background(), map[string]any{"model": "nope"}); err == nil || errors.Is(err, loom.ErrKeyRejected) {
+		t.Fatalf("unknown model: err = %v, want a not-found error", err)
 	}
 }

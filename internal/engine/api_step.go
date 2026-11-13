@@ -43,6 +43,35 @@ type Step struct {
 	Diagnostics map[string]any // anything pre/post processors logged
 	DurationMs  int
 	CreatedAt   time.Time
+	// Author is who wrote the result: "" when the agent's generator produced
+	// it, otherwise the caller-chosen author of a recorded step (RecordStep or
+	// a human-led turn), e.g. "participant:host".
+	Author string
+	// ParticipantID is the participant whose action drove this step
+	// (Action.ParticipantID), or "".
+	ParticipantID string
+}
+
+// ExternalStep is a step whose result was written outside loom — a human game
+// master's narration, a moderator's edit — recorded with Engine.RecordStep.
+type ExternalStep struct {
+	// AgentSlug (with Owner and AgentVersion; 0 = latest) names the agent the
+	// step is attributed to: the role being played, such as a human game
+	// master. Its generator is never called and its prompts are not rendered.
+	AgentSlug    string
+	Owner        string
+	AgentVersion int
+	// Author identifies who wrote the result (required), e.g.
+	// "participant:host". It is stored on Step.Author.
+	Author string
+	// Result is the finished result to record. It must be ready: a pending
+	// (async) result cannot be recorded.
+	Result Result
+	// Action, Inputs and Params are recorded and exposed to hooks exactly as
+	// on a StepRequest.
+	Action *Action
+	Inputs map[string]any
+	Params map[string]any
 }
 
 // RetryMode selects how the engine treats post-hook retries.
@@ -150,7 +179,21 @@ type StepRequest struct {
 	turnRole string
 	// bus is the per-turn cross-agent channel fabric, set by RunTurn.
 	bus Bus
+
+	// external, when set, is a result written outside loom: the step records
+	// it instead of generating (see Engine.RecordStep). author is who wrote it.
+	external Result
+	author   string
 }
+
+// Author is the author of a recorded step (Engine.RecordStep or a human-led
+// turn), or "" when the step is generated. Hooks use it to treat human input
+// differently from model output.
+func (r *StepRequest) Author() string { return r.author }
+
+// Recorded reports whether this step records an externally written result
+// rather than calling a generator.
+func (r *StepRequest) Recorded() bool { return r.external != nil }
 
 // Bus returns the per-turn cross-agent communication fabric for this step, or nil
 // if the step is not part of a RunTurn. Hooks and plugins use it to publish or

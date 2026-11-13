@@ -339,3 +339,67 @@ func TestGC_DryRunDeletesNothing(t *testing.T) {
 		t.Error("dry-run must not delete anything")
 	}
 }
+
+// Retention rules (client ask §7) expire whole sessions — roots included — by
+// tag and idle time, honouring pins, live branches and DryRun.
+func TestGC_RetentionRules(t *testing.T) {
+	ctx := context.Background()
+	e, db := reproEngine(t, "gc_ret", map[string]Generator{"g": okGen{}}, PollerConfig{})
+	p := e.prefix
+	mk := func(tags ...string) *Session {
+		s := &Session{PlatformID: "demo", State: State{Modality: ModalityText}, Tags: tags}
+		if err := e.Sessions().Create(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	oldDemo, freshDemo, oldPlain := mk("demo"), mk("demo"), mk()
+	pinnedDemo, lookalike, oldTrial := mk("demo"), mk("demo2"), mk("trial", "x")
+	for _, s := range []*Session{oldDemo, oldPlain, pinnedDemo, lookalike, oldTrial} {
+		gcAge(t, db, p, s.ID, 48*time.Hour)
+	}
+	gcExec(t, db, fmt.Sprintf(`UPDATE %ssessions SET pinned=true WHERE id=$1`, p), pinnedDemo.ID)
+
+	cfg := gcTestConfig(true)
+	cfg.Retention = []RetentionRule{
+		{Name: "demo", Tags: []string{"demo"}, MaxIdle: 24 * time.Hour, Action: RetentionPurge},
+		{Name: "trial", Tags: []string{"trial"}, MaxIdle: 24 * time.Hour, Action: RetentionDiscard},
+		{Name: "broken", MaxIdle: 0, Action: RetentionPurge}, // skipped: would match everything
+	}
+	dry, err := NewBranchGCWorker(e, cfg).Sweep(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dry.Retention["demo"] != 1 || dry.Retention["trial"] != 1 || !gcExists(t, db, p, oldDemo.ID) {
+		t.Fatalf("dry run = %+v, or it deleted", dry.Retention)
+	}
+	if _, ok := dry.Retention["broken"]; ok {
+		t.Fatal("invalid rule ran")
+	}
+
+	cfg.DryRun = false
+	live, err := NewBranchGCWorker(e, cfg).Sweep(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.Retention["demo"] != 1 || live.Retention["trial"] != 1 {
+		t.Fatalf("live = %+v", live.Retention)
+	}
+	var n int
+	_ = db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %ssessions WHERE id=$1`, p), oldDemo.ID).Scan(&n)
+	if n != 0 {
+		t.Fatal("purged session still present")
+	}
+	if gcExists(t, db, p, oldTrial.ID) {
+		t.Fatal("discarded session still live")
+	}
+	_ = db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %ssessions WHERE id=$1`, p), oldTrial.ID).Scan(&n)
+	if n != 1 {
+		t.Fatal("discard hard-deleted the session; it should be soft-deleted")
+	}
+	for name, s := range map[string]*Session{"fresh": freshDemo, "untagged": oldPlain, "pinned": pinnedDemo, "lookalike tag": lookalike} {
+		if !gcExists(t, db, p, s.ID) {
+			t.Errorf("%s session was swept", name)
+		}
+	}
+}

@@ -82,14 +82,44 @@ type BudgetExceededError struct {
 	LimitUSD    float64
 	UsedTokens  int
 	LimitTokens int
+	UsedSteps   int
+	LimitSteps  int
 	ResetsAt    time.Time
 	Suggestion  string
 }
 
+// Error names the limit that tripped. It used to report USD unconditionally,
+// so a token- or step-limited budget read "used $0.0000 of $0.0000".
 func (e *BudgetExceededError) Error() string {
-	return fmt.Sprintf("loom: budget exceeded: %s (%s window): used $%.4f of $%.4f",
-		e.BudgetName, e.Window, e.UsedUSD, e.LimitUSD)
+	var used string
+	switch {
+	case e.LimitUSD > 0 && e.UsedUSD >= e.LimitUSD:
+		used = fmt.Sprintf("used $%.4f of $%.4f", e.UsedUSD, e.LimitUSD)
+	case e.LimitTokens > 0 && e.UsedTokens >= e.LimitTokens:
+		used = fmt.Sprintf("used %d of %d tokens", e.UsedTokens, e.LimitTokens)
+	case e.LimitSteps > 0 && e.UsedSteps >= e.LimitSteps:
+		used = fmt.Sprintf("used %d of %d steps", e.UsedSteps, e.LimitSteps)
+	default:
+		used = fmt.Sprintf("used $%.4f of $%.4f", e.UsedUSD, e.LimitUSD)
+	}
+	return fmt.Sprintf("loom: budget exceeded: %s (%s window): %s", e.BudgetName, e.Window, used)
 }
+
+// ErrKeyRejected is wrapped by Verifier.Verify when the provider rejects the
+// API key (HTTP 401/403), so a UI can say "key not accepted" before play.
+var ErrKeyRejected = errors.New("loom: provider rejected the API key")
+
+// ErrVerifyNotSupported is returned by Engine.VerifyGenerator for a generator
+// that does not implement Verifier.
+var ErrVerifyNotSupported = errors.New("loom: generator does not support key verification")
+
+// ErrNotParticipant is returned when an action names a ParticipantID that is
+// not one of the session's participants, or RemoveParticipant is given an
+// unknown id.
+var ErrNotParticipant = errors.New("loom: not a participant of this session")
+
+// ErrParticipantExists is returned by AddParticipant for an ID already present.
+var ErrParticipantExists = errors.New("loom: participant already in this session")
 
 // ErrNotFound is returned when a requested entity does not exist. Errors from
 // the registries (Agents/Prompts/Sessions/Budgets/ResponseFormats) unwrap to it,

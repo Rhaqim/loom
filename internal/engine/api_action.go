@@ -24,6 +24,10 @@ type Action struct {
 	Kind     ActionKind
 	Payload  any // typed per Kind: Selection, FreeText, Spatial, etc.
 	Metadata map[string]any
+	// ParticipantID names the participant who took this action. When set, it
+	// must be one of the session's participants (else ErrNotParticipant) and it
+	// is stored on the step as Step.ParticipantID.
+	ParticipantID string
 }
 
 // Selection is the payload for ActionSelect — choosing one of N presented options.

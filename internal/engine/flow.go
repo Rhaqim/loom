@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -139,6 +140,16 @@ type TurnRequest struct {
 	// turn. It lets an embedder build follower inputs from the lead and react to
 	// each follower in completion order.
 	OnStep func(role string, step *Step, err error)
+	// LeadResult, when set, makes this a human-led turn: the lead step records
+	// this result (written by LeadAuthor, e.g. a human game master) instead of
+	// calling the lead agent's generator, then the followers run as usual and
+	// consume it through the lead's OutputKey. It must be a ready result. The
+	// recorded lead has no cost row and does not stream; its text reaches the
+	// bus "lead.done" topic as any lead's does.
+	LeadResult Result
+	// LeadAuthor is stored on the recorded lead's Step.Author. Required with
+	// LeadResult.
+	LeadAuthor string
 }
 
 // Turn is the result of RunTurn: the lead step plus follower steps, all sharing
@@ -220,7 +231,15 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 			}
 		}
 	}
+	if req.LeadResult != nil {
+		if req.LeadAuthor == "" {
+			return nil, fmt.Errorf("loom: TurnRequest.LeadResult needs a LeadAuthor")
+		}
+		onChunk = nil
+	}
 	leadStep, err := e.steps.run(ctx, session, StepRequest{
+		external:             req.LeadResult,
+		author:               req.LeadAuthor,
 		AgentSlug:            req.Flow.Lead.AgentSlug,
 		AgentVersion:         req.Flow.Lead.AgentVersion,
 		Owner:                req.Owner,
@@ -449,6 +468,7 @@ func (e *Engine) RunTurn(ctx context.Context, session *Session, req TurnRequest)
 	session.State.Modality = leadStep.Result.Modality()
 
 	turn.Messages = bus.Messages()
+	e.emit(ctx, SessionEvent{Type: EventTurnDone, SessionID: session.ID, StepIndex: leadStep.Index, TurnID: turnID})
 	return turn, nil
 }
 
@@ -553,6 +573,11 @@ func mergeParams(turnParams, agentParams map[string]any) map[string]any {
 
 // ResultText extracts the primary text payload from a Result for prompt
 // injection, returning "" for modalities without a natural text form.
+//
+// A StructuredResult renders as its "text" field when it has one (the
+// established convention) and otherwise as the JSON encoding of Data. It used
+// to return "" in that case, so a structured agent's output reached the next
+// agent in a turn as an empty input.
 func ResultText(r Result) string {
 	switch v := r.(type) {
 	case *TextResult:
@@ -561,10 +586,18 @@ func ResultText(r Result) string {
 		if s, ok := v.Data["text"].(string); ok {
 			return s
 		}
+		if len(v.Data) == 0 {
+			return ""
+		}
+		if b, err := json.Marshal(v.Data); err == nil {
+			return string(b)
+		}
 	case *ImageResult:
 		return v.Prompt
 	case *VideoResult:
 		return v.PreviewImage
+	case *Model3DResult:
+		return v.Prompt
 	}
 	return ""
 }
