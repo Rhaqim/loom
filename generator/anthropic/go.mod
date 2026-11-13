@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/anthropics/anthropic-sdk-go/v2 v2.9.0
-	github.com/rhaqim/loom v0.0.2
+	github.com/rhaqim/loom v0.0.3
 )
 
 require (
