@@ -455,6 +455,25 @@ func (e *Engine) RunStep(ctx context.Context, session *Session, req StepRequest)
 	return e.steps.run(ctx, session, req)
 }
 
+// AddParticipant adds p to the session's participants and persists the
+// session. JoinedAt defaults to now. Adding an ID that is already present
+// returns ErrParticipantExists. Pass the same *Session the app runs steps on:
+// the change is serialised with in-flight steps, so it is neither lost nor
+// reported as a conflict. Membership is part of State, so the next step's
+// checkpoint records it and a fork from before the join drops it.
+//
+// These live on Engine rather than SessionRegistry so that interface — which
+// applications may implement themselves, e.g. as a test double — is unchanged.
+func (e *Engine) AddParticipant(ctx context.Context, s *Session, p Participant) error {
+	return e.sessions.AddParticipant(ctx, s, p)
+}
+
+// RemoveParticipant removes the participant with id and persists the session;
+// an unknown id returns ErrNotParticipant.
+func (e *Engine) RemoveParticipant(ctx context.Context, s *Session, id string) error {
+	return e.sessions.RemoveParticipant(ctx, s, id)
+}
+
 // VerifyGenerator checks the registered generator slug's credentials and model
 // (with optional per-request overrides such as a user's own "api_key" and
 // "model") by asking the provider, without generating. It returns

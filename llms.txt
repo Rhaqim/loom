@@ -168,8 +168,8 @@ for slug, ferr := range turn.Errors {  // follower failures (never returned as e
 
 For a session several people share (a multiplayer game):
 
-- **Participants.** `e.Sessions().AddParticipant(ctx, sess, loom.Participant{ID: "wren", Role:
-  "player"})` / `RemoveParticipant(ctx, sess, "wren")`. Membership lives in `State.Participants`,
+- **Participants.** `e.AddParticipant(ctx, sess, loom.Participant{ID: "wren", Role: "player"})` /
+  `e.RemoveParticipant(ctx, sess, "wren")`. Membership lives in `State.Participants`,
   so every checkpoint records it and a fork from before a join drops that player. Pass the same
   `*Session` you run steps on (the change is serialised with in-flight steps). Set
   `Action.ParticipantID`: a non-member's action fails with `loom.ErrNotParticipant`, and the id is

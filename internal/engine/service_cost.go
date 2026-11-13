@@ -2,7 +2,7 @@ package engine
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -66,21 +66,23 @@ func (c *costService) ByStep(ctx context.Context, sessionID uuid.UUID) ([]StepUs
 // records costs with (Config.Pricing, DefaultPrice, JobPricing). It used to
 // apply fixed rates regardless of configuration.
 func (c *costService) Estimate(ctx context.Context, req EstimateRequest) (*CostEstimate, error) {
+	// As in v0.0.2, Estimate does not fail for a missing or unknown agent: with
+	// no pricing key the default price applies (DefaultPrice, else the
+	// placeholder rate, reported as PricingConfigured = false).
 	model, modal := req.Model, req.Modal
 	if req.AgentID != uuid.Nil && (model == "" || modal == "") {
 		agent, err := c.e.agents.GetByID(ctx, req.AgentID)
-		if err != nil {
+		switch {
+		case err == nil:
+			if model == "" {
+				model = agent.GeneratorSlug
+			}
+			if modal == "" {
+				modal = agent.Modal
+			}
+		case !errors.Is(err, ErrNotFound):
 			return nil, err
 		}
-		if model == "" {
-			model = agent.GeneratorSlug
-		}
-		if modal == "" {
-			modal = agent.Modal
-		}
-	}
-	if model == "" {
-		return nil, fmt.Errorf("loom: Estimate needs an AgentID or a Model")
 	}
 	est := &CostEstimate{Model: model}
 	switch modal {

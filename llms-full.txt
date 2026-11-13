@@ -168,8 +168,8 @@ for slug, ferr := range turn.Errors {  // follower failures (never returned as e
 
 For a session several people share (a multiplayer game):
 
-- **Participants.** `e.Sessions().AddParticipant(ctx, sess, loom.Participant{ID: "wren", Role:
-  "player"})` / `RemoveParticipant(ctx, sess, "wren")`. Membership lives in `State.Participants`,
+- **Participants.** `e.AddParticipant(ctx, sess, loom.Participant{ID: "wren", Role: "player"})` /
+  `e.RemoveParticipant(ctx, sess, "wren")`. Membership lives in `State.Participants`,
   so every checkpoint records it and a fork from before a join drops that player. Pass the same
   `*Session` you run steps on (the change is serialised with in-flight steps). Set
   `Action.ParticipantID`: a non-member's action fails with `loom.ErrNotParticipant`, and the id is
@@ -1552,6 +1552,17 @@ func New(cfg Config) (*Engine, error)
     New creates and initialises a Loom engine from the given Config. It does NOT
     run schema migrations — call NewSchemaLoader(dialect).Apply(ctx, db) first.
 
+func (e *Engine) AddParticipant(ctx context.Context, s *Session, p Participant) error
+    AddParticipant adds p to the session's participants and persists the
+    session. JoinedAt defaults to now. Adding an ID that is already present
+    returns ErrParticipantExists. Pass the same *Session the app runs steps on:
+    the change is serialised with in-flight steps, so it is neither lost nor
+    reported as a conflict. Membership is part of State, so the next step's
+    checkpoint records it and a fork from before the join drops it.
+
+    These live on Engine rather than SessionRegistry so that interface — which
+    applications may implement themselves, e.g. as a test double — is unchanged.
+
 func (e *Engine) Agents() AgentRegistry
     Agents returns the agent registry.
 
@@ -1697,6 +1708,10 @@ func (e *Engine) RegisterGenerator(slug string, g Generator)
     This is how a platform extends into a new modality — register a video or
     world (3-D/AR) generator and reference it from an agent; no other engine
     change is needed.
+
+func (e *Engine) RemoveParticipant(ctx context.Context, s *Session, id string) error
+    RemoveParticipant removes the participant with id and persists the session;
+    an unknown id returns ErrNotParticipant.
 
 func (e *Engine) ResponseFormats() ResponseFormatRegistry
     ResponseFormats returns the response-format registry.
@@ -2847,16 +2862,6 @@ const (
 type SessionRegistry interface {
 	// Create persists a new session.
 	Create(ctx context.Context, s *Session) error
-	// AddParticipant adds p to the session's participants and persists the
-	// session. JoinedAt defaults to now. Adding an ID that is already present
-	// returns ErrParticipantExists. Pass the same *Session the app runs steps
-	// on: the change is serialised with in-flight steps, so it is neither lost
-	// nor reported as a conflict. Membership is part of State, so the next
-	// step's checkpoint records it and a fork from before the join drops it.
-	AddParticipant(ctx context.Context, s *Session, p Participant) error
-	// RemoveParticipant removes the participant with id and persists the
-	// session; an unknown id returns ErrNotParticipant.
-	RemoveParticipant(ctx context.Context, s *Session, id string) error
 	// Get retrieves a session by ID, with its full step history loaded. A
 	// missing OR soft-deleted session returns *NotFoundError (which unwraps to
 	// ErrNotFound) — consistent with List, BranchTree and Update. Use
@@ -2975,7 +2980,7 @@ type State struct {
 	// Participants are the people sharing this session (players, a host, a
 	// human game master). It is part of State, so every step's checkpoint
 	// records the membership at that step and a fork restores it. Change it
-	// with SessionRegistry.AddParticipant / RemoveParticipant.
+	// with Engine.AddParticipant / RemoveParticipant.
 	Participants []Participant
 }
     State is the live state of a session between steps.

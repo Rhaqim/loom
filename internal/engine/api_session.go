@@ -41,7 +41,7 @@ type State struct {
 	// Participants are the people sharing this session (players, a host, a
 	// human game master). It is part of State, so every step's checkpoint
 	// records the membership at that step and a fork restores it. Change it
-	// with SessionRegistry.AddParticipant / RemoveParticipant.
+	// with Engine.AddParticipant / RemoveParticipant.
 	Participants []Participant
 }
 
@@ -207,16 +207,6 @@ type BranchNode struct {
 type SessionRegistry interface {
 	// Create persists a new session.
 	Create(ctx context.Context, s *Session) error
-	// AddParticipant adds p to the session's participants and persists the
-	// session. JoinedAt defaults to now. Adding an ID that is already present
-	// returns ErrParticipantExists. Pass the same *Session the app runs steps
-	// on: the change is serialised with in-flight steps, so it is neither lost
-	// nor reported as a conflict. Membership is part of State, so the next
-	// step's checkpoint records it and a fork from before the join drops it.
-	AddParticipant(ctx context.Context, s *Session, p Participant) error
-	// RemoveParticipant removes the participant with id and persists the
-	// session; an unknown id returns ErrNotParticipant.
-	RemoveParticipant(ctx context.Context, s *Session, id string) error
 	// Get retrieves a session by ID, with its full step history loaded. A
 	// missing OR soft-deleted session returns *NotFoundError (which unwraps to
 	// ErrNotFound) — consistent with List, BranchTree and Update. Use

@@ -30,10 +30,10 @@ func act(id string) *Action {
 func TestParticipantsMembershipAndActions(t *testing.T) {
 	ctx := context.Background()
 	e, sess := partySetup(t)
-	if err := e.Sessions().AddParticipant(ctx, sess, Participant{ID: "host", Role: "host"}); err != nil {
+	if err := e.AddParticipant(ctx, sess, Participant{ID: "host", Role: "host"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Sessions().AddParticipant(ctx, sess, Participant{ID: "host"}); !errors.Is(err, ErrParticipantExists) {
+	if err := e.AddParticipant(ctx, sess, Participant{ID: "host"}); !errors.Is(err, ErrParticipantExists) {
 		t.Fatalf("duplicate add: err = %v", err)
 	}
 	step, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "gm", Action: act("host")})
@@ -58,10 +58,10 @@ func TestParticipantsMembershipAndActions(t *testing.T) {
 		t.Fatalf("reloaded step participant = %q", got.History[0].ParticipantID)
 	}
 
-	if err := e.Sessions().RemoveParticipant(ctx, sess, "host"); err != nil {
+	if err := e.RemoveParticipant(ctx, sess, "host"); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Sessions().RemoveParticipant(ctx, sess, "host"); !errors.Is(err, ErrNotParticipant) {
+	if err := e.RemoveParticipant(ctx, sess, "host"); !errors.Is(err, ErrNotParticipant) {
 		t.Fatalf("second remove: err = %v", err)
 	}
 }
@@ -70,12 +70,12 @@ func TestParticipantsMembershipAndActions(t *testing.T) {
 func TestForkRestoresTheParty(t *testing.T) {
 	ctx := context.Background()
 	e, sess := partySetup(t)
-	_ = e.Sessions().AddParticipant(ctx, sess, Participant{ID: "host", Role: "host"})
+	_ = e.AddParticipant(ctx, sess, Participant{ID: "host", Role: "host"})
 	s0, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "gm", Action: act("host")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = e.Sessions().AddParticipant(ctx, sess, Participant{ID: "wren", Role: "player"})
+	_ = e.AddParticipant(ctx, sess, Participant{ID: "wren", Role: "player"})
 	s1, err := e.RunStep(ctx, sess, StepRequest{AgentSlug: "gm", Action: act("wren")})
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +107,7 @@ func TestJoinDuringTurnIsKept(t *testing.T) {
 	joined := make(chan error, 1)
 	e.Hooks().RegisterPost("join-mid-turn", func(_ context.Context, req *StepRequest, res Result) (Result, error) {
 		if req.TurnRole() == "follower:slow" {
-			go func() { joined <- e.Sessions().AddParticipant(ctx, sess, Participant{ID: "late", Role: "player"}) }()
+			go func() { joined <- e.AddParticipant(ctx, sess, Participant{ID: "late", Role: "player"}) }()
 			time.Sleep(30 * time.Millisecond)
 		}
 		return res, nil
