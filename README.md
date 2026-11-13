@@ -255,7 +255,7 @@ Register any number of generators under a slug. Built-in adapters:
 | Package | Generator | Modality |
 |---|---|---|
 | `generator/openai` | `NewChatGenerator(key, model)` | Text (streaming) |
-| `generator/anthropic` | `NewChatGenerator(key, model)` | Text (streaming) |
+| `generator/anthropic` | `NewChatGenerator(key, model)` | Text (streaming), on the official Anthropic Go SDK — a separate module: `go get github.com/rhaqim/loom/generator/anthropic` |
 | `generator/replicate` | `NewImageGenerator(key, model)` | Image (async) |
 | `generator/runway` | `NewVideoGenerator(key, model)` | Video (async) |
 | `generator/meshy` | `NewModel3DGenerator(key)` | 3D asset, GLB (async, text- or image-to-3D) |

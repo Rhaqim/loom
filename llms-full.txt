@@ -192,12 +192,15 @@ For a session several people share (a multiplayer game):
 
 Built-in adapters (each `New...` takes an API key + model unless noted):
 - `generator/openai`    → `openai.NewChatGenerator(key, model)`      — text, streaming
-- `generator/anthropic` → `anthropic.NewChatGenerator(key, model)`   — text, streaming
+- `generator/anthropic` → `anthropic.NewChatGenerator(key, model)`   — text, streaming. Its own Go module
+  (keeps the SDK's dependencies out of loom): `go get github.com/rhaqim/loom/generator/anthropic`.
   `Params.Extra["effort"]` (`low`…`max`) → `output_config.effort`; `.WithNativeStructuredOutputs()`
   sends a ResponseFormat schema as native structured outputs (schema needs `additionalProperties: false`
   on every object). Default `max_tokens` 16000. A safety refusal returns `*loom.GenerationError{Kind:
-  GenerationRejected}` carrying the refusal category; leave `Temperature`/`TopP` unset on models that
-  reject sampling parameters (Claude Opus 5.5).
+  GenerationRejected}` carrying the refusal category. Built on the official Anthropic Go SDK (API
+  version 2026-10-21): `Temperature`/`TopP` are never sent (that version rejects them on every model),
+  the key goes in both `Authorization: Bearer` and `X-Api-Key`, `ANTHROPIC_*` environment variables
+  are ignored, a base URL may include or omit `/v1`, and the SDK retries 408/409/429/5xx twice.
 - `generator/replicate` → `replicate.NewImageGenerator(key, model)`  — image, async
 - `generator/runway`    → `runway.NewVideoGenerator(key, model)`      — video, async
 - `generator/meshy`     → `meshy.NewModel3DGenerator(key)`            — 3D (GLB `Model3DResult`), async.
@@ -3532,31 +3535,43 @@ func (g *ChatGenerator) WithBaseURL(url string) *ChatGenerator
 
 package anthropic // import "github.com/rhaqim/loom/generator/anthropic"
 
-Package anthropic provides a Loom generator adapter for Anthropic Claude models.
+Package anthropic provides a Loom generator adapter for Anthropic Claude models,
+built on the official Anthropic Go SDK (github.com/anthropics/anthropic-sdk-go).
+
+The SDK speaks API version 2026-10-21. On that version a Messages request
+carrying temperature or top_p is rejected on every model, so this adapter never
+sends GenerateParams.Temperature or TopP: requests use the model's default
+sampling (Claude 4.7 and later models accept only the defaults anyway). The key
+is sent both as "Authorization: Bearer" (the SDK's default) and as "X-Api-Key",
+so proxies that read either header keep working.
 
 TYPES
 
 type ChatGenerator struct {
 	// Has unexported fields.
 }
-    ChatGenerator implements loom.Generator and loom.StreamingGenerator for
-    Anthropic Claude models (claude-opus-4, claude-sonnet-4, claude-haiku-4-5,
-    etc.).
+    ChatGenerator implements loom.Generator, loom.StreamingGenerator and
+    loom.Verifier for Anthropic Claude models.
 
 func NewChatGenerator(apiKey, model string) *ChatGenerator
-    NewChatGenerator creates an Anthropic chat generator.
+    NewChatGenerator creates an Anthropic chat generator for apiKey and model.
+
+    The client ignores ANTHROPIC_* environment variables and saved login
+    profiles: the key, model and base URL are exactly what the generator is
+    configured with, so the environment cannot redirect requests or swap keys.
 
 func (g *ChatGenerator) Generate(ctx context.Context, req loom.GenerateRequest) (loom.Result, error)
     Generate calls the Anthropic Messages API synchronously.
 
 func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateRequest) (<-chan loom.Chunk, <-chan loom.Result, error)
-    GenerateStream calls the Anthropic streaming API.
+    GenerateStream calls the Anthropic streaming API. Text deltas arrive on the
+    first channel; the assembled Result (or a failed one) on the second.
 
 func (g *ChatGenerator) Modality() loom.Modality
 
 func (g *ChatGenerator) Verify(ctx context.Context, overrides map[string]any) (loom.ModelInfo, error)
-    Verify checks the API key and model against the provider's models endpoint
-    (GET /models/{model}), honouring "api_key", "model" and "base_url"
+    Verify checks the API key and model against the Models API (GET
+    /v1/models/{model}), honouring "api_key", "model" and "base_url"
     overrides. It generates nothing and spends no tokens. A 401/403 wraps
     loom.ErrKeyRejected; a 404 means the key works but the model does not exist.
 
@@ -3568,9 +3583,9 @@ func (g *ChatGenerator) WithAllowedBaseURLs(urls ...string) *ChatGenerator
     host.
 
 func (g *ChatGenerator) WithBaseURL(url string) *ChatGenerator
-    WithBaseURL overrides the API base URL (useful for testing / proxies).
-    The URL set here is also implicitly trusted as a per-request "base_url"
-    override.
+    WithBaseURL overrides the API base URL (useful for testing / proxies),
+    with or without a trailing /v1. The URL set here is also implicitly trusted
+    as a per-request "base_url" override.
 
 func (g *ChatGenerator) WithNativeStructuredOutputs() *ChatGenerator
     WithNativeStructuredOutputs makes a ResponseFormat with a schema use

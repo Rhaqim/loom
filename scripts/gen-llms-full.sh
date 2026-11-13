@@ -34,7 +34,12 @@ HDR
 
   for pkg in schema generator/openai generator/anthropic generator/replicate generator/runway generator/meshy generator/echo judge harness cmd/loom-cli; do
     printf '\n%s\n# github.com/rhaqim/loom/%s\n%s\n\n' "$rule" "$pkg" "$rule"
-    go doc -all "./$pkg" 2>/dev/null || echo "(no exported API)"
+    # generator/anthropic is a separate module; go doc must run inside it.
+    if [ "$pkg" = generator/anthropic ]; then
+      (cd "$pkg" && go doc -all . 2>/dev/null) || echo "(no exported API)"
+    else
+      go doc -all "./$pkg" 2>/dev/null || echo "(no exported API)"
+    fi
   done
 } > "$OUT"
 

@@ -1,40 +1,54 @@
-// Package anthropic provides a Loom generator adapter for Anthropic Claude models.
+// Package anthropic provides a Loom generator adapter for Anthropic Claude
+// models, built on the official Anthropic Go SDK
+// (github.com/anthropics/anthropic-sdk-go).
+//
+// The SDK speaks API version 2026-10-21. On that version a Messages request
+// carrying temperature or top_p is rejected on every model, so this adapter
+// never sends GenerateParams.Temperature or TopP: requests use the model's
+// default sampling (Claude 4.7 and later models accept only the defaults
+// anyway). The key is sent both as "Authorization: Bearer" (the SDK's default)
+// and as "X-Api-Key", so proxies that read either header keep working.
 package anthropic
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"strings"
-	"time"
 
+	"github.com/anthropics/anthropic-sdk-go/v2"
+	"github.com/anthropics/anthropic-sdk-go/v2/option"
 	loom "github.com/rhaqim/loom"
 )
 
-const (
-	defaultBaseURL   = "https://api.anthropic.com/v1"
-	anthropicVersion = "2023-06-01"
-	// maxResponseBytes caps a full (non-streaming) response body so a malicious
-	// or misbehaving upstream cannot exhaust memory with a huge reply. The
-	// streaming path is bounded separately by the scanner's per-line limit.
-	maxResponseBytes = 8 << 20 // 8 MiB
-	// maxErrorBodyBytes truncates an upstream error body before it is echoed
-	// into an error string (and thus logs).
-	maxErrorBodyBytes = 4 << 10 // 4 KiB
-)
+// defaultBaseURL is the Claude API. A base URL may be given with or without
+// the trailing /v1 (the SDK adds the version segment itself).
+const defaultBaseURL = "https://api.anthropic.com/v1"
 
-// ChatGenerator implements loom.Generator and loom.StreamingGenerator for
-// Anthropic Claude models (claude-opus-4, claude-sonnet-4, claude-haiku-4-5, etc.).
+// defaultMaxTokens applies when GenerateParams.MaxTokens is unset. On current
+// models thinking is on by default and its tokens count against max_tokens, so
+// a low cap can be spent on reasoning before any visible text. 16000 keeps
+// non-streaming requests within HTTP timeouts.
+const defaultMaxTokens = 16000
+
+// effortLevels are the accepted output_config.effort values.
+var effortLevels = map[string]anthropic.OutputConfigEffort{
+	"low":    anthropic.OutputConfigEffortLow,
+	"medium": anthropic.OutputConfigEffortMedium,
+	"high":   anthropic.OutputConfigEffortHigh,
+	"xhigh":  anthropic.OutputConfigEffortXhigh,
+	"max":    anthropic.OutputConfigEffortMax,
+}
+
+// ChatGenerator implements loom.Generator, loom.StreamingGenerator and
+// loom.Verifier for Anthropic Claude models.
 type ChatGenerator struct {
 	apiKey  string
 	model   string
 	baseURL string
-	client  *http.Client
+	client  anthropic.Client
 	// allowedBaseURLs is the opt-in allowlist of base URLs a per-request
 	// "base_url" override may select. Empty by default, which disables the
 	// override: a caller-supplied base_url is otherwise a SSRF and
@@ -48,28 +62,23 @@ type ChatGenerator struct {
 	nativeFormat bool
 }
 
-// WithNativeStructuredOutputs makes a ResponseFormat with a schema use the
-// Messages API's native structured outputs (output_config.format), which
-// guarantees schema-valid JSON. Every object in the schema must set
-// additionalProperties: false, and numeric or length constraints are not
-// supported; a schema that breaks these rules is rejected by the API with a 400.
-func (g *ChatGenerator) WithNativeStructuredOutputs() *ChatGenerator {
-	g.nativeFormat = true
-	return g
-}
-
-// NewChatGenerator creates an Anthropic chat generator.
+// NewChatGenerator creates an Anthropic chat generator for apiKey and model.
+//
+// The client ignores ANTHROPIC_* environment variables and saved login
+// profiles: the key, model and base URL are exactly what the generator is
+// configured with, so the environment cannot redirect requests or swap keys.
 func NewChatGenerator(apiKey, model string) *ChatGenerator {
 	return &ChatGenerator{
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: defaultBaseURL,
-		client:  &http.Client{Timeout: 120 * time.Second},
+		client:  anthropic.NewClient(option.WithoutEnvironmentDefaults()),
 	}
 }
 
-// WithBaseURL overrides the API base URL (useful for testing / proxies). The URL
-// set here is also implicitly trusted as a per-request "base_url" override.
+// WithBaseURL overrides the API base URL (useful for testing / proxies), with
+// or without a trailing /v1. The URL set here is also implicitly trusted as a
+// per-request "base_url" override.
 func (g *ChatGenerator) WithBaseURL(url string) *ChatGenerator {
 	g.baseURL = url
 	return g
@@ -86,6 +95,16 @@ func (g *ChatGenerator) WithAllowedBaseURLs(urls ...string) *ChatGenerator {
 	for _, u := range urls {
 		g.allowedBaseURLs[strings.TrimRight(u, "/")] = struct{}{}
 	}
+	return g
+}
+
+// WithNativeStructuredOutputs makes a ResponseFormat with a schema use the
+// Messages API's native structured outputs (output_config.format), which
+// guarantees schema-valid JSON. Every object in the schema must set
+// additionalProperties: false, and numeric or length constraints are not
+// supported; a schema that breaks these rules is rejected by the API with a 400.
+func (g *ChatGenerator) WithNativeStructuredOutputs() *ChatGenerator {
+	g.nativeFormat = true
 	return g
 }
 
@@ -108,8 +127,8 @@ func (g *ChatGenerator) baseURLAllowed(v string) bool {
 // to a different model or tenant key. Returns the receiver unchanged when no
 // overrides apply. A "base_url" override is honored only when it passes
 // baseURLAllowed; otherwise withOverrides returns an error rather than fall back
-// to the default endpoint (fail-closed). The shallow copy shares the
-// (concurrency-safe) http.Client.
+// to the default endpoint (fail-closed). The copy shares the SDK client, whose
+// per-call settings come from requestOptions.
 func (g *ChatGenerator) withOverrides(req loom.GenerateRequest) (*ChatGenerator, error) {
 	if len(req.Overrides) == 0 {
 		return g, nil
@@ -130,6 +149,18 @@ func (g *ChatGenerator) withOverrides(req loom.GenerateRequest) (*ChatGenerator,
 	return &cp, nil
 }
 
+// requestOptions are the per-call SDK settings: this (possibly overridden)
+// generator's base URL and key. The key goes in both auth headers (see the
+// package doc).
+func (g *ChatGenerator) requestOptions() []option.RequestOption {
+	base := strings.TrimSuffix(strings.TrimRight(g.baseURL, "/"), "/v1") + "/"
+	return []option.RequestOption{
+		option.WithBaseURL(base),
+		option.WithAPIKey(g.apiKey),
+		option.WithHeader("X-Api-Key", g.apiKey),
+	}
+}
+
 func (g *ChatGenerator) Modality() loom.Modality { return loom.ModalityText }
 
 // Generate calls the Anthropic Messages API synchronously.
@@ -138,24 +169,25 @@ func (g *ChatGenerator) Generate(ctx context.Context, req loom.GenerateRequest) 
 	if err != nil {
 		return nil, err
 	}
-	body, err := g.buildBody(req, false)
+	params, err := g.buildParams(req)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := g.post(ctx, "/messages", body)
+	msg, err := g.client.Messages.New(ctx, params, g.requestOptions()...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("anthropic: %w", err)
 	}
-	return g.parseResponse(resp, req)
+	return g.toResult(msg, req)
 }
 
-// GenerateStream calls the Anthropic streaming API.
+// GenerateStream calls the Anthropic streaming API. Text deltas arrive on the
+// first channel; the assembled Result (or a failed one) on the second.
 func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateRequest) (<-chan loom.Chunk, <-chan loom.Result, error) {
 	g, err := g.withOverrides(req)
 	if err != nil {
 		return nil, nil, err
 	}
-	body, err := g.buildBody(req, true)
+	params, err := g.buildParams(req)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -167,80 +199,36 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 		defer close(chunks)
 		defer close(results)
 
-		respBody, err := g.postRaw(ctx, "/messages", body)
-		if err != nil {
-			results <- loom.NewFailedResult(loom.ModalityText, err)
-			return
-		}
-		defer respBody.Close()
-
-		var assembled strings.Builder
-		stop := "end_turn"
-		var inTok, outTok int
-		var refusal stopDetails
-
-		// Anthropic streams Server-Sent Events: "event: <type>" and "data: <json>"
-		// lines separated by blanks. A bufio.Scanner over lines parses this; the
-		// old json.Decoder over the raw body broke on the first non-JSON "event:"
-		// line and silently returned empty content with fabricated zero usage.
-		sc := bufio.NewScanner(respBody)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" || !strings.HasPrefix(line, "data:") {
-				continue
+		stream := g.client.Messages.NewStreaming(ctx, params, g.requestOptions()...)
+		defer stream.Close()
+		var msg anthropic.Message
+		var sawText bool
+		for stream.Next() {
+			ev := stream.Current()
+			if err := msg.Accumulate(ev); err != nil {
+				results <- loom.NewFailedResult(loom.ModalityText, fmt.Errorf("anthropic: stream: %w", err))
+				return
 			}
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			var event struct {
-				Type    string `json:"type"`
-				Message struct {
-					Usage struct {
-						InputTokens int `json:"input_tokens"`
-					} `json:"usage"`
-				} `json:"message"`
-				Delta struct {
-					Text        string       `json:"text"`
-					StopReason  string       `json:"stop_reason"`
-					StopDetails *stopDetails `json:"stop_details"`
-				} `json:"delta"`
-				Usage struct {
-					OutputTokens int `json:"output_tokens"`
-				} `json:"usage"`
-			}
-			if json.Unmarshal([]byte(payload), &event) != nil {
-				continue
-			}
-			switch event.Type {
-			case "message_start":
-				inTok = event.Message.Usage.InputTokens
-			case "content_block_delta":
-				if event.Delta.Text != "" {
-					assembled.WriteString(event.Delta.Text)
-					chunks <- loom.Chunk{Content: event.Delta.Text}
-				}
-			case "message_delta":
-				if event.Usage.OutputTokens > 0 {
-					outTok = event.Usage.OutputTokens
-				}
-				if event.Delta.StopReason != "" {
-					stop = event.Delta.StopReason
-				}
-				if event.Delta.StopDetails != nil {
-					refusal = *event.Delta.StopDetails
+			if delta, ok := ev.AsAny().(anthropic.ContentBlockDeltaEvent); ok {
+				if text, ok := delta.Delta.AsAny().(anthropic.TextDelta); ok && text.Text != "" {
+					sawText = true
+					chunks <- loom.Chunk{Content: text.Text}
 				}
 			}
 		}
-		if err := sc.Err(); err != nil && assembled.Len() == 0 {
-			results <- loom.NewFailedResult(loom.ModalityText, err)
+		// A transport error before any text fails the result; after some text
+		// the partial output is kept, as before.
+		if err := stream.Err(); err != nil && !sawText {
+			results <- loom.NewFailedResult(loom.ModalityText, fmt.Errorf("anthropic: %w", err))
 			return
 		}
 		// A refusal, even mid-stream after some text, fails the result; the
 		// engine surfaces it as GenerationRejected.
-		if stop == "refusal" {
-			results <- loom.NewFailedResult(loom.ModalityText, refusalError(refusal))
+		if msg.StopReason == anthropic.StopReasonRefusal {
+			results <- loom.NewFailedResult(loom.ModalityText, refusalError(msg.StopDetails))
 			return
 		}
-		tr := loom.NewTextResult(assembled.String(), stop, inTok, outTok)
+		tr := loom.NewTextResult(messageText(&msg), string(msg.StopReason), int(msg.Usage.InputTokens), int(msg.Usage.OutputTokens))
 		tr.Metadata()["model"] = g.model
 		results <- tr
 	}()
@@ -248,126 +236,48 @@ func (g *ChatGenerator) GenerateStream(ctx context.Context, req loom.GenerateReq
 	return chunks, results, nil
 }
 
-// -----------------------------------------------------------------------
-// Internal types and helpers
-// -----------------------------------------------------------------------
-
-type messagesRequest struct {
-	Model        string         `json:"model"`
-	MaxTokens    int            `json:"max_tokens"`
-	Temperature  float64        `json:"temperature,omitempty"`
-	TopP         float64        `json:"top_p,omitempty"`
-	System       string         `json:"system,omitempty"`
-	Messages     []anthropicMsg `json:"messages"`
-	Stream       bool           `json:"stream,omitempty"`
-	OutputConfig *outputConfig  `json:"output_config,omitempty"`
-}
-
-// outputConfig is the Messages API output_config object: effort (thinking
-// depth and token spend) and format (native structured outputs).
-type outputConfig struct {
-	Effort string        `json:"effort,omitempty"`
-	Format *outputFormat `json:"format,omitempty"`
-}
-
-type outputFormat struct {
-	Type   string         `json:"type"` // "json_schema"
-	Schema map[string]any `json:"schema"`
-}
-
-// stopDetails accompanies stop_reason "refusal".
-type stopDetails struct {
-	Category    string `json:"category"`
-	Explanation string `json:"explanation"`
-}
-
-// defaultMaxTokens applies when GenerateParams.MaxTokens is unset. On current
-// models thinking is on by default and its tokens count against max_tokens, so
-// the old 4096 could be spent on reasoning before any visible text. 16000 keeps
-// non-streaming requests within HTTP timeouts.
-const defaultMaxTokens = 16000
-
-// effortLevels are the accepted output_config.effort values.
-var effortLevels = map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}
-
-// refusalError reports a safety refusal (stop_reason "refusal") as a typed
-// rejection, so callers see GenerationRejected rather than an empty success.
-func refusalError(d stopDetails) error {
-	msg := "anthropic: request refused"
-	if d.Category != "" {
-		msg += " (" + d.Category + ")"
-	}
-	if d.Explanation != "" {
-		msg += ": " + d.Explanation
-	}
-	return &loom.GenerationError{Kind: loom.GenerationRejected, Message: msg}
-}
-
-type anthropicMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type messagesResponse struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	StopReason  string       `json:"stop_reason"`
-	StopDetails *stopDetails `json:"stop_details"`
-	Usage       struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
-}
-
-// buildBody builds the Messages request.
+// buildParams builds the Messages request.
 //
 //   - Params.Extra["effort"] ("low" | "medium" | "high" | "xhigh" | "max") is
 //     sent as output_config.effort. Unset leaves the model's default, which on
 //     Claude Opus 5.5 is "medium".
 //   - With WithNativeStructuredOutputs, a ResponseFormat with a schema uses
 //     native structured outputs (output_config.format). Otherwise the JSON
-//     contract is steered through the system prompt, as before.
-//   - Temperature and TopP are sent only when set; some current models (Claude
-//     Opus 5.5 among them) reject sampling parameters with a 400.
-func (g *ChatGenerator) buildBody(req loom.GenerateRequest, stream bool) ([]byte, error) {
+//     contract is steered through the system prompt.
+//   - Temperature and TopP are never sent (see the package doc).
+func (g *ChatGenerator) buildParams(req loom.GenerateRequest) (anthropic.MessageNewParams, error) {
 	maxTokens := req.Params.MaxTokens
 	if maxTokens == 0 {
 		maxTokens = defaultMaxTokens
 	}
-	mr := messagesRequest{
-		Model:       g.model,
-		MaxTokens:   maxTokens,
-		Temperature: req.Params.Temperature,
-		TopP:        req.Params.TopP,
-		Messages:    []anthropicMsg{{Role: "user", Content: req.UserPrompt}},
-		Stream:      stream,
+	params := anthropic.MessageNewParams{
+		Model:     g.model,
+		MaxTokens: int64(maxTokens),
+		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(req.UserPrompt))},
 	}
-	var oc outputConfig
 	if v, ok := req.Params.Extra["effort"]; ok {
-		effort, _ := v.(string)
-		if !effortLevels[effort] {
-			return nil, fmt.Errorf("anthropic: effort %v is not one of low, medium, high, xhigh, max", v)
+		name, _ := v.(string)
+		effort, valid := effortLevels[name]
+		if !valid {
+			return params, fmt.Errorf("anthropic: effort %v is not one of low, medium, high, xhigh, max", v)
 		}
-		oc.Effort = effort
+		params.OutputConfig.Effort = effort
 	}
+	system := systemWithFormat(req)
 	if rf := req.ResponseFormat; g.nativeFormat && rf != nil && len(rf.Schema) > 0 {
-		oc.Format = &outputFormat{Type: "json_schema", Schema: rf.Schema}
-		mr.System = req.SystemPrompt
-	} else {
-		mr.System = systemWithFormat(req)
+		params.OutputConfig.Format = anthropic.JSONOutputFormatParam{Schema: rf.Schema}
+		system = req.SystemPrompt
 	}
-	if oc != (outputConfig{}) {
-		mr.OutputConfig = &oc
+	if system != "" {
+		params.System = []anthropic.TextBlockParam{{Text: system}}
 	}
-	return json.Marshal(mr)
+	return params, nil
 }
 
 // systemWithFormat appends JSON-output guidance to the system prompt when the
-// agent declares a response format without StrictMode (see buildBody for the
-// native path). The contract is validated by loom's SchemaValidationPostHook;
-// parseResponse then decodes the JSON into a StructuredResult.
+// agent declares a response format without native structured outputs. The
+// contract is validated by loom's SchemaValidationPostHook; toResult then
+// decodes the JSON into a StructuredResult.
 func systemWithFormat(req loom.GenerateRequest) string {
 	if req.ResponseFormat == nil {
 		return req.SystemPrompt
@@ -387,27 +297,15 @@ func systemWithFormat(req loom.GenerateRequest) string {
 	return b.String()
 }
 
-func (g *ChatGenerator) parseResponse(body []byte, req loom.GenerateRequest) (loom.Result, error) {
-	var mr messagesResponse
-	if err := json.Unmarshal(body, &mr); err != nil {
-		return nil, fmt.Errorf("anthropic: parse response: %w", err)
+// toResult converts a complete Message into a loom Result: a refusal becomes a
+// GenerationRejected error, JSON output for a ResponseFormat a
+// StructuredResult, anything else a TextResult.
+func (g *ChatGenerator) toResult(msg *anthropic.Message, req loom.GenerateRequest) (loom.Result, error) {
+	if msg.StopReason == anthropic.StopReasonRefusal {
+		return nil, refusalError(msg.StopDetails)
 	}
-	if mr.StopReason == "refusal" {
-		var d stopDetails
-		if mr.StopDetails != nil {
-			d = *mr.StopDetails
-		}
-		return nil, refusalError(d)
-	}
-	var sb strings.Builder
-	for _, c := range mr.Content {
-		if c.Type == "text" {
-			sb.WriteString(c.Text)
-		}
-	}
-	content := sb.String()
-	in, out := mr.Usage.InputTokens, mr.Usage.OutputTokens
-
+	content := messageText(msg)
+	in, out := int(msg.Usage.InputTokens), int(msg.Usage.OutputTokens)
 	if req.ResponseFormat != nil {
 		var data map[string]any
 		if err := json.Unmarshal([]byte(content), &data); err == nil {
@@ -416,80 +314,63 @@ func (g *ChatGenerator) parseResponse(body []byte, req loom.GenerateRequest) (lo
 			return sr, nil
 		}
 	}
-	tr := loom.NewTextResult(content, mr.StopReason, in, out)
+	tr := loom.NewTextResult(content, string(msg.StopReason), in, out)
 	tr.Metadata()["model"] = g.model
 	return tr, nil
 }
 
-func (g *ChatGenerator) post(ctx context.Context, path string, body []byte) ([]byte, error) {
-	rc, err := g.postRaw(ctx, path, body)
-	if err != nil {
-		return nil, err
+// messageText joins a message's text blocks (thinking blocks are skipped).
+func messageText(msg *anthropic.Message) string {
+	var sb strings.Builder
+	for _, block := range msg.Content {
+		if t, ok := block.AsAny().(anthropic.TextBlock); ok {
+			sb.WriteString(t.Text)
+		}
 	}
-	defer rc.Close()
-	return io.ReadAll(io.LimitReader(rc, maxResponseBytes))
+	return sb.String()
 }
 
-func (g *ChatGenerator) postRaw(ctx context.Context, path string, body []byte) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL+path, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+// refusalError reports a safety refusal (stop_reason "refusal") as a typed
+// rejection, so callers see GenerationRejected rather than an empty success.
+func refusalError(d anthropic.RefusalStopDetails) error {
+	msg := "anthropic: request refused"
+	if d.Category != "" {
+		msg += " (" + string(d.Category) + ")"
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", g.apiKey)
-	req.Header.Set("anthropic-version", anthropicVersion)
-
-	resp, err := g.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("anthropic: http: %w", err)
+	if d.Explanation != "" {
+		msg += ": " + d.Explanation
 	}
-	if resp.StatusCode >= 400 {
-		defer resp.Body.Close()
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return nil, fmt.Errorf("anthropic: http %d: %s", resp.StatusCode, b)
-	}
-	return resp.Body, nil
+	return &loom.GenerationError{Kind: loom.GenerationRejected, Message: msg}
 }
 
 var _ loom.Verifier = (*ChatGenerator)(nil)
 
-// Verify checks the API key and model against the provider's models endpoint
-// (GET /models/{model}), honouring "api_key", "model" and "base_url"
-// overrides. It generates nothing and spends no tokens. A 401/403 wraps
+// Verify checks the API key and model against the Models API (GET
+// /v1/models/{model}), honouring "api_key", "model" and "base_url" overrides.
+// It generates nothing and spends no tokens. A 401/403 wraps
 // loom.ErrKeyRejected; a 404 means the key works but the model does not exist.
 func (g *ChatGenerator) Verify(ctx context.Context, overrides map[string]any) (loom.ModelInfo, error) {
 	g, err := g.withOverrides(loom.GenerateRequest{Overrides: overrides})
 	if err != nil {
 		return loom.ModelInfo{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.baseURL+"/models/"+url.PathEscape(g.model), nil)
+	m, err := g.client.Models.Get(ctx, g.model, anthropic.ModelGetParams{}, g.requestOptions()...)
 	if err != nil {
-		return loom.ModelInfo{}, err
+		var apiErr *anthropic.Error
+		if errors.As(err, &apiErr) {
+			switch apiErr.StatusCode {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				return loom.ModelInfo{}, fmt.Errorf("%w (anthropic http %d)", loom.ErrKeyRejected, apiErr.StatusCode)
+			case http.StatusNotFound:
+				return loom.ModelInfo{}, fmt.Errorf("anthropic: model %q not found for this key", g.model)
+			}
+		}
+		return loom.ModelInfo{}, fmt.Errorf("anthropic: %w", err)
 	}
-	req.Header.Set("x-api-key", g.apiKey)
-	req.Header.Set("anthropic-version", anthropicVersion)
-	resp, err := g.client.Do(req)
-	if err != nil {
-		return loom.ModelInfo{}, fmt.Errorf("anthropic: http: %w", err)
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return loom.ModelInfo{}, fmt.Errorf("%w (anthropic http %d): %s", loom.ErrKeyRejected, resp.StatusCode, b)
-	case resp.StatusCode == http.StatusNotFound:
-		return loom.ModelInfo{}, fmt.Errorf("anthropic: model %q not found for this key", g.model)
-	case resp.StatusCode >= 400:
-		return loom.ModelInfo{}, fmt.Errorf("anthropic: http %d: %s", resp.StatusCode, b)
-	}
-	var m struct {
-		ID             string `json:"id"`
-		DisplayName    string `json:"display_name"`
-		MaxInputTokens int    `json:"max_input_tokens"`
-		MaxTokens      int    `json:"max_tokens"`
-	}
-	if err := json.Unmarshal(b, &m); err != nil {
-		return loom.ModelInfo{}, fmt.Errorf("anthropic: parse model: %w", err)
-	}
-	return loom.ModelInfo{ID: m.ID, DisplayName: m.DisplayName, ContextWindow: m.MaxInputTokens, MaxOutputTokens: m.MaxTokens}, nil
+	return loom.ModelInfo{
+		ID:              m.ID,
+		DisplayName:     m.DisplayName,
+		ContextWindow:   int(m.MaxInputTokens),
+		MaxOutputTokens: int(m.MaxTokens),
+	}, nil
 }

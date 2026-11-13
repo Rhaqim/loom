@@ -192,12 +192,15 @@ For a session several people share (a multiplayer game):
 
 Built-in adapters (each `New...` takes an API key + model unless noted):
 - `generator/openai`    → `openai.NewChatGenerator(key, model)`      — text, streaming
-- `generator/anthropic` → `anthropic.NewChatGenerator(key, model)`   — text, streaming
+- `generator/anthropic` → `anthropic.NewChatGenerator(key, model)`   — text, streaming. Its own Go module
+  (keeps the SDK's dependencies out of loom): `go get github.com/rhaqim/loom/generator/anthropic`.
   `Params.Extra["effort"]` (`low`…`max`) → `output_config.effort`; `.WithNativeStructuredOutputs()`
   sends a ResponseFormat schema as native structured outputs (schema needs `additionalProperties: false`
   on every object). Default `max_tokens` 16000. A safety refusal returns `*loom.GenerationError{Kind:
-  GenerationRejected}` carrying the refusal category; leave `Temperature`/`TopP` unset on models that
-  reject sampling parameters (Claude Opus 5.5).
+  GenerationRejected}` carrying the refusal category. Built on the official Anthropic Go SDK (API
+  version 2026-10-21): `Temperature`/`TopP` are never sent (that version rejects them on every model),
+  the key goes in both `Authorization: Bearer` and `X-Api-Key`, `ANTHROPIC_*` environment variables
+  are ignored, a base URL may include or omit `/v1`, and the SDK retries 408/409/429/5xx twice.
 - `generator/replicate` → `replicate.NewImageGenerator(key, model)`  — image, async
 - `generator/runway`    → `runway.NewVideoGenerator(key, model)`      — video, async
 - `generator/meshy`     → `meshy.NewModel3DGenerator(key)`            — 3D (GLB `Model3DResult`), async.
